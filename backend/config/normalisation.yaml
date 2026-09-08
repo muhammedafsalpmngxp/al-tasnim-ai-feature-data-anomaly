@@ -1,0 +1,219 @@
+# Layer 0 normalisation rules.
+#
+# Declarative on purpose: a business user must be able to review what the engine rewrites
+# before any check runs, without reading SQL. Every rule here also emits a finding — the
+# rewrite is itself reported ("98,771 rows had to be removed before analysis").
+#
+# Evidence for each rule is in docs/01-DISCOVERY-FINDINGS.md §5.
+
+# ---------------------------------------------------------------------------------------
+# Snapshot pinning. Tables that append a full copy on every sync. Reading them unpinned
+# double-counts everything: WBS weightage sums come out ~2x.
+#
+# Pinning by DATE is not enough — 2026-07-29 holds two snapshots (08:16:51 and 12:09:22).
+# Pin on the exact timestamp, per partition.
+# ---------------------------------------------------------------------------------------
+snapshots:
+  - table: core.engineering_task_plan
+    timestamp_column: Time_Stamp
+    partition_by: [project_id]
+    check_id: PIP-001
+    note: >
+      81 distinct Time_Stamp values over 55 calendar days, 3 projects, 3,359 distinct
+      (project_id, code) pairs. (project_id, code, Time_Stamp) is unique with 0 duplicate
+      groups — so this is history, not corruption. An external report mistook the reused
+      `id` for a broken primary key (docs/01d §2.1).
+
+# ---------------------------------------------------------------------------------------
+# Deduplication. Declare the true business key; the engine keeps one row per key.
+#   mode: exact_only  -> only collapse byte-identical rows; rows that DISAGREE become a
+#                        finding for a human instead of being silently resolved.
+#   mode: keep_latest -> keep the row that sorts last by `order_by`.
+# ---------------------------------------------------------------------------------------
+dedup:
+  - table: well.well_progress
+    keys: [well_id, week_number]
+    order_by: progress_id DESC
+    mode: keep_latest
+    check_id: DUP-001
+    severity: critical
+    # What counts as a conflict between two rows for the same week.
+    compare_columns: [overall_progress, construction_progress, location_prep_progress, well_name]
+    note: >
+      99,589 rows collapse to ~818. 601 duplicate (well_id, week_number) groups holding
+      98,771 excess rows; week 2026-02-05 alone has 793 rows for 5 wells. Any statistic
+      computed before this runs is drawn from a 122x inflated population.
+
+  - table: well.task_daily
+    keys: [well_id, task_code, ActionOn]
+    order_by: id DESC
+    mode: exact_only
+    check_id: DUP-004
+    severity: high
+    # Only what a person records. Deliberately EXCLUDES duration and remaining_duration:
+    # those are P6-derived and change on every re-export, so comparing them counts a plan
+    # refresh as a conflicting truth. Comparing all 12 non-key columns reported 22,629
+    # conflicts; the honest figure over the site-recorded columns is far smaller.
+    compare_columns: [progress, completed, actual_start, actual_end, target_start, target_end]
+    note: >
+      This table is a DAILY LOG at 3.03 rows per task — one row per day worked is CORRECT
+      history and must not be collapsed. But (well_id, task_code, ActionOn) should still be
+      unique and is not: 22,628 duplicate groups, 23,789 excess rows. Of those groups
+      19,543 are byte-identical (safe) and 3,085 hold DIFFERENT values — two truths for one
+      task on one day, which needs a human, not a dedup rule.
+
+  - table: dbo.activity_task_plan
+    keys: [well_id, task_code, schedule_id]
+    order_by: activity_task_plan_id DESC
+    mode: keep_latest
+    check_id: DUP-002
+    severity: critical
+    enabled: false          # pending the business decision below
+    note: >
+      17,930,484 rows covering only 12 wells; duplication factor 206x-2,718x. created_at
+      and updated_at are 100% NULL so there is no timestamp to pick a latest version by.
+      DISABLED pending confirmation that this table is live at all —
+      dbo.activity_taskplan_job_progress covers 694 wells in 84,790 rows and looks like the
+      real per-well source. Excluding this table removes ~89% of total scan cost.
+
+# ---------------------------------------------------------------------------------------
+# Placeholder dates standing in for NULL. Must be normalised BEFORE any check, or a
+# completion test reading `actual_end_date IS NOT NULL` treats half the table as finished
+# in 1900.
+# ---------------------------------------------------------------------------------------
+placeholder_dates:
+  values: ["1900-01-01", "1899-12-30", "0001-01-01"]
+  check_id: PLC-001
+  severity: critical
+  targets:
+    - table: dbo.activity_taskplan_job_progress
+      columns: [actual_start_date, actual_end_date, target_start_date, target_end_date]
+      note: >
+        actual_end_date = 1900-01-01 on 43,232 of 84,790 rows (51%); actual_start_date on
+        39,446 (47%); target_start/end on 3,679 each. planned_start/end are clean.
+    - table: well.well_progress
+      columns: [week_number]
+      note: 209 rows parked at 1900-01-01, all with zero progress.
+
+# ---------------------------------------------------------------------------------------
+# Blank strings used alongside NULL.
+#
+# ORDER MATTERS: blank must be tested BEFORE any type-cast check, because in SQL Server
+# TRY_CAST('' AS date) SUCCEEDS and returns 1900-01-01. Testing castability first counts
+# 127 empty ssfd_value strings as valid dates.
+# ---------------------------------------------------------------------------------------
+blank_to_null:
+  check_id: BLK-001
+  severity: low
+  targets:
+    - table: well.well_master
+      columns: [ssfd_value]
+      note: 127 empty strings alongside 507 NULLs — two representations of "no value".
+
+# ---------------------------------------------------------------------------------------
+# Sentinel strings: status messages and spreadsheet artefacts stored in typed columns.
+# Mapped to NULL for analysis; the original value is preserved in the finding evidence.
+# ---------------------------------------------------------------------------------------
+sentinels:
+  check_id: SNT-001
+  severity: medium
+  values:
+    - "NO FLAF"
+    - "#N/A"
+    - "N/A"
+    - "NA"
+    - "NULL"
+    - "NONE"
+    - "TBC"
+    - "TBA"
+    - "UNKNOWN"
+    - "#VALUE!"
+    - "#REF!"
+    - "-"
+    - "?"
+  targets:
+    - table: well.well_master
+      columns: [ramz_id, flowline_dl, fl_dia, fl_length_m, tie_in_port_no]
+      note: >
+        ramz_id = 'NO FLAF' on 25 wells — a status message in an identifier column.
+        tie_in_port_no carries 18 sentinels; flowline_dl / fl_dia / fl_length_m 1 each.
+    - table: dbo.mapping_master
+      columns: [UOM]
+      note: "'#N/A' as a literal unit of measure on 182 rows."
+
+# ---------------------------------------------------------------------------------------
+# Text cleanup. Applied for DISPLAY and GROUPING only — never written back, and the raw
+# value always appears in the finding evidence.
+# ---------------------------------------------------------------------------------------
+text_cleanup:
+  html_entities:
+    check_id: FMT-011
+    severity: low
+    targets:
+      - table: dbo.activity_taskplan_job_progress
+        columns: [task_name]
+        note: 20,269 rows contain un-decoded '&amp;'.
+  mojibake:
+    check_id: FMT-012
+    severity: medium
+    replacements: { "m�": "m²", "�": "?" }
+    targets:
+      - table: dbo.mapping_master
+        columns: [UOM]
+      - table: dbo.activity_master_mapping
+        columns: [uom]
+        note: "m² stored as mojibake on 34 + 26 rows; the m²/m2 distinction is lost."
+
+# ---------------------------------------------------------------------------------------
+# Whitespace normalisation for GROUPING KEYS. Collapsing these is what reveals phantom
+# keys — values that look distinct but are the same thing.
+# ---------------------------------------------------------------------------------------
+grouping_key_normalisation:
+  check_id: FMT-007
+  severity: critical
+  strip_chars: ["\r", "\n", "\t"]
+  collapse_whitespace: true
+  case_insensitive: true
+  targets:
+    - table: dbo.activity_master_csv
+      columns: [activity_group_description]
+      note: >
+        7 WBS values contain a literal line-feed. Two pairs differ only by ONE SPACE before
+        it, so 37 stored WBS are 35 real ones plus 2 phantoms. 'RDX / WDX Excavation &
+        prepad' really holds 11 activities but is split 9 + 2, which corrupts the §9
+        weightage denominator: activities get 1/9 and 1/2 instead of a common 1/11.
+
+# ---------------------------------------------------------------------------------------
+# Key values that are not real entities.
+#
+#   mode: flag_only  -> the rows STAY in the normalised source and are reported. Use when
+#                       the value is a legitimate sentinel carrying real work.
+#   mode: exclude    -> the rows are removed. Use only when they are genuinely junk that
+#                       would distort every distribution they appear in.
+#
+# `exclude` discards data, so it needs evidence, not a guess. Measuring before choosing is
+# the point: well_id = 0 looked like junk and turned out to be 4,691 rows of real work.
+# ---------------------------------------------------------------------------------------
+phantom_keys:
+  check_id: CMP-016
+  severity: medium
+  targets:
+    - table: well.task_daily
+      column: well_id
+      values: [0]
+      mode: flag_only
+      note: >
+        MEASURED, not assumed: 4,691 rows across 83 task_codes and 42 activity_ids, all
+        with the deliberate '-00000' suffix, all MS* (material shifting) prefixes, all
+        under one project (47B5CDFB-...), carrying real progress values and genuine daily
+        history from 2026-02-05. well_id 0 does not exist in well_master.
+
+        So this is a SENTINEL meaning "not specific to a well" — yard and logistics work —
+        not corrupt data. It is FLAGGED as unattributable-to-a-well and KEPT, because
+        excluding it would silently discard 4.4% of all task rows. Per-well aggregates must
+        still filter it out, or it appears as a phantom well 0.
+
+        Separately: task_codes MSSF1180-00000 and MSBP1020-00000 carry 45-year and 33-year
+        target spans (target_end 2071-03-24 and 2059-07-21). Those are caught by the
+        date-range invariants in Phase 2 as individual defects, which is the right level —
+        two bad rows do not justify dropping 4,691 good ones.

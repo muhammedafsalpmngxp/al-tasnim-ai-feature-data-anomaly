@@ -1,0 +1,272 @@
+# Column ownership register — WHO writes each column and what it means.
+#
+# This file exists because I inferred column meaning from NAMES and got it wrong twice:
+# I used P6 dates as the baseline when the business watches `target` (5.5x more late tasks
+# reported), and I counted a daily log per row instead of per task (15x overstatement).
+# See docs/01c.
+#
+# `startDate`, `target_start` and `committed_start` are all "a start date" to a profiler.
+# They are three different documents to the business. Roles must be REVIEWED, never guessed.
+#
+# The invariant generator (Phase 2) reads this file to emit ~929 checks. A column marked
+# `role: unused` or `all_null: true` generates nothing — that is how the generator avoids
+# the false pairs my name-based prototype produced (docs/01e §3).
+
+meta:
+  reviewed_by: pending_business_signoff
+  reviewed_on: null
+  source: docs/01c-BASELINE-AND-GRAIN-CORRECTION.md
+
+# ---------------------------------------------------------------------------------------
+# Roles
+#   machine_plan  P6-generated. NOT authoritative. Differences vs target are normal
+#                 re-planning and are reported as INFORMATION, never as a defect.
+#   commitment    the human planner's (an engineer's) commitment. THE baseline.
+#   display_only  meaning not confirmed by the business. Shown and sortable; never a
+#                 baseline for any delay, variance or compliance check.
+#   actual        what happened on site.
+#   measure       a quantity or percentage.
+#   signoff       a boolean acceptance flag.
+#   derived       computed from other columns; listed with `derived_from`.
+#   identity      a key or name.
+#   master_date   the §4 date the whole schedule is measured against.
+#   unused        100% NULL or frozen. Generates no invariants.
+# ---------------------------------------------------------------------------------------
+
+tables:
+
+  well.task_daily:
+    grain:
+      kind: latest_per
+      keys: [well_id, task_code]
+      order_by: ActionOn DESC, id DESC
+      note: >
+        DAILY LOG, not a task list. 107,309 rows / 35,444 tasks = 3.03 rows per task.
+        Task HUP1780-29437 reached progress 1.0 on 2025-11-23 and was signed off on
+        2025-11-25; the first two rows are correct history, not contradictions.
+    # Explicit start<=end pairs for the generated date-order invariant (F1/F2). Declared,
+    # not inferred from names -- inferring from "start"/"end" tokens is exactly the mistake
+    # that mispaired material_po_date with eng_start_date (both 100% NULL) in the discovery
+    # prototype (docs/01e Section 3). Each entry becomes ONE generated check, evaluated at
+    # the table's declared grain (latest row per task, so history is never counted twice).
+    date_order:
+      - { before: startDate,       after: endDate,       id: TMP-P6,     severity: low,
+          note: "P6-generated span -- informational, NOT an authoritative baseline" }
+      - { before: target_start,    after: target_end,    id: TMP-TARGET, severity: high,
+          business_rule_ref: "§4/§5", note: "planner's authoritative commitment" }
+      - { before: committed_start, after: committed_end, id: TMP-COMMIT, severity: medium,
+          note: "integrity ONLY -- display_only, never used as a baseline (docs/01c)" }
+      - { before: actual_start,    after: actual_end,    id: TMP-ACTUAL, severity: high,
+          note: "what happened on site" }
+    columns:
+      ActionOn:         { owner: site,    role: identity,     authoritative: true,  note: the log date }
+      task_code:        { owner: system,  role: identity,     authoritative: true,  note: "<activity_id>-<well_id>; suffix matches well_id on 107,309/107,309 rows" }
+      well_id:          { owner: system,  role: identity,     authoritative: true }
+      startDate:        { owner: p6,      role: machine_plan, authoritative: false }
+      endDate:          { owner: p6,      role: machine_plan, authoritative: false }
+      target_start:     { owner: planner, role: commitment,   authoritative: true }
+      target_end:       { owner: planner, role: commitment,   authoritative: true }
+      committed_start:  { owner: unknown, role: display_only, authoritative: false, label: "Commit start" }
+      committed_end:    { owner: unknown, role: display_only, authoritative: false, label: "Commit end" }
+      actual_start:     { owner: site,    role: actual,       authoritative: true }
+      actual_end:       { owner: site,    role: actual,       authoritative: true }
+      progress:         { owner: site,    role: measure,      authoritative: true, range: [0, 1] }
+      completed:        { owner: site,    role: signoff,      authoritative: true }
+      duration:         { owner: p6,      role: derived,      authoritative: false,
+                          derived_from: [startDate, endDate], inclusive: true,
+                          note: "matches P6 span inclusive on 69,706/107,483 (64.9%); target span on only 41.5%" }
+      remaining_duration: { owner: p6,    role: derived,      authoritative: false }
+      required:         { owner: planner, role: measure,      authoritative: true, min: 0, note: "min -1,992 — negative required quantity" }
+      planned:          { owner: planner, role: measure,      authoritative: true, min: 0, note: "max 1,011,111 — repeated-digit entry error" }
+      data_qty:         { owner: site,    role: measure,      authoritative: true, min: 0, coverage: 0.59 }
+      data_hours:       { owner: site,    role: measure,      authoritative: true, min: 0, coverage: 0.59, note: "min -2.5" }
+      daily_actual_hours:    { owner: site, role: unused, all_null: true, note: "100% NULL — blocks productivity checks" }
+      daily_actual_quantity: { owner: site, role: unused, all_null: true, note: "100% NULL" }
+      daily_completed:  { owner: site,    role: unused, all_null: true }
+      planned_crew:     { owner: planner, role: unused, all_null: true }
+      created_at:       { owner: system,  role: unused, all_null: true, note: "no audit trail — change detection must use content hashing" }
+      updated_at:       { owner: system,  role: unused, all_null: true }
+      crew_type_id:     { owner: system,  role: identity, authoritative: false, coverage: 0.007 }
+      crew_id:          { owner: system,  role: identity, authoritative: false, coverage: 0.33 }
+      emp_id:           { owner: system,  role: identity, authoritative: false, coverage: 0.31 }
+
+  well.well_master:
+    grain: { kind: row, note: "814 rows, well_id unique, but NO primary key declared" }
+    # Same-role AND cross-role pairs, all explicitly declared. The cross-role ones
+    # (rig_on_date vs loc_finish_date, etc.) are exactly what the discovery prototype found
+    # by brute-force pairing every date column (docs/01e Section 3, generated 630 candidate
+    # pairs) -- here only the pairs a human reviewed as meaningful are declared.
+    date_order:
+      - { before: ex_rig_on_date,  after: ex_rig_off_date, id: TMP-EXRIG, severity: medium,
+          note: "planning figures -- measured 21 violations in discovery" }
+      - { before: rig_on_date,     after: rig_off_date,    id: TMP-RIG,   severity: high,
+          business_rule_ref: "§7", note: "drilling lifecycle order -- measured 4 violations" }
+      - { before: loc_start_date,  after: loc_finish_date, id: TMP-LOC,   severity: medium,
+          note: "measured 3 violations" }
+      - { before: rig_on_date,     after: loc_finish_date, id: TMP-RIGLOC, severity: high,
+          business_rule_ref: "§7",
+          note: "cross-role: construction finishing after the rig is already on -- measured 266 wells" }
+      - { before: const_complete_date, after: rig_on_date, id: TMP-CCRIG, severity: high,
+          business_rule_ref: "§7", note: "measured 101 violations -- Class 2 in docs/01" }
+    columns:
+      well_id:              { owner: system, role: identity,    authoritative: true }
+      ramz_id:              { owner: system, role: identity,    authoritative: false,
+                              note: "68% NULL; 'NO FLAF' on 25 wells. Disagrees with well_progress.well_name on 260 wells" }
+      ex_rig_on_date:       { owner: pdo,    role: master_date, authoritative: true,
+                              note: "§2 — THE master date. 0% NULL. All §4 deadlines derive from it" }
+      ex_rig_off_date:      { owner: pdo,    role: machine_plan, authoritative: false, note: "§10 — a planning figure, never the actual rig-off" }
+      rig_on_date:          { owner: pdo,    role: actual,      authoritative: true }
+      rig_off_date:         { owner: pdo,    role: actual,      authoritative: true }
+      pegged_date:          { owner: pdo,    role: actual,      authoritative: true, deadline: "ex_rig_on_date - 60 days" }
+      flaf_issue_date:      { owner: pdo,    role: actual,      authoritative: true, deadline: "ex_rig_on_date - 90 days" }
+      eng_completion_date:  { owner: altasnim, role: actual,    authoritative: true,
+                              note: "§8 — well completion date. deadline: rig_off_date + 2 days" }
+      loc_start_date:       { owner: altasnim, role: actual,    authoritative: true }
+      loc_finish_date:      { owner: altasnim, role: actual,    authoritative: false,
+                              note: "§4/§11 — NOT approved as Location Construction completion. Never substitute it" }
+      const_complete_date:  { owner: altasnim, role: actual,    authoritative: false, note: "§11 — same restriction as loc_finish_date" }
+      progress:             { owner: unknown, role: unused,     authoritative: false,
+                              note: "varchar(20) containing ONLY DATES — 111 of 111 non-null values parse as dates. Repurposed or broken import" }
+      buffer_status:        { owner: unknown, role: measure,    authoritative: false,
+                              note: "varchar(20) but 814/814 values are numeric — a day count, range ~30-67. Misnamed and mistyped" }
+      fl_length_m:          { owner: unknown, role: measure,    authoritative: false, unit_declared: m, unit_actual: km,
+                              note: "517 values are text like '1 km' — kilometres in a metres column, unit inside the string" }
+      fl_dia:               { owner: unknown, role: measure,    authoritative: false,
+                              note: "12 spellings of 3 diameters (4\", 4 inch, 4\" inch) plus 'Coriolis', which is a flow meter" }
+      ssfd_value:           { owner: unknown, role: identity,   authoritative: false, note: "127 blank strings alongside 507 NULLs" }
+      ipm:                  { owner: unknown, role: identity,   authoritative: false, note: "holds rig codes SWER149/SWERIG81 — 19 distinct. Not a flag" }
+      lift_type:            { owner: pdo,    role: identity,    authoritative: true, note: "clean vocabulary: PCP/WI/PI/ESP/OP/BP/WSW/DWI" }
+      northing:             { owner: pdo,    role: measure,     authoritative: true, range: [1800000, 2800000], note: "Oman UTM 40N" }
+      easting:              { owner: pdo,    role: measure,     authoritative: true, range: [200000, 800000] }
+      rig_id:               { owner: pdo,    role: identity,    authoritative: true, note: "481 overlapping rig assignments across 16 rigs" }
+      status_id:                { owner: system, role: unused, all_null: true, note: "has a FOREIGN KEY and is 100% NULL — well status unknown for all 814" }
+      flowline_const_status_id: { owner: system, role: unused, all_null: true, note: "FK-backed, 100% NULL" }
+      station_id:               { owner: system, role: unused, all_null: true, note: "FK-backed, 100% NULL" }
+
+  well.well_progress:
+    grain:
+      kind: latest_per
+      keys: [well_id, week_number]
+      order_by: progress_id DESC
+      note: >
+        99,589 rows collapse to ~818. NO USABLE TIME SERIES: 601 of 605 wells have exactly
+        ONE week, only 4 have two, max 2. Weekly cumulative-progress monotonicity CANNOT be
+        assessed here — the check runs on well.task_daily instead, where 4,697 progress
+        decreases and 2,181 completion reversals exist.
+    columns:
+      week_number:            { owner: system, role: identity, authoritative: true, note: "1900-01-01 on 209 rows" }
+      overall_progress:       { owner: system, role: measure,  authoritative: true, range: [0, 1], cumulative: true }
+      construction_progress:  { owner: system, role: measure,  authoritative: true, range: [0, 1], cumulative: true }
+      location_prep_progress: { owner: system, role: measure,  authoritative: true, range: [0, 1], cumulative: true }
+      prev_week_cum_progress: { owner: system, role: derived,  authoritative: false,
+                                derived_from: [overall_progress], note: "disagrees with the actual previous row on 3 of 4 comparable transitions" }
+      curr_week_cum_progress: { owner: system, role: unused,   all_null: false,
+                                note: "99.99% NULL while prev_week_cum_progress is 0% NULL — the 'current' column was never populated" }
+      well_name:              { owner: system, role: identity, authoritative: true,
+                                note: "791 distinct, hygienic. Disagrees with well_master.ramz_id on 260 wells; 554 wells have only this name" }
+
+  core.engineering_task_plan:
+    grain:
+      kind: snapshot_pinned
+      keys: [project_id, code]
+      order_by: Time_Stamp DESC
+      note: >
+        Daily snapshot: 81 Time_Stamp values, 3 projects, 3,359 (project_id, code) pairs.
+        (project_id, code, Time_Stamp) is UNIQUE with 0 duplicate groups. `id` is reused
+        across snapshots BY DESIGN — an external report read that as a broken primary key
+        (docs/01d §2.1). Pin the exact timestamp; pinning by date double-counts, because
+        2026-07-29 holds two snapshots.
+    columns:
+      id:            { owner: system, role: identity, authoritative: false, note: "source task id, STABLE across snapshots — not a row key" }
+      code:          { owner: system, role: identity, authoritative: true }
+      type:          { owner: system, role: identity, authoritative: true, note: "W=WBS A=activity M=milestone T=new task" }
+      parent:        { owner: system, role: identity, authoritative: true, note: "resolves to another row's id within the same snapshot, 100%" }
+      Time_Stamp:    { owner: system, role: identity, authoritative: true }
+      weightage:     { owner: planner, role: measure, authoritative: true,
+                       note: "§9 PMS weight. Sums to 44.0 / 65.99 / 270.69 per project — none is 100. Root PW1 alone = 135.34. Float noise: 0.9999990000000001" }
+      progress:      { owner: site,   role: measure,  authoritative: true, range: [0, 1] }
+      start_date:    { owner: p6,     role: machine_plan, authoritative: false }
+      end_date:      { owner: p6,     role: machine_plan, authoritative: false }
+      target_start:  { owner: p6,     role: machine_plan, authoritative: false,
+                       note: "IDENTICAL to P6 on 128,585/128,643 (99.95%) — NO planner input in this table. Do not treat as an independent baseline" }
+      target_end:    { owner: p6,     role: machine_plan, authoritative: false }
+      actual_start:  { owner: site,   role: actual,   authoritative: true, note: "actual_start > actual_end on 14,827 rows" }
+      actual_end:    { owner: site,   role: actual,   authoritative: true, note: "1,062 rows have an end with no start" }
+      manhours:      { owner: planner, role: measure, authoritative: true, min: 0 }
+      manhoursactual: { owner: site,  role: unused,   authoritative: false,
+                        note: "populated on 128,641 rows and EVERY VALUE IS ZERO — exists, is written, carries no information" }
+      qtyactual:     { owner: site,   role: measure,  authoritative: false, note: "caps at 8 while qty reaches 96" }
+
+  dbo.activity_taskplan_job_progress:
+    grain: { kind: row, note: "84,790 rows, 694 wells. No stable key declared" }
+    columns:
+      well_id:            { owner: system, role: identity, authoritative: false,
+                            note: "nvarchar(50) holding integers. CROSS-WELL CONTAMINATION: rows whose well_id says 33760 carry task_code suffixes -32258 and -33128" }
+      task_code:          { owner: system, role: identity, authoritative: true }
+      parent_wbs_code:    { owner: system, role: identity, authoritative: false,
+                            note: "MIXES TWO VOCABULARIES: sometimes a code ('W33760'), sometimes a WBS name ('Commissioning', 'Sleeper Laying')" }
+      planned_start_date: { owner: p6,     role: machine_plan, authoritative: false, note: "0 placeholder values — clean" }
+      planned_end_date:   { owner: p6,     role: machine_plan, authoritative: false }
+      target_start_date:  { owner: planner, role: commitment, authoritative: true, placeholder: "1900-01-01", note: "3,679 placeholders" }
+      target_end_date:    { owner: planner, role: commitment, authoritative: true, placeholder: "1900-01-01" }
+      actual_start_date:  { owner: site,   role: actual,   authoritative: true, placeholder: "1900-01-01", note: "39,446 of 84,790 are the 1900 placeholder (47%)" }
+      actual_end_date:    { owner: site,   role: actual,   authoritative: true, placeholder: "1900-01-01", note: "43,232 (51%)" }
+      progress:           { owner: site,   role: measure,  authoritative: true, range: [0, 1] }
+      weightage:          { owner: planner, role: measure, authoritative: true, range: [0, 1], note: "max 1.1167 for type W — exceeds 1.0" }
+      actual_manhours:    { owner: site,   role: measure,  authoritative: false, min: 0,
+                            note: "range -45.07 to 1,162,384.37 — the max is 132 years of continuous work" }
+      task_name:          { owner: system, role: identity, authoritative: true, note: "20,269 rows contain un-decoded '&amp;'" }
+
+  dbo.activity_master_mapping:
+    grain: { kind: row }
+    columns:
+      activity_id:   { owner: system, role: identity, authoritative: true,
+                       note: "hop 1 of the §3 chain. 4 duplicates (ENG1120, ENG1130, MIL2000, MIL2010), all with NULL activity_code. 621 activity_ids used by task_daily are ABSENT — whole disciplines (HUP, LOC, OHL, CW*, NS*, RR*, RW*, RO*) are 100% unmapped" }
+      activity_code: { owner: system, role: identity, authoritative: true, note: "10.29% NULL. OLD code scheme (FL-CV-ML01-01)" }
+      norms:         { owner: business, role: measure, authoritative: false, min: 0,
+                       note: "DISAGREES with dbo.mapping_master.Norms on 120 of 387 shared activities (31%). Neither is confirmed authoritative" }
+      uom:           { owner: business, role: identity, authoritative: false, note: "m² stored as mojibake on 26 rows" }
+
+  dbo.activity_master_csv:
+    grain: { kind: row }
+    columns:
+      activity_code:              { owner: system, role: identity, authoritative: true, note: "hop 2 of §3. 2 fully-NULL rows" }
+      activity_group_description: { owner: business, role: identity, authoritative: true,
+                                    note: "§3 — THE WBS. 7 values contain a line-feed; 37 stored values are 35 real + 2 phantoms. Only 22 of 37 are reachable from real work" }
+      crew_code:                  { owner: business, role: identity, authoritative: true,
+                                    note: "§3 says crew comes from here. Resolves to ref.crew_type.crew_type_code (53/57), NOT ref.crew.code (0/57). The rule names the wrong target" }
+
+  ref.employee:
+    grain: { kind: row }
+    columns:
+      id:               { owner: system, role: identity, authoritative: true }
+      employee_id:      { owner: system, role: identity, authoritative: false, note: "IDENTICAL to id on all 18,476 rows — a redundant duplicated key column" }
+      emp_uid:          { owner: hr,     role: identity, authoritative: true, note: "the business identifier, but DUPLICATED — one value appears 3x, another carries 2 different names" }
+      emp_name:         { owner: hr,     role: identity, authoritative: true, note: "677 duplicate normalised-name groups; trailing ' .' placeholder for missing surnames" }
+      nationality_type: { owner: hr,     role: identity, authoritative: true,
+                          allowed: ["National", "Expat", null],
+                          note: "§2 — EXACTLY these strings. Expat 14,183, National 2,802, NULL 1,491. NULL is a real THIRD GROUP and must always be reported separately, never folded into Expat" }
+      emp_status:       { owner: hr,     role: signoff, authoritative: false, note: "only 2 of 18,476 marked inactive — never maintained, so headcount cannot be derived" }
+      email:            { owner: hr,     role: identity, authoritative: false, pii: true, coverage: 0.033 }
+
+  ref.crew_type:
+    grain: { kind: row }
+    columns:
+      crew_type_code:  { owner: business, role: identity, authoritative: true,
+                         note: "OLD scheme. 13 rows have neither code nor name (ids 332-344) and 4 crews reference them" }
+      Crew_group_code: { owner: business, role: identity, authoritative: false,
+                         note: "NEW scheme, populated on 63 of 159 rows. Of 50 rows where both exist, 49 MISMATCH: CRW1308 -> FCG-0402, SRV0401 -> SSS-0401. These match mapping_master.New_Crew_code, so the same half-finished code migration affects crews as well as activities" }
+
+# ---------------------------------------------------------------------------------------
+# PII — excluded from every LLM payload and from report evidence samples.
+# Checks on these columns report COUNTS only.
+# ---------------------------------------------------------------------------------------
+pii_columns:
+  - dbo.employee_contact.*
+  - ref.employee.email
+  - well.task_daily.supervisor_email
+  - well.task_daily.task_assignee
+  - core.engineering_task_plan.supervisor_email
+  - core.engineering_task_plan.task_assignee
+  - dbo.activity_taskplan_job_progress.supervisor_email
+  - dbo.activity_taskplan_job_progress.task_assignee
