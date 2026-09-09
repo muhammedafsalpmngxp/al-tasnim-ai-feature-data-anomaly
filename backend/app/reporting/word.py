@@ -13,6 +13,7 @@ from docx.shared import Pt, RGBColor
 
 from app.db.store import FindingsStore
 from app.logging import get_logger
+from app.sentinel.business_rules_index import cites, describe, referenced_sections
 
 log = get_logger(__name__)
 
@@ -159,7 +160,7 @@ class WordReport:
                 p = self.doc.add_paragraph()
                 p.add_run(f"{f['check_id']} — {f['title']}").bold = True
                 if f.get("business_rule_ref"):
-                    self._p(f"Business rule: {f['business_rule_ref']}")
+                    self._p(f"Business rule: {describe(f['business_rule_ref'])}")
                 if f.get("owner"):
                     self._p(f"Owner: {f['owner']}")
                 text = f.get("llm_explanation") or f.get("why_it_matters") or ""
@@ -192,19 +193,37 @@ class WordReport:
     # -------------------------------------------------------- 6. business-rule section
     def _business_rule_compliance(self) -> None:
         self._h1("Business-Rule Compliance")
+        self._p(
+            "Every rule quoted below is the exact wording from docs/BUSINESS_RULES.md -- "
+            "the same document the AI layer is given verbatim as ground truth -- so this "
+            "section can never describe a rule differently than the analysis above did."
+        )
         findings = self.store.findings(self.run_id, limit=5000)
-        by_rule: dict[str, list[dict]] = {}
-        for f in findings:
-            ref = f.get("business_rule_ref")
-            if ref:
-                by_rule.setdefault(ref, []).append(f)
-        if not by_rule:
+        refs = [f.get("business_rule_ref") for f in findings]
+        cited = referenced_sections(refs)
+        if not cited:
             self._p("No findings this run cite a specific business-rule section.")
             return
-        for ref in sorted(by_rule):
-            self._h2(f"Business rule {ref}")
-            for f in by_rule[ref]:
-                self._p(f"• {f['check_id']}: {f['title']}")
+        for sec in cited:
+            self._h2(f"§{sec.number}  {sec.title}")
+            self._add_rule_text(sec.text)
+            matching = [f for f in findings if cites(f.get("business_rule_ref"), sec.number)]
+            if matching:
+                bold = self.doc.add_paragraph()
+                bold.add_run("Findings citing this rule:").bold = True
+                for f in matching:
+                    self.doc.add_paragraph(f"{f['check_id']}: {f['title']}", style="List Bullet")
+
+    def _add_rule_text(self, text: str) -> None:
+        """Prints a BUSINESS_RULES.md section body as-is (its own wording, not a
+        paraphrase) -- one paragraph per non-blank line, since a single paragraph would
+        collapse the source's line breaks (including its markdown tables) into one
+        unreadable run of text.
+        """
+        for line in text.splitlines():
+            line = line.strip()
+            if line:
+                self._p(line)
 
     # ------------------------------------------------------------------- 7. appendix
     def _appendix(self) -> None:

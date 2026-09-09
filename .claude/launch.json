@@ -1,0 +1,26 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "backend-api",
+      "runtimeExecutable": "C:\\Users\\USER\\miniconda3\\envs\\mycuda\\python.exe",
+      "runtimeArgs": [
+        "-m", "uvicorn",
+        "--app-dir", "C:\\Users\\USER\\Documents\\Afsal\\Al-Tasnim-ai-features\\al-tasnim-ai-feature-data-anomaly\\backend",
+        "app.api.main:app",
+        "--host", "127.0.0.1",
+        "--port", "8001"
+      ],
+      "port": 8001
+    },
+    {
+      "name": "frontend",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "--prefix", "C:\\Users\\USER\\Documents\\Afsal\\Al-Tasnim-ai-features\\al-tasnim-ai-feature-data-anomaly\\frontend",
+        "run", "dev"
+      ],
+      "port": 5173
+    }
+  ]
+}

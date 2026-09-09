@@ -108,7 +108,7 @@ class Settings(BaseSettings):
 
     # ---- API (Phase 3; unused in Phase 1) --------------------------------------
     api_host: str = Field("0.0.0.0", alias="API_HOST")
-    api_port: int = Field(8000, alias="API_PORT")
+    api_port: int = Field(8001, alias="API_PORT")
     api_cors_origins: Annotated[list[str], NoDecode] = Field(
         default=["http://localhost:5173"], alias="API_CORS_ORIGINS"
     )

@@ -42,6 +42,19 @@ log = get_logger(__name__)
 
 _TOOL_NAMES = {"list_tables", "describe_table", "run_query", "propose_check"}
 
+# Confirmed live 2026-09-08: a session proposed "rig-on date earlier than expected" with
+# severity_guess=high -- its OWN hypothesis text correctly called this an acceleration
+# (business rule §5: early is good, never a defect), but the metadata contradicted the
+# prose. The prompt now warns against this explicitly (see suggest_system_prompt), but a
+# prompt instruction is not enforcement -- this is the same lesson as every guard
+# elsewhere in this codebase: real safety lives in code, not in wording a model might not
+# follow. A hypothesis using any of these words is refused before it is even persisted,
+# regardless of the severity or SQL attached to it.
+_EARLY_IS_GOOD_MARKERS = (
+    "earlier than", "ahead of schedule", "acceleration", "accelerat", "sooner than",
+    "before its expected", "before the expected", "before its target", "before the target",
+)
+
 
 @dataclass(slots=True)
 class SuggestionOutcome:
@@ -122,8 +135,9 @@ def run_suggestion_session(
                 elif call.name == "run_query":
                     output = tools.run_query(args.get("sql", ""))
                 else:  # propose_check
-                    output = _handle_proposal(store, tools, args)
-                    outcome.proposals_made += 1
+                    recorded, output = _handle_proposal(store, tools, args)
+                    if recorded:
+                        outcome.proposals_made += 1
             history.append({
                 "type": "function_call_output", "call_id": call.call_id, "output": output,
             })
@@ -219,16 +233,33 @@ def {fn_name}(ctx: CheckContext) -> CheckOutcome:
 '''
 
 
-def _handle_proposal(store: FindingsStore, tools: ExplorationTools, args: dict[str, Any]) -> str:
-    """Persist one propose_check call. Independently re-executes the proposed SQL
-    (structured, for the review record) rather than trusting the agent's own run_query
-    preview -- the human reviewing this suggestion sees a result this code just verified
-    a second time, not one the agent merely claims it saw.
+def _handle_proposal(
+    store: FindingsStore, tools: ExplorationTools, args: dict[str, Any]
+) -> tuple[bool, str]:
+    """Persist one propose_check call, unless it is refused outright (see
+    `_EARLY_IS_GOOD_MARKERS`). Independently re-executes the proposed SQL (structured, for
+    the review record) rather than trusting the agent's own run_query preview -- the human
+    reviewing this suggestion sees a result this code just verified a second time, not one
+    the agent merely claims it saw.
+
+    Returns `(recorded, message)` -- `recorded` is False for a missing-field error or an
+    outright refusal, so the caller's `proposals_made` count reflects what actually
+    entered the review queue, not how many times the model called the tool.
     """
     required = ("title", "family", "severity_guess", "hypothesis", "sql_text", "table_ref")
     missing = [k for k in required if not args.get(k)]
     if missing:
-        return f"error: propose_check missing required field(s): {missing}"
+        return False, f"error: propose_check missing required field(s): {missing}"
+
+    combined_text = f"{args['title']} {args['hypothesis']}".lower()
+    hit = next((m for m in _EARLY_IS_GOOD_MARKERS if m in combined_text), None)
+    if hit:
+        log.warning("suggest.refused_early_is_good", title=args["title"], marker=hit)
+        return False, (
+            f"REFUSED, not recorded: this describes an EARLY/accelerated outcome "
+            f"(matched {hit!r}), which business rule §5 defines as good news, never a "
+            "defect, regardless of severity. Do not propose this or anything like it."
+        )
 
     test = tools.test_execute(args["sql_text"])
     row_count, sample = (test[0], test[1]) if test else (None, None)
@@ -239,8 +270,8 @@ def _handle_proposal(store: FindingsStore, tools: ExplorationTools, args: dict[s
     )
     log.info("suggest.proposed", suggestion_id=suggestion_id, title=args["title"])
     if test is None:
-        return (
+        return True, (
             f"recorded as suggestion #{suggestion_id}, but the SQL failed to re-run "
             "independently -- it will need correction before a human can approve it"
         )
-    return f"recorded as suggestion #{suggestion_id} ({row_count} rows on independent re-run)"
+    return True, f"recorded as suggestion #{suggestion_id} ({row_count} rows on independent re-run)"

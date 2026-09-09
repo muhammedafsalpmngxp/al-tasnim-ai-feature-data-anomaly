@@ -13,6 +13,7 @@ import xlsxwriter
 
 from app.db.store import FindingsStore
 from app.logging import get_logger
+from app.sentinel.business_rules_index import describe, referenced_sections
 
 log = get_logger(__name__)
 
@@ -40,6 +41,7 @@ class ExcelReport:
         self._sheet_well_scorecard(wb, fmt)
         self._sheet_normalisation(wb, fmt)
         self._sheet_check_catalogue(wb, fmt)
+        self._sheet_business_rules(wb, fmt)
         wb.close()
         log.info("excel.built", run_id=self.run_id, path=str(path))
         return path
@@ -142,7 +144,7 @@ class ExcelReport:
             "why_it_matters", "llm_explanation", "llm_root_cause", "llm_remediation",
             "entity_id", "well_id",
         ]
-        widths = [12, 8, 10, 10, 55, 12, 14, 10, 26, 12, 10, 45, 45, 40, 40, 24, 8]
+        widths = [12, 8, 10, 10, 55, 12, 34, 10, 26, 12, 10, 45, 45, 40, 40, 24, 8]
         for i, (h, w) in enumerate(zip(headers, widths)):
             ws.write(0, i, h, fmt["header"])
             ws.set_column(i, i, w)
@@ -156,7 +158,7 @@ class ExcelReport:
             ws.write(r, 3, f["finding_class"])
             ws.write(r, 4, f["title"], fmt["wrap"])
             ws.write_number(r, 5, f["affected_count"] or 0, fmt["num"])
-            ws.write(r, 6, f.get("business_rule_ref") or "")
+            ws.write(r, 6, describe(f.get("business_rule_ref")), fmt["wrap"])
             ws.write(r, 7, f.get("owner") or "")
             ws.write(r, 8, f.get("grain") or "", fmt["wrap"])
             ws.write(r, 9, f.get("baseline") or "")
@@ -261,6 +263,34 @@ class ExcelReport:
             ws.write(r, 7, c.get("baseline") or "")
             ws.write(r, 8, c.get("skip_reason") or "", fmt["wrap"])
             ws.write(r, 9, c.get("error_text") or "", fmt["wrap"])
+
+    # ------------------------------------------------ 7. Business Rules Reference
+    def _sheet_business_rules(self, wb, fmt) -> None:
+        """The exact wording of every business-rule section this run's findings cite --
+        pulled live from docs/BUSINESS_RULES.md, not retyped -- so a reader never has to
+        go find that file separately to see what "§4" actually says.
+        """
+        ws = wb.add_worksheet("Business Rules Reference")
+        ws.set_column("A:A", 10)
+        ws.set_column("B:B", 32)
+        ws.set_column("C:C", 90)
+        headers = ["section", "title", "rule text (verbatim from BUSINESS_RULES.md)"]
+        for i, h in enumerate(headers):
+            ws.write(0, i, h, fmt["header"])
+        ws.freeze_panes(1, 0)
+        refs = [f.get("business_rule_ref") for f in self.store.findings(self.run_id, limit=5000)]
+        cited = referenced_sections(refs)
+        if not cited:
+            ws.merge_range(
+                1, 0, 1, len(headers) - 1,
+                "No findings this run cite a specific business-rule section.", fmt["wrap"],
+            )
+            return
+        for r, sec in enumerate(cited, start=1):
+            ws.write(r, 0, f"§{sec.number}")
+            ws.write(r, 1, sec.title, fmt["wrap"])
+            ws.write(r, 2, sec.text, fmt["wrap"])
+            ws.set_row(r, min(300, 15 * (sec.text.count("\n") + 2)))
 
 
 def build_excel_report(store: FindingsStore, run_id: str, path: Path) -> Path:

@@ -12,14 +12,32 @@ FastAPI backend · React frontend · SQL Server source.
 ## Status
 
 **Discovery complete. Phases 0/1 (normalise + checks), Phase 4 (LLM enrichment) and Phase 6
-(Excel/Word reports) built and verified live end-to-end. Statistics, VERIFY, the agentic
-layer, API and frontend are not yet built.**
+(Excel/Word reports) built and verified live end-to-end. A Tier 2 suggestion agent, a
+FastAPI backend and a React frontend are also built and verified live. Statistics, VERIFY
+and the Tier 3 investigation agent are not yet built.**
 
 Run the whole thing today with `python -m app.cli run`: it connects live, normalises,
-executes 51 checks (0 errors), narrates every finding and writes an executive summary with
+executes 52 checks (0 errors), narrates every finding and writes an executive summary with
 your configured OpenAI model, then produces a real `.xlsx` and `.docx` in `output/<run_id>/`
 -- all in one command. `python -m app.cli report --run latest` rebuilds just the reports
-from an existing run without re-scanning the database.
+from an existing run without re-scanning the database. The same pipeline is also reachable
+over HTTP -- see [**Running the app**](#running-the-app) below for the backend API and
+frontend dashboard, where "Generate Report" does exactly this and gives you the Excel/Word
+files to download once it finishes.
+
+**A Tier 2 suggestion agent finds candidate NEW checks beyond the fixed 52.** It explores
+the live schema with bounded, read-only tools (`list_tables`/`describe_table`/`run_query`,
+same `ReadOnlyGuard` as everything else), verifies each hypothesis by actually re-running
+its own proposed SQL, and can only ever *propose* -- nothing it produces becomes a real
+check without a human reading the generated `.py.suggested` file, fixing its grain/baseline
+TODOs, and renaming it. Verified live across three real sessions, each of which surfaced and
+led to a fix for a genuine bug: a trailing-semicolon query-wrapping bug, a proposal that
+violated business rule §5 ("early is good", now also blocked server-side by keyword, not
+just by prompt instruction), and a proposed check that didn't implement its own hypothesis
+(caught in human review, not by the agent). One verified proposal was promoted to a real
+check this way -- `BIZ-109` in `business_rules.py`, whose promotion also fixed a real
+per-row-vs-per-task grain bug in the agent's own SQL (49 vs the correct 33). See
+`python -m app.cli suggest --help`.
 
 **Verified live against a real OpenAI key on 2026-09-08: 46 of 46 findings narrated, 6
 incidents correlated, 0 rejected by the citation validator.** Getting to 0 took three real
@@ -40,33 +58,29 @@ both ways.
 
 The check layer concretely: a registry that fails at *registration time* if a check omits
 its grain or baseline declaration (`backend/app/sentinel/checks/base.py`); a generator that
-builds ~51 checks from `config/column_semantics.yaml` with zero table names in Python
+builds 39 checks from `config/column_semantics.yaml` with zero table names in Python
 (date-order, future-date, range, minimum -- `generator.py`); and 13 hand-written checks
 encoding specific sections of the business rules that no generic invariant can express
 (§4 deadlines with the PENDING/GAP split, §7 lifecycle order, §9 WBS weightage, rig
-double-booking -- `business_rules.py`). Verified deterministic across repeated runs and
-safe to call repeatedly in one long-lived process; `pytest tests/`, 84 tests, no live DB or
-API key required.
+double-booking -- `business_rules.py`) -- 52 checks total. Verified deterministic across
+repeated runs and safe to call repeatedly in one long-lived process; `pytest tests/`, 140
+tests, no live DB or API key required.
 
-One correction worth reading before trusting the discovery numbers: building the checks
-surfaced the *same* per-row-vs-per-task grain mistake documented in `01c` recurring in new
-code, caught this time by the framework itself -- see `01c` §7. The corrected, current
+One correction worth knowing before trusting the "What it detects" numbers below: building
+the checks surfaced the *same* per-row-vs-per-task grain mistake from the original discovery
+profiling recurring in new code, caught this time by the framework itself -- the mandatory
+grain declaration exists specifically because of that recurrence. The corrected, current
 figures for those two checks are materially smaller than the discovery-time numbers quoted
 below.
 
-The database has been fully profiled — 81 objects, 936 columns, ~20.1 M rows — and the
-findings are written up. Read these before writing any code:
-
-| Document | What it contains |
-|---|---|
-| [`docs/01-DISCOVERY-FINDINGS.md`](docs/01-DISCOVERY-FINDINGS.md) | Structure: connection, scale, keys, constraints, duplication, placeholders, the four named anomaly classes |
-| [`docs/01b-DOMAIN-ANALYSIS.md`](docs/01b-DOMAIN-ANALYSIS.md) | Meaning: wells, activities, employees — formats, vocabularies, mapping chain, 20 further anomaly classes |
-| [`docs/01c-BASELINE-AND-GRAIN-CORRECTION.md`](docs/01c-BASELINE-AND-GRAIN-CORRECTION.md) | **Read this before trusting any figure above.** P6-generated dates vs planner-owned `target` dates, the daily-log grain of `task_daily`, and the corrected numbers |
-| [`docs/01d-VERIFICATION-OF-EXTERNAL-REPORT.md`](docs/01d-VERIFICATION-OF-EXTERNAL-REPORT.md) | An external profiling report re-measured claim by claim: 8 of 10 correct, but both "critical" items misdiagnosed and missing-data 3.5x overstated. Why the VERIFY stage exists |
-| [`docs/01e-GENERATED-INVARIANTS.md`](docs/01e-GENERATED-INVARIANTS.md) | How coverage is achieved: declare column roles once, generate ~929 invariants. Prototype found 5 issues the hand-written catalogue missed, incl. 14,827 inverted dates |
-| [`docs/03-ANOMALY-TAXONOMY.md`](docs/03-ANOMALY-TAXONOMY.md) | **The complete anomaly catalogue** — ~165 classes across 14 dimensions, each with its measured value, source and whether it attaches to a `well_id`. Includes the well-centric scorecard |
-| [`docs/04-AGENTIC-LIVE-ANALYSIS.md`](docs/04-AGENTIC-LIVE-ANALYSIS.md) | **Every report is computed live, at click-time** — nothing is cached or hardcoded. Plus the agentic investigation layer: a bounded, audited tool-loop that digs into master-data conflicts (e.g. the norms disagreement) beyond what a fixed check can say |
-| [`docs/02-FEATURE-PLAN.md`](docs/02-FEATURE-PLAN.md) | The plan: architecture, ~110 checks in 11 families, API, UI, build sequence, open decisions |
+The database was fully profiled during discovery — 81 objects, 936 columns, ~20.1 M rows.
+That profiling's own working documents (connection/structure notes, domain analysis, the
+baseline/grain correction, the anomaly taxonomy, the feature plan) were discovery-phase
+scratch work, not runtime input, and have been removed now that their findings are absorbed
+into the working code itself: `config/column_semantics.yaml` (column roles, grain,
+baseline), `business_rules.py` (the hand-written checks and their business-rule citations),
+and this README. The one document still in the repo, `docs/BUSINESS_RULES.md`, is the one
+actually read by the running code -- see [Business rules](#business-rules) below.
 
 ---
 
@@ -93,25 +107,30 @@ reverted from 1 to 0**, and a column named `progress` that contains only dates.
 
 > Figures in this table were revised after the business clarified that `target_*` (planner-owned)
 > and not `start/end` (P6-generated) is the authoritative baseline, and after `task_daily`
-> was confirmed to be a daily log rather than a task list. See
-> [`docs/01c`](docs/01c-BASELINE-AND-GRAIN-CORRECTION.md).
+> was confirmed to be a daily log rather than a task list -- see `Baseline.TARGET` and the
+> `task_daily` grain declaration in `config/column_semantics.yaml`, where that correction
+> now lives as reviewable config rather than a one-time discovery note.
 
 ---
 
 ## Architecture
 
 ```
-React + Vite frontend
-        │  REST + SSE
-FastAPI backend
+React + Vite frontend  (frontend/)
+        │  REST, polled  (no websocket/SSE -- a plain GET every ~1.5s while a run is live)
+FastAPI backend  (backend/app/api/) -- thin, read-mostly layer over FindingsStore;
+        │                             POST /api/runs starts Orchestrator.run() on a thread
+Orchestrator (backend/app/sentinel/orchestrator.py) -- same one the CLI's `run` calls
         │
    ┌────┴──────────────────────────────────────────────┐
    │ Phase 0  normalise   snapshot pin · dedup · nulls │
-   │ Phase 1  checks      ~1,093 (929 generated)       │
-   │ Phase 2  stats       median+MAD · IQR · drift     │
-   │ Phase 3  VERIFY      6 gates · downgrade or drop  │
+   │ Phase 1  checks      52 (13 hand-written + 39     │
+   │                      generated) + a Tier 2 agent  │
+   │                      that proposes NEW candidates │
+   │ Phase 2  stats       median+MAD · IQR · drift     │  (not yet built)
+   │ Phase 3  VERIFY      6 gates · downgrade or drop  │  (not yet built)
    │ Phase 4  LLM         explain · correlate · rank   │
-   │ Phase 5  persist     dq.run / finding / incident  │
+   │ Phase 5  persist     run / finding / incident     │
    │ Phase 6  reports     .xlsx + .docx                │
    └───────────────────────────────────────────────────┘
         │                              │
@@ -127,13 +146,16 @@ The LLM never produces a number — counts, ids and dates are injected from dete
 finding rows after generation. Layers 1 and 2 alone produce a correct report; the LLM is
 enrichment, never a correctness dependency.
 
-**Phase 3 VERIFY has no bypass.** Every finding is adversarially re-tested against six gates
-— grain, baseline, due-date, column role, an independently written counter-query, and
-materiality — and carries `verified_by`, `grain`, `baseline` and `counter_query_count`. A
-finding that cannot state those is dropped, with the reason recorded on the run. Three
-separate tools, this one twice, produced correctly-computed numbers with wrong conclusions
-before this gate existed ([`docs/01c`](docs/01c-BASELINE-AND-GRAIN-CORRECTION.md),
-[`docs/01d`](docs/01d-VERIFICATION-OF-EXTERNAL-REPORT.md)).
+**Phase 3 VERIFY is designed, not yet built** (see the architecture diagram above). The
+design: every finding gets adversarially re-tested against six gates — grain, baseline,
+due-date, column role, an independently written counter-query, and materiality — and would
+carry `verified_by`, `grain`, `baseline` and `counter_query_count`; a finding that can't
+state those would be dropped, with the reason recorded on the run. The motivation is
+concrete, not hypothetical: earlier profiling attempts against this same database produced
+correctly-computed numbers with wrong conclusions (a wrong baseline column, a wrong grain)
+that only surfaced on manual re-check — the mandatory `grain`/`baseline` declaration already
+enforced at check-registration time (`checks/base.py`) is the first half of closing that
+gap; VERIFY is the second half.
 
 ---
 
@@ -158,50 +180,103 @@ pip install pandas scipy xlsxwriter matplotlib structlog pydantic-settings sse-s
 
 Copy `.env.example` to `.env` and fill in the credentials. The Sentinel uses its own
 scope variables (`DQ_ALLOWED_SCHEMAS`, `DQ_EXCLUDED_TABLES`) rather than the chat feature's
-`ALLOWED_SCHEMAS` / `EXCLUDED_TABLES` — the latter hides four tables this feature must read.
-See `docs/02-FEATURE-PLAN.md` §10.
+`ALLOWED_SCHEMAS` / `EXCLUDED_TABLES` — the latter hides four tables this feature must read
+(see `backend/app/sentinel/scope.py`).
 
 ### Verify the connection
 
 ```bash
 conda activate mycuda
-python others/discovery/01_inventory.py
+cd backend
+python -m app.cli doctor
 ```
+
+Prints the resolved config, connects live, and reports the account's actual permissions
+(`db_datareader`/`db_owner`/`can_insert`/`can_create_table`) so a misconfigured or
+over-privileged connection is caught before any check ever runs.
 
 ---
 
-## Re-running discovery
+## Running the app
 
-The 20 scripts in `others/discovery/` are the evidence base for every number in the docs. They are
-read-only and safe to re-run at any time. Output lands in `others/discovery/out/*.json`.
+Three ways to run this, from simplest to full-stack. All three call the exact same
+`Orchestrator` -- there is one pipeline implementation, not one for the CLI and a different
+one for the API.
+
+### 1. CLI only (no servers)
 
 ```bash
 conda activate mycuda
-cd others/discovery
-
-python 01_inventory.py                          # schemas, objects, row counts, scope flags
-python 02_columns_keys.py "well.well_master"    # column dictionary, PKs, FKs, constraints
-python 03_colsearch.py "progress" "weight"      # keyword search across all 936 columns
-python 04_profile.py "well.well_master"         # null% / distinct / min-max / sentinels
-python 05_relations.py                          # grain, duplicates, orphans, WBS chain
-python 06_wbs_hier.py                           # WBS hierarchy and weightage rollup
-python 07_hier2.py                              # parent linkage, 1900-01-01 placeholders
-python 08_rules.py                              # the four named business-rule classes
-python 09_engine_and_sweep.py                   # existing DQ engine + dead-column sweep
-python 10_text_xref.py                          # encoding, sentinels, cross-table names
-python 11_norms_xref.py                         # norms / UOM / code disagreement
-python 12_domain_wells.py                       # well lifecycle, formats, rig overlaps
-python 13_domain_activities.py                  # task_code formats, mapping chain, WBS
-python 14_domain_employees.py                   # employees, crews, WBS name collisions
-python 15_verify_gaps.py                        # crew join target, dual ids, manhours
-python 16_p6_vs_target.py                       # P6 vs planner-target baseline
-python 17_grain_check.py                        # task_daily grain; re-measured contradictions
-python 18_verify_report.py                      # re-measures an external report's claims
-python 19_generated_invariants.py               # generated-invariant engine prototype
-python 20_well_centric.py                       # per-well anomaly scorecard, monotonicity
+cd backend
+python -m app.cli run                 # full live scan + LLM enrichment + Excel/Word
+python -m app.cli run --no-llm --no-reports --tables well.well_master   # fast, scoped, free
+python -m app.cli show --run latest   # re-print the findings from the last run
+python -m app.cli report --run latest # rebuild just the reports, no re-scan
+python -m app.cli suggest --max-calls 18   # run a Tier 2 suggestion-agent session
 ```
 
-`others/discovery/dbx.py` holds the shared connection, `.env` scope parsing and JSON output helpers.
+### 2. Backend API only
+
+The API (`backend/app/api/`) is a thin, mostly-read layer over the same `FindingsStore`
+`show`/`report` already use, plus one action endpoint: `POST /api/runs` starts a run on a
+background thread (a full run takes minutes, so the request returns a `job_id`
+immediately and the caller polls `GET /api/jobs/{job_id}` for progress). Nothing in
+`app/sentinel`, `app/db`, `app/reporting` or `app/cli.py` was changed to add it.
+
+```bash
+conda activate mycuda
+cd backend
+python -m app.api.main
+# or, equivalently, for a production-style launch:
+uvicorn app.api.main:app --host 0.0.0.0 --port 8001
+```
+
+Interactive API docs (Swagger UI) are then at `http://localhost:8001/docs`. Key endpoints:
+
+| Method & path | What it does |
+|---|---|
+| `POST /api/runs` | Start a live run (`{tables?, triggered_by?, enrich?, generate_reports?}`) → `{job_id, status}` |
+| `GET /api/jobs/{job_id}` | Poll progress: `{status, run_id, phase, phase_state, elapsed_seconds}` |
+| `GET /api/runs` | List past runs with severity/class summaries |
+| `GET /api/runs/{run_id}` | One run's summary |
+| `GET /api/runs/{run_id}/findings` | Findings, filterable by `severity`/`family`/`finding_class` |
+| `GET /api/runs/{run_id}/incidents` | Correlated incidents |
+| `GET /api/runs/{run_id}/report/excel` `/report/word` | Download the generated files |
+| `GET /api/checks` | The hand-written check catalogue |
+
+`DQ_MAX_CONCURRENT_RUNS` (`.env`, default 2) bounds how many runs the API will start at
+once; a request beyond that limit gets `409 Conflict` rather than contending for the same
+live database connection and SQLite store.
+
+### 3. Backend API + frontend (the full dashboard)
+
+```bash
+# terminal 1
+conda activate mycuda
+cd backend
+python -m app.api.main            # http://localhost:8001
+
+# terminal 2
+cd frontend
+npm install                       # first time only
+npm run dev                       # http://localhost:5173
+```
+
+Open `http://localhost:5173`. The dashboard lists past runs with their severity
+breakdown; **Generate Report** starts a new live run and shows its progress phase-by-phase
+(schema → normalise → checks → AI analysis → reports) until the Excel and Word files are
+ready to download -- this is the "analyze the data, then produce the report" flow end to
+end, verified live in-browser. Click into any run for its full findings register
+(searchable/filterable by severity, family and class) and its correlated incidents.
+
+In dev, Vite proxies `/api/*` to `http://127.0.0.1:8001` (see `vite.config.ts`) so there is
+no CORS configuration to think about locally -- if you run the backend on a different port,
+update that proxy target, or set `API_CORS_ORIGINS` in `.env` and `VITE_API_BASE_URL` when
+building the frontend for a real (non-proxied) deployment.
+
+`.claude/launch.json` defines both servers (`backend-api` on port 8001, `frontend` on port
+5173) for previewing them in an editor/agent that reads that file, matching the `API_PORT`
+default (8001) in `app/config.py` / `.env.example`.
 
 ---
 
@@ -228,9 +303,9 @@ positive variances.
 ## Layout
 
 ```
-├── docs/                        discovery findings, domain analysis, corrections, plan, rules
-├── others/discovery/            20 read-only exploration scripts -- the evidence for docs/,
-│                                 not part of the running app (kept out of backend/ on purpose)
+├── docs/BUSINESS_RULES.md        the one doc the running code reads -- fed to the LLM
+│                                 verbatim as ground truth, and parsed structurally by
+│                                 business_rules_index.py for the reports (see below)
 │
 ├── backend/                     the product: the check engine, LLM enrichment, reports
 │   ├── app/
@@ -250,14 +325,27 @@ positive variances.
 │   │   │                         four jobs by default (OPENAI_MODEL), each independently
 │   │   │                         overridable; every LLM number is checked against the
 │   │   │                         finding's own evidence before it can print
-│   │   ├── reporting/            excel.py (xlsxwriter, 6 sheets), word.py (python-docx)
-│   │   └── cli.py                `python -m app.cli doctor|run|show|sql|schema|report`
+│   │   │                         -- suggest.py/tools.py: Tier 2 agent, bounded read-only
+│   │   │                         tool loop, human-approval gate via .py.suggested files
+│   │   ├── reporting/            excel.py (xlsxwriter, 7 sheets), word.py (python-docx)
+│   │   ├── sentinel/business_rules_index.py   parses BUSINESS_RULES.md's own "## N. Title"
+│   │   │                         headers so a report can expand "§4" into "§4 Milestone
+│   │   │                         deadlines" and quote the section's real text verbatim
+│   │   ├── api/                  FastAPI layer -- main.py, routes.py, jobs.py, schemas.py;
+│   │   │                         reads through FindingsStore, POST /api/runs starts the
+│   │   │                         same Orchestrator.run() the CLI's `run` calls, on a thread
+│   │   └── cli.py                `python -m app.cli doctor|run|show|sql|schema|report|suggest`
 │   ├── config/
 │   │   ├── normalisation.yaml    dedup keys, placeholder values, sentinel strings
 │   │   └── column_semantics.yaml column ROLES (owner, baseline, grain) -- reviewed, not coded
-│   └── tests/                    84 tests; `pytest tests/` needs no live DB or API key
+│   └── tests/                    131 tests; `pytest tests/` needs no live DB or API key
 │
-└── frontend/                     React + Vite dashboard and findings register  (to build)
+└── frontend/                     React + Vite + TypeScript + Tailwind dashboard
+    └── src/
+        ├── lib/api.ts             typed client for backend/app/api
+        ├── components/            GenerateReportPanel (the live-progress "generate" flow),
+        │                          FindingsTable, IncidentsList, RunsTable, badges
+        └── pages/                 Dashboard (run history + generate), RunDetail (findings)
 ```
 
 ### Nothing is hardcoded — new tables and columns are handled automatically
@@ -286,10 +374,6 @@ This was verified end-to-end by simulating drift through `DQ_EXCLUDED_TABLES` /
 and a new column are detected. A table with no entry in `column_semantics.yaml` still gets
 scanned, using conservative defaults (`Grain.row()`, no baseline) until a business owner
 reviews it in.
-
-`others/discovery/dbx.py` is a thin wrapper over `app.config` / `app.db.source` /
-`app.sentinel.scope` — there is exactly one implementation of the connection string and the
-scope resolution in this repository, shared by the exploration scripts and the product.
 
 ---
 

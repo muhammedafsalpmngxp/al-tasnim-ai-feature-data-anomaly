@@ -265,6 +265,56 @@ def biz_108_rig_off_tasks_open(ctx: CheckContext) -> CheckOutcome:
     return CheckOutcome(result=result, findings=[finding])
 
 
+@check(
+    id="BIZ-109", family="BIZ", grain=_TASK_DAILY_GRAIN, baseline=Baseline.NONE,
+    severity="high", business_rule_ref=None,
+    title="Wells with many completed tasks but no rig-on date recorded",
+)
+def biz_109_completed_tasks_no_rig_on(ctx: CheckContext) -> CheckOutcome:
+    """Proposed by the Tier 2 suggestion agent (suggestion #4, 2026-09-08), reviewed and
+    rewritten here. The agent's own SQL queried well.task_daily directly instead of
+    collapsing to its declared grain (latest_per well_id/task_code) first -- since a task
+    averages 3.03 daily-log rows (config/column_semantics.yaml), that would count the same
+    signed-off task multiple times. Rewritten to use `td.at_grain()`, same as BIZ-108.
+    """
+    src = _need(ctx, "well.task_daily", "well.well_master")
+    if src is None:
+        return _skip("BIZ-109", "BIZ", "task_daily or well_master not normalised this run")
+    td, wm = src["well.task_daily"], src["well.well_master"]
+    row = ctx.source.one(f"""
+        WITH t AS (
+            SELECT well_id,
+                   SUM(CASE WHEN ISNULL(completed,0)=1 THEN 1 ELSE 0 END) AS completed_tasks
+            FROM {td.at_grain()} GROUP BY well_id
+        )
+        SELECT COUNT(DISTINCT t.well_id) AS wells, SUM(t.completed_tasks) AS completed_tasks
+        FROM {wm.subquery('m')} JOIN t ON t.well_id = m.well_id
+        WHERE m.rig_on_date IS NULL AND t.completed_tasks > 10
+    """) or {}
+    wells = int(row.get("wells") or 0)
+    completed_tasks = int(row.get("completed_tasks") or 0)
+    result = CheckResult(check_id="BIZ-109", family="BIZ", status="fail" if wells else "pass",
+                          rows_scanned=td.rows_effective, violations=wells,
+                          grain=td.grain.describe(), baseline=Baseline.NONE.value)
+    if not wells:
+        return CheckOutcome(result=result)
+    finding = Finding(
+        check_id="BIZ-109", family="BIZ", severity=Severity.HIGH,
+        finding_class=FindingClass.GAP,
+        title=f"{wells} wells have over 10 completed tasks but no rig-on date recorded",
+        entity_type="table", entity_id="well.well_master", entity_label="well.well_master",
+        affected_count=wells, grain=td.grain.describe(), baseline="none",
+        why_it_matters=(
+            "rig_on_date is an authoritative, site-recorded actual (config/column_semantics.yaml), "
+            "not a planning figure. A well with more than 10 signed-off tasks but no rig-on date "
+            "means either the date was never captured or task sign-off is happening before "
+            "drilling has a recorded start -- both need follow-up."
+        ),
+        evidence=[{"wells_affected": wells, "completed_tasks": completed_tasks}],
+    )
+    return CheckOutcome(result=result, findings=[finding])
+
+
 def _milestone_deadline_check(
     check_id: str, actual_col: str, deadline_expr: str, owner: str,
     business_rule_ref: str, label: str,
