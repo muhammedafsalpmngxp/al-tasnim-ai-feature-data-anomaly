@@ -63,8 +63,21 @@ builds 39 checks from `config/column_semantics.yaml` with zero table names in Py
 encoding specific sections of the business rules that no generic invariant can express
 (§4 deadlines with the PENDING/GAP split, §7 lifecycle order, §9 WBS weightage, rig
 double-booking -- `business_rules.py`) -- 52 checks total. Verified deterministic across
-repeated runs and safe to call repeatedly in one long-lived process; `pytest tests/`, 140
+repeated runs and safe to call repeatedly in one long-lived process; `pytest tests/`, 146
 tests, no live DB or API key required.
+
+**Normalisation reports what it rewrites, including at the value level.** Layer 0 nulls
+placeholder dates, blank strings and sentinel strings before any check runs, so nothing
+mistakes them for real values -- and every one of those rewrites is now counted and
+reported as its own finding (`PLC-001` critical, `SNT-001` medium, `BLK-001` low, the
+severities declared in `config/normalisation.yaml`). That closes a real hole: those three
+rewrites used to happen silently, so `dbo.activity_taskplan_job_progress.actual_end_date`
+being **43,232 of 84,790 rows (51%) parked at `1900-01-01`** appeared in the report as
+simply "empty", with nothing saying the emptiness was disguised as a real date that an
+`IS NOT NULL` completion test would count as finished. Measured live, the added findings
+take the run from 7 critical to 9. The measuring predicate is asserted by test to be the
+same condition that does the nulling -- if they ever drift, the reported count stops
+describing the actual rewrite (`tests/test_normalise_value_cleanups.py`).
 
 One correction worth knowing before trusting the "What it detects" numbers below: building
 the checks surfaced the *same* per-row-vs-per-task grain mistake from the original discovery
@@ -124,6 +137,8 @@ Orchestrator (backend/app/sentinel/orchestrator.py) -- same one the CLI's `run` 
         │
    ┌────┴──────────────────────────────────────────────┐
    │ Phase 0  normalise   snapshot pin · dedup · nulls │
+   │                      every rewrite reported, incl.│
+   │                      placeholder/blank/sentinel   │
    │ Phase 1  checks      52 (13 hand-written + 39     │
    │                      generated) + a Tier 2 agent  │
    │                      that proposes NEW candidates │
@@ -173,7 +188,7 @@ gap; VERIFY is the second half.
 
 ```bash
 conda activate mycuda
-pip install pandas scipy xlsxwriter matplotlib structlog pydantic-settings sse-starlette alembic pytest pytest-asyncio httpx
+pip install pandas scipy xlsxwriter matplotlib structlog rich pydantic-settings sse-starlette alembic pytest pytest-asyncio httpx
 ```
 
 ### Configure
@@ -214,6 +229,23 @@ python -m app.cli show --run latest   # re-print the findings from the last run
 python -m app.cli report --run latest # rebuild just the reports, no re-scan
 python -m app.cli suggest --max-calls 18   # run a Tier 2 suggestion-agent session
 ```
+
+Everything the run does streams to the terminal as it happens, rendered with `rich`
+(`app/logging.py`): a clock and colour-coded level per record, values highlighted, and
+full-colour tracebacks. Every individual check logs its own line -- `check.pass`,
+`check.fail`, and `check.skipped`/`check.error` at **WARNING** so a check that silently
+didn't run (a hole in that run's coverage) stands out rather than hiding inside the
+aggregate count. Narration logs per finding (`enrich.narrated 12/47 …`), because that
+phase is ~4 of the ~6 minutes and would otherwise sit silent.
+
+```bash
+DQ_LOG_LEVEL=DEBUG python -m app.cli run   # more detail
+DQ_LOG_JSON=true    python -m app.cli run  # one JSON object per line, for shipping to a log store
+```
+
+Logs go to **stderr**, the report tables to **stdout**, so
+`python -m app.cli run > run.txt` keeps the tables in the file while the live log still
+streams to the terminal.
 
 ### 2. Backend API only
 
@@ -338,7 +370,7 @@ positive variances.
 │   ├── config/
 │   │   ├── normalisation.yaml    dedup keys, placeholder values, sentinel strings
 │   │   └── column_semantics.yaml column ROLES (owner, baseline, grain) -- reviewed, not coded
-│   └── tests/                    131 tests; `pytest tests/` needs no live DB or API key
+│   └── tests/                    146 tests; `pytest tests/` needs no live DB or API key
 │
 └── frontend/                     React + Vite + TypeScript + Tailwind dashboard
     └── src/

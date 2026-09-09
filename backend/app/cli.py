@@ -13,6 +13,11 @@ import json
 import sys
 from typing import Any
 
+from rich import box
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
+
 from app.config import get_settings
 from app.db.source import SourceDatabase
 from app.db.store import FindingsStore
@@ -24,13 +29,103 @@ from app.sentinel.scope import Scope, TableRef
 
 log = get_logger(__name__)
 
+# Report output goes to STDOUT; log records go to STDERR (app/logging.py). Keeping them on
+# separate streams is what lets `python -m app.cli run > run.txt` capture the tables while
+# the live log still streams to the terminal.
+out = Console()
+
+SEVERITY_STYLE = {
+    "critical": "bold red",
+    "high": "dark_orange",
+    "medium": "yellow",
+    "low": "green",
+    "review": "magenta",
+    "info": "cyan",
+}
+STATUS_STYLE = {
+    "completed": "bold green", "pass": "green",
+    "failed": "bold red", "fail": "red", "error": "bold red",
+    "running": "yellow", "skipped": "dim", "cancelled": "dim",
+}
+
 
 def _hr(title: str) -> None:
-    print(f"\n{'=' * 78}\n{title}\n{'=' * 78}")
+    out.print()
+    out.rule(f"[bold cyan]{title}", style="cyan")
 
 
 def _fmt(n: Any) -> str:
     return f"{n:,}" if isinstance(n, int) else str(n)
+
+
+def _sev(severity: str) -> Text:
+    return Text(severity.upper(), style=SEVERITY_STYLE.get(severity, ""))
+
+
+def _kv(pairs: list[tuple[str, Any]], *, key_style: str = "dim") -> None:
+    """Two-column key/value block -- no borders, so it reads as a definition list.
+
+    A `str` value is markup-parsed (so a caller can pass "[yellow]SKIPPED[/]"); pass a
+    `Text` for anything read straight out of the database, since arbitrary content --
+    an `error_text` holding "[...]", a path with a bracket -- would otherwise be parsed
+    as markup and either vanish or raise.
+    """
+    t = Table(box=None, show_header=False, pad_edge=False, padding=(0, 2))
+    t.add_column(style=key_style, no_wrap=True)
+    t.add_column(overflow="fold")
+    for k, v in pairs:
+        t.add_row(k, Text("—") if v is None else v if isinstance(v, (str, Text)) else Text(str(v)))
+    out.print(t)
+
+
+def _counts_line(label: str, counts: dict[str, int], styles: dict[str, str]) -> None:
+    """`severity: 7 CRITICAL · 25 HIGH · …` with each token in its own colour."""
+    if not counts:
+        out.print(f"[dim]{label}: (none)[/]")
+        return
+    line = Text(f"{label}: ", style="dim")
+    for i, (k, n) in enumerate(counts.items()):
+        if i:
+            line.append(" · ", style="dim")
+        line.append(f"{n} {k.upper()}", style=styles.get(k, ""))
+    out.print(line)
+
+
+def _findings_table(findings: list[dict], *, title: str | None = None) -> None:
+    # Every DB-sourced string is wrapped in Text(): finding titles genuinely contain
+    # square brackets (CMP-016's is "... carry well_id = [0] — kept, ...", and every
+    # GEN-RANGE title ends in "[1800000.0, 2800000.0]"), which rich would otherwise
+    # parse as a markup tag and silently swallow.
+    if not findings:
+        out.print("[dim]  (no findings)[/]")
+        return
+    t = Table(title=title, box=box.SIMPLE_HEAD, header_style="bold", expand=True)
+    t.add_column("severity", no_wrap=True)
+    t.add_column("class", no_wrap=True, style="dim")
+    t.add_column("check", no_wrap=True, style="cyan")
+    t.add_column("affected", justify="right", no_wrap=True)
+    t.add_column("title", overflow="fold")
+    for f in findings:
+        t.add_row(
+            _sev(f["severity"]), Text(f["finding_class"]), Text(f["check_id"]),
+            Text(_fmt(f.get("affected_count") or 0)), Text(f["title"]),
+        )
+    out.print(t)
+
+
+def _normalisation_table(actions: list[dict]) -> None:
+    if not actions:
+        out.print("[dim]  (nothing removed or rewritten this run)[/]")
+        return
+    t = Table(box=box.SIMPLE_HEAD, header_style="bold", expand=True)
+    t.add_column("kind", no_wrap=True, style="cyan")
+    t.add_column("target", overflow="fold")
+    t.add_column("rows removed", justify="right", no_wrap=True, style="red")
+    t.add_column("of total", justify="right", no_wrap=True, style="dim")
+    for a in actions:
+        t.add_row(Text(a["kind"]), Text(a["target"]),
+                  Text(_fmt(a["rows_affected"])), Text(_fmt(a["rows_total"])))
+    out.print(t)
 
 
 # --------------------------------------------------------------------------- doctor
@@ -166,32 +261,38 @@ def cmd_run(args: argparse.Namespace) -> int:
         orch.close()
 
     n = outcome.normalisation
-    _hr(f"RUN {outcome.run_id} — {outcome.status.value.upper()}"
-        + ("  (DRY RUN, nothing persisted)" if args.dry_run else ""))
-    print(f"  duration          : {outcome.seconds}s")
-    print(f"  tables normalised : {n.get('tables_normalised', 0)}")
-    print(f"  rows raw          : {_fmt(n.get('rows_raw', 0))}")
-    print(f"  rows effective    : {_fmt(n.get('rows_effective', 0))}")
-    print(f"  ROWS REMOVED      : {_fmt(n.get('rows_removed', 0))}"
-          "   <- had to go before analysis could start")
-    print(f"  findings          : {outcome.findings_written}")
-    print(f"  normalisation log : {outcome.actions_written} actions")
+    status_style = STATUS_STYLE.get(outcome.status.value, "")
+    _hr(f"RUN {outcome.run_id} — [{status_style}]{outcome.status.value.upper()}[/]"
+        + ("  [yellow](DRY RUN, nothing persisted)[/]" if args.dry_run else ""))
+    rows: list[tuple[str, Any]] = [
+        ("duration", f"{outcome.seconds}s"),
+        ("tables normalised", n.get("tables_normalised", 0)),
+        ("rows raw", _fmt(n.get("rows_raw", 0))),
+        ("rows effective", _fmt(n.get("rows_effective", 0))),
+        ("ROWS REMOVED", f"{_fmt(n.get('rows_removed', 0))}"
+                         "   [dim]<- had to go before analysis could start[/]"),
+        ("findings", outcome.findings_written),
+        ("normalisation log", f"{outcome.actions_written} actions"),
+    ]
     if outcome.lifecycle:
         lc = outcome.lifecycle
-        print(f"  lifecycle         : {lc.get('new', 0)} new, "
-              f"{lc.get('recurring', 0)} recurring, {lc.get('resolved', 0)} resolved")
+        rows.append(("lifecycle", f"{lc.get('new', 0)} new, "
+                                  f"{lc.get('recurring', 0)} recurring, "
+                                  f"{lc.get('resolved', 0)} resolved"))
     if outcome.phases_skipped:
-        print(f"  phases skipped    : {', '.join(outcome.phases_skipped)}")
+        rows.append(("phases skipped", f"[dim]{', '.join(outcome.phases_skipped)}[/]"))
     if outcome.llm_enabled:
-        print(f"  LLM enrichment    : {outcome.llm_findings_narrated} findings narrated, "
-              f"{outcome.llm_incidents} incidents, "
-              f"{outcome.llm_usage.get('total_tokens', 0):,} tokens")
+        rows.append(("LLM enrichment",
+                     f"{outcome.llm_findings_narrated} findings narrated, "
+                     f"{outcome.llm_incidents} incidents, "
+                     f"{outcome.llm_usage.get('total_tokens', 0):,} tokens"))
     elif outcome.llm_skip_reason:
-        print(f"  LLM enrichment    : SKIPPED ({outcome.llm_skip_reason})")
+        rows.append(("LLM enrichment", f"[yellow]SKIPPED[/] ({outcome.llm_skip_reason})"))
     if outcome.xlsx_path:
-        print(f"  Excel report      : {outcome.xlsx_path}")
+        rows.append(("Excel report", outcome.xlsx_path))
     if outcome.docx_path:
-        print(f"  Word report       : {outcome.docx_path}")
+        rows.append(("Word report", outcome.docx_path))
+    _kv(rows)
 
     if snaps := n.get("snapshots_pinned"):
         _hr("SNAPSHOTS PINNED")
@@ -209,17 +310,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not args.dry_run:
         store = FindingsStore()
         _hr("NORMALISATION ACTIONS")
-        print(f"  {'kind':18}{'target':44}{'rows removed':>14}{'of':>12}")
-        for a in store.normalisation_actions(outcome.run_id):
-            print(f"  {a['kind']:18}{a['target'][:43]:44}"
-                  f"{a['rows_affected']:>14,}{a['rows_total']:>12,}")
+        _normalisation_table(store.normalisation_actions(outcome.run_id))
         _hr("FINDINGS BY SEVERITY / CLASS")
-        print(f"  severity: {store.severity_counts(outcome.run_id)}")
-        print(f"  class   : {store.class_counts(outcome.run_id)}")
+        _counts_line("severity", store.severity_counts(outcome.run_id), SEVERITY_STYLE)
+        _counts_line("class", store.class_counts(outcome.run_id), {})
         _hr("FINDINGS")
-        for f in store.findings(outcome.run_id, limit=40):
-            print(f"  [{f['severity']:8}] [{f['finding_class']:9}] {f['check_id']:9} "
-                  f"{f['title'][:88]}")
+        _findings_table(store.findings(outcome.run_id, limit=40))
         store.close()
     return 0 if outcome.status.value == "completed" else 1
 
@@ -236,37 +332,45 @@ def cmd_show(args: argparse.Namespace) -> int:
         if not run:
             print("no runs recorded — try: python -m app.cli run")
             return 1
-        _hr(f"RUN {run['run_id']} — {run['status']}")
-        for k in ("started_at", "finished_at", "db_name", "as_of_date",
-                  "rows_scanned", "findings_total", "checks_skipped", "error_text"):
-            if run.get(k) is not None:
-                print(f"  {k:16}: {run[k]}")
+        status_style = STATUS_STYLE.get(run["status"], "")
+        _hr(f"RUN {run['run_id']} — [{status_style}]{run['status'].upper()}[/]")
+        _kv([
+            (k, Text(str(run[k])))  # raw DB values -- never markup-parsed, see _kv
+            for k in (
+                "started_at", "finished_at", "db_name", "as_of_date",
+                "rows_scanned", "findings_total", "checks_skipped", "error_text",
+            ) if run.get(k) is not None
+        ])
         _hr("SEVERITY / CLASS")
-        print(f"  severity: {store.severity_counts(run['run_id'])}")
-        print(f"  class   : {store.class_counts(run['run_id'])}")
+        _counts_line("severity", store.severity_counts(run["run_id"]), SEVERITY_STYLE)
+        _counts_line("class", store.class_counts(run["run_id"]), {})
         _hr("NORMALISATION ACTIONS")
-        for a in store.normalisation_actions(run["run_id"]):
-            print(f"  {a['kind']:18}{a['target'][:44]:46}"
-                  f"{a['rows_affected']:>12,} of {a['rows_total']:,}")
+        _normalisation_table(store.normalisation_actions(run["run_id"]))
         _hr(f"FINDINGS (top {args.limit})")
-        for f in store.findings(run["run_id"], limit=args.limit):
-            print(f"\n  {f['check_id']}  [{f['severity']}/{f['finding_class']}]  "
-                  f"{f['status']}")
-            print(f"  {f['title']}")
-            if f.get("why_it_matters"):
-                print(f"      why: {f['why_it_matters'][:300]}")
-            if f.get("evidence") and args.evidence:
-                print(f"      evidence: {f['evidence'][:400]}")
+        findings = store.findings(run["run_id"], limit=args.limit)
+        _findings_table(findings)
+        if args.evidence:
+            for f in findings:
+                out.print()
+                out.print(Text(f"{f['check_id']}  ", style="bold cyan").append(f["title"]))
+                if f.get("why_it_matters"):
+                    out.print(Text("  why: ", style="dim").append(f["why_it_matters"][:300]))
+                if f.get("evidence"):
+                    # evidence is a raw JSON string -- always contains brackets.
+                    out.print(Text("  evidence: ", style="dim").append(str(f["evidence"])[:400]))
         if args.wells:
             _hr("WELL SCORECARD (top 20)")
             rows = store.well_scorecard(run["run_id"], limit=20)
             if rows:
-                print(f"  {'well_id':>10}{'findings':>10}{'actionable':>12}{'critical':>10}")
+                t = Table(box=box.SIMPLE_HEAD, header_style="bold")
+                for col in ("well_id", "findings", "actionable", "critical"):
+                    t.add_column(col, justify="right", no_wrap=True)
                 for r in rows:
-                    print(f"  {r['well_id']:>10}{r['findings']:>10}"
-                          f"{r['actionable']:>12}{r['critical']:>10}")
+                    t.add_row(str(r["well_id"]), str(r["findings"]),
+                              str(r["actionable"] or 0), str(r["critical"] or 0))
+                out.print(t)
             else:
-                print("  (no well-linked findings yet — Phase 2 adds those)")
+                out.print("[dim]  (no well-linked findings yet — Phase 2 adds those)[/]")
         return 0
     finally:
         store.close()
@@ -431,12 +535,28 @@ def cmd_suggest(args: argparse.Namespace) -> int:
             rows = store.suggestions(status=args.status)
             _hr(f"SUGGESTIONS{f' (status={args.status})' if args.status else ''}")
             if not rows:
-                print("  (none)")
+                out.print("[dim]  (none)[/]")
+                return 0
+            t = Table(box=box.SIMPLE_HEAD, header_style="bold", expand=True)
+            t.add_column("#", justify="right", no_wrap=True)
+            t.add_column("status", no_wrap=True)
+            t.add_column("severity", no_wrap=True)
+            t.add_column("family", no_wrap=True, style="dim")
+            t.add_column("table", no_wrap=True, style="dim")
+            t.add_column("rows", justify="right", no_wrap=True, style="dim")
+            t.add_column("title", overflow="fold")
+            review_style = {"pending": "yellow", "approved": "green", "rejected": "dim red"}
             for r in rows:
-                print(f"  #{r['suggestion_id']:<4} [{r['status']:9}] [{r['severity_guess']:8}] "
-                      f"{r['title'][:80]}")
-                print(f"        family={r['family']}  table={r.get('table_ref')}  "
-                      f"verified_rows={r.get('test_row_count')}")
+                t.add_row(
+                    str(r["suggestion_id"]),
+                    Text(r["status"], style=review_style.get(r["status"], "")),
+                    _sev(r["severity_guess"]),
+                    Text(r["family"] or ""),
+                    Text(str(r.get("table_ref") or "")),
+                    Text(str(r.get("test_row_count") if r.get("test_row_count") is not None else "")),
+                    Text(r["title"]),
+                )
+            out.print(t)
             return 0
 
         # default: run a new exploration session

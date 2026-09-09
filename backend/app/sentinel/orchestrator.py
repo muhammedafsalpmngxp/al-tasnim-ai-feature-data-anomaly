@@ -190,6 +190,20 @@ class Orchestrator:
                 out = registered.run(check_ctx)
                 check_results.append(out.result)
                 check_findings.extend(out.findings)
+                # One line per check, not just the aggregate: a check that quietly
+                # errored or skipped is a hole in this run's coverage, and the aggregate
+                # count alone doesn't say WHICH check went missing.
+                logger = log.warning if out.result.status in ("error", "skipped") else log.info
+                logger(
+                    f"check.{out.result.status}",
+                    check_id=out.result.check_id,
+                    family=out.result.family,
+                    violations=out.result.violations,
+                    rows_scanned=out.result.rows_scanned,
+                    findings=len(out.findings),
+                    **({"reason": out.result.skip_reason} if out.result.skip_reason else {}),
+                    **({"error": out.result.error_text} if out.result.error_text else {}),
+                )
                 if out.result.status == "pass":
                     outcome.checks_passed += 1
                 elif out.result.status == "fail":

@@ -24,6 +24,7 @@ dependencies:
       - openai
       - pyyaml
       - structlog
+      - rich            # terminal rendering for logs (app/logging.py) and CLI tables
       - sse-starlette
       - alembic
       - pytest

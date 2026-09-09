@@ -14,6 +14,7 @@ Two principles:
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -531,6 +532,160 @@ class Normaliser:
                 )
         return preds
 
+    # ------------------------------------------------- placeholder / blank / sentinel
+    def _measure_and_report_cleanup(
+        self,
+        ref: TableRef,
+        from_expr: str,
+        *,
+        kind: NormalisationKind,
+        columns: list[str],
+        predicate: Callable[[str], str],
+        check_id: str,
+        severity: Severity,
+        label: str,
+        why_template: str,
+        note: str = "",
+    ) -> None:
+        """Count what a value-level cleanup rewrote, and report it as a finding.
+
+        `_select_list` nulls placeholder dates, blank strings and sentinel strings so no
+        check mistakes them for real values -- but until this ran, that rewrite was
+        SILENT: the values were replaced and nothing counted or reported them, so a
+        column that is 51% "1900-01-01" looked simply 51% empty in the report, with no
+        finding saying the emptiness is disguised as a real date. `NormalisationAction`'s
+        own contract is "every rewrite is itself reported"; snapshot-pin, dedup and
+        phantom-key already did, these three did not.
+
+        `predicate` must be the SAME condition `_select_list` uses to null the value, or
+        the count reported here would not describe the rewrite that actually happened.
+        Measured on the raw source expression, before the rewrite is applied.
+        """
+        present = self._require_columns(ref, columns, label)
+        if not present:
+            return
+        per_col = ",\n               ".join(
+            f"SUM(CASE WHEN {predicate(f't.{_q(c)}')} THEN 1 ELSE 0 END) AS {_q(c)}"
+            for c in present
+        )
+        any_pred = " OR ".join(predicate(f"t.{_q(c)}") for c in present)
+        sql = f"""
+            SELECT COUNT(*) AS rows_total,
+               SUM(CASE WHEN {any_pred} THEN 1 ELSE 0 END) AS rows_any,
+               {per_col}
+            FROM {from_expr} AS t
+        """
+        try:
+            row = self.src.one(sql) or {}
+        except Exception as exc:  # noqa: BLE001 -- a measurement must never fail the run
+            log.warning(
+                "normalise.cleanup_measure_failed",
+                table=ref.full, kind=kind.value, error=str(exc)[:300],
+            )
+            return
+
+        rows_total = int(row.get("rows_total") or 0)
+        rows_any = int(row.get("rows_any") or 0)
+        by_column = {c: int(row.get(c) or 0) for c in present}
+        affected_columns = {c: n for c, n in by_column.items() if n}
+        log.info(
+            f"normalise.{kind.value}",
+            table=ref.full, check_id=check_id, rows_affected=rows_any,
+            rows_total=rows_total, columns=affected_columns or None,
+        )
+        if not rows_any:
+            return
+
+        worst = max(affected_columns.items(), key=lambda kv: kv[1])
+        pct = round(100.0 * rows_any / rows_total, 1) if rows_total else 0.0
+        self._record(
+            NormalisationAction(
+                kind=kind,
+                target=ref.full,
+                rows_affected=rows_any,
+                rows_total=rows_total,
+                check_id=check_id,
+                detail={"by_column": by_column, "note": note},
+            ),
+            title=(
+                f"{rows_any:,} rows in {ref.full} carry a {label} value "
+                f"nulled before analysis ({worst[0]}: {worst[1]:,})"
+            ),
+            finding_class=FindingClass.DEFECT,
+            severity=severity,
+            why=why_template.format(
+                table=ref.full, rows=f"{rows_any:,}", total=f"{rows_total:,}", pct=pct,
+                worst_column=worst[0], worst_count=f"{worst[1]:,}",
+                columns=", ".join(f"{c} ({n:,})" for c, n in affected_columns.items()),
+            ),
+            evidence=[{
+                "rows_affected": rows_any,
+                "rows_total": rows_total,
+                "percent_of_rows": pct,
+                "by_column": affected_columns,
+            }],
+        )
+
+    def _report_value_cleanups(self, ref: TableRef, from_expr: str) -> None:
+        """Measure + report all three value-level cleanups for one table."""
+        spec = self.spec
+        if spec.placeholder_dates and (cols := spec.placeholder_columns(ref.full)):
+            values = spec.placeholder_dates.values
+            self._measure_and_report_cleanup(
+                ref, from_expr,
+                kind=NormalisationKind.PLACEHOLDER_DATE,
+                columns=cols,
+                predicate=lambda e: "(" + " OR ".join(f"{e} = '{v}'" for v in values) + ")",
+                check_id=spec.placeholder_dates.check_id,
+                severity=spec.placeholder_dates.severity,
+                label="placeholder date",
+                why_template=(
+                    "{rows} of {total} rows ({pct}%) in {table} hold a placeholder date "
+                    "({columns}) standing in for NULL. This is missing data wearing a real "
+                    "date: any completion test reading `IS NOT NULL` counts these rows as "
+                    "finished, and any duration measured from one is measured from 1900."
+                ),
+                note=", ".join(values),
+            )
+        if spec.blank_to_null and (cols := spec.blank_columns(ref.full)):
+            self._measure_and_report_cleanup(
+                ref, from_expr,
+                kind=NormalisationKind.BLANK_TO_NULL,
+                columns=cols,
+                predicate=lambda e: f"LTRIM(RTRIM({e})) = '' AND {e} IS NOT NULL",
+                check_id=spec.blank_to_null.check_id,
+                severity=spec.blank_to_null.severity,
+                label="blank string",
+                why_template=(
+                    "{rows} of {total} rows ({pct}%) in {table} use a blank string where "
+                    "other rows use NULL ({columns}) -- two representations of \"no value\" "
+                    "in one column, so any COUNT or IS NULL test disagrees with itself "
+                    "depending on which representation it happens to meet."
+                ),
+            )
+        if spec.sentinels and (cols := spec.sentinel_columns(ref.full)):
+            lits = ", ".join(
+                f"'{v.replace(chr(39), chr(39) * 2)}'" for v in spec.sentinels.values
+            )
+            self._measure_and_report_cleanup(
+                ref, from_expr,
+                kind=NormalisationKind.SENTINEL_TO_NULL,
+                columns=cols,
+                predicate=lambda e: (
+                    f"UPPER(LTRIM(RTRIM(CAST({e} AS nvarchar(200))))) IN ({lits})"
+                ),
+                check_id=spec.sentinels.check_id,
+                severity=spec.sentinels.severity,
+                label="sentinel string",
+                why_template=(
+                    "{rows} of {total} rows ({pct}%) in {table} hold a sentinel string "
+                    "instead of a value ({columns}) -- a status message or spreadsheet "
+                    "artefact stored in a typed column. It is not a value and not a NULL, "
+                    "so it corrupts both counts and joins on that column."
+                ),
+                note=", ".join(spec.sentinels.values),
+            )
+
     # -------------------------------------------------------------------- recording
     def _record(
         self,
@@ -600,6 +755,9 @@ class Normaliser:
             transforms.append("blank strings nulled")
         if self.spec.sentinel_columns(ref.full):
             transforms.append("sentinel strings nulled")
+        # Measure those three rewrites BEFORE the SELECT that applies them, so what they
+        # replaced is counted and reported rather than silently disappearing.
+        self._report_value_cleanups(ref, from_expr)
 
         select_list = self._select_list(ref)
         inner_select = f"{select_list},\n       {window}" if window else select_list

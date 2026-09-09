@@ -47,9 +47,10 @@ def enrich_run(store: FindingsStore, run_id: str, client: LLMClient | None = Non
 
     findings = store.findings(run_id, limit=2000)
     outcome = EnrichmentOutcome()
+    log.info("enrich.started", run_id=run_id, findings_to_narrate=len(findings))
 
     # ---------------------------------------------------------------------- 1. narrate
-    for f in findings:
+    for i, f in enumerate(findings, start=1):
         result = client.structured(
             Role.NARRATE,
             system=narrate_system_prompt(),
@@ -72,6 +73,15 @@ def enrich_run(store: FindingsStore, run_id: str, client: LLMClient | None = Non
             remediation=result.data["remediation"],
         )
         outcome.findings_narrated += 1
+        # Per-finding, because narration is the long pole of a run (~4 of ~6 minutes)
+        # and without this the terminal sits silent through all of it.
+        log.info(
+            "enrich.narrated",
+            progress=f"{i}/{len(findings)}",
+            check_id=f["check_id"],
+            model=result.model,
+            tokens=result.usage.total,
+        )
 
     # -------------------------------------------------------------------- 2. correlate
     incidents: list[dict] = []
