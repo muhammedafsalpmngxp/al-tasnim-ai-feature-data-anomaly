@@ -31,6 +31,7 @@ _WELL_MASTER_GRAIN = _SPEC.semantics_for("well.well_master").grain
 _TASK_DAILY_GRAIN = _SPEC.semantics_for("well.task_daily").grain
 _WELL_PROGRESS_GRAIN = _SPEC.semantics_for("well.well_progress").grain
 _ETP_GRAIN = _SPEC.semantics_for("core.engineering_task_plan").grain
+_JOB_PROGRESS_GRAIN = _SPEC.semantics_for("dbo.activity_taskplan_job_progress").grain
 
 
 def _need(ctx: CheckContext, *tables: str) -> dict[str, object] | None:
@@ -602,6 +603,131 @@ check(
     title="Rig off but construction_progress has not reached 100%",
 )(_progress_vs_completion(
     "CON-009", "construction_progress", "rig_off_date", "rig is off", "§7",
+))
+
+
+# ============================================== CON family: logical contradictions
+# A value can be individually valid and still contradict the value next to it. These three
+# are the contradictions a placeholder date or a stale flag CREATES -- reporting "51% of
+# actual_end_date is 1900-01-01" says the data is wrong; these say what it makes wrong.
+@check(
+    id="CON-012", family="CON", grain=_TASK_DAILY_GRAIN, baseline=Baseline.NONE,
+    severity="high", business_rule_ref="§8",
+    title="Task reports 100% progress but its completion flag still says not done",
+)
+def con_012_progress_complete_flag_not(ctx: CheckContext) -> CheckOutcome:
+    """One of the four anomaly classes the business named at the outset, and until now the
+    only one with no check of its own: an activity at progress >= 1 whose `completed`
+    sign-off flag is still 0. Which field is right decides whether the work is finished,
+    so the report must not silently pick one -- §12.
+
+    TRY_CAST because `progress` is stored as text on this table; a bare comparison throws
+    an arithmetic overflow on the non-numeric rows.
+    """
+    src = _need(ctx, "well.task_daily")
+    if src is None:
+        return _skip("CON-012", "CON", "task_daily not normalised this run")
+    td = src["well.task_daily"]
+    row = ctx.source.one(f"""
+        SELECT COUNT(*) AS n,
+               SUM(CASE WHEN v >= 1 AND ISNULL(completed, 0) = 0 THEN 1 ELSE 0 END) AS bad,
+               COUNT(DISTINCT CASE WHEN v >= 1 AND ISNULL(completed, 0) = 0
+                                   THEN well_id END) AS wells
+        FROM (SELECT TRY_CAST(progress AS float) AS v, completed, well_id
+              FROM {td.at_grain()}) AS s
+        WHERE v IS NOT NULL
+    """) or {}
+    n, bad = int(row.get("n") or 0), int(row.get("bad") or 0)
+    wells = int(row.get("wells") or 0)
+    result = CheckResult(check_id="CON-012", family="CON", status="fail" if bad else "pass",
+                          rows_scanned=n, violations=bad,
+                          grain=td.grain.describe(), baseline=Baseline.NONE.value)
+    if not bad:
+        return CheckOutcome(result=result)
+    finding = Finding(
+        check_id="CON-012", family="CON", severity=Severity.HIGH,
+        finding_class=FindingClass.DEFECT,
+        title=(f"{bad:,} tasks across {wells:,} wells report 100% progress while their "
+               "completion flag still says not done"),
+        entity_type="table", entity_id="well.task_daily", entity_label="well.task_daily",
+        affected_count=bad, grain=td.grain.describe(), baseline="none",
+        business_rule_ref="§8",
+        why_it_matters=(
+            f"{bad:,} tasks record progress of 100% but are still flagged as not "
+            "completed. Two fields on the same row disagree about whether the work is "
+            "finished, so any completion count is wrong by up to this many tasks "
+            "depending on which field it reads. Someone has to say which is authoritative "
+            "-- the engine reports both rather than choosing (§12)."
+        ),
+        evidence=[{"tasks_affected": bad, "wells_affected": wells, "tasks_scanned": n}],
+    )
+    return CheckOutcome(result=result, findings=[finding])
+
+
+def _job_progress_vs_date(check_id: str, date_col: str, threshold: str, label: str,
+                          severity: Severity, why_tail: str):
+    """Shared shape for "the work is reported as progressing/finished, but the date that
+    should record it is unusable". Runs on the NORMALISED source, where a 1900-01-01
+    placeholder has already been turned into NULL -- so `IS NULL` here means "no usable
+    date", whether it was absent or a placeholder. PLC-001 reports how many were the
+    placeholder; this reports what that costs.
+    """
+    def run(ctx: CheckContext) -> CheckOutcome:
+        src = _need(ctx, "dbo.activity_taskplan_job_progress")
+        if src is None:
+            return _skip(check_id, "CON", "activity_taskplan_job_progress not normalised")
+        jp = src["dbo.activity_taskplan_job_progress"]
+        row = ctx.source.one(f"""
+            SELECT COUNT(*) AS n,
+                   SUM(CASE WHEN v {threshold} AND {date_col} IS NULL THEN 1 ELSE 0 END) AS bad
+            FROM (SELECT TRY_CAST(progress AS float) AS v, {date_col}
+                  FROM {jp.at_grain()}) AS s
+            WHERE v IS NOT NULL
+        """) or {}
+        n, bad = int(row.get("n") or 0), int(row.get("bad") or 0)
+        result = CheckResult(check_id=check_id, family="CON",
+                              status="fail" if bad else "pass",
+                              rows_scanned=n, violations=bad,
+                              grain=jp.grain.describe(), baseline=Baseline.NONE.value)
+        if not bad:
+            return CheckOutcome(result=result)
+        finding = Finding(
+            check_id=check_id, family="CON", severity=severity,
+            finding_class=FindingClass.DEFECT,
+            title=f"{bad:,} rows {label} but have no usable {date_col}",
+            entity_type="table", entity_id="dbo.activity_taskplan_job_progress",
+            entity_label="dbo.activity_taskplan_job_progress",
+            affected_count=bad, grain=jp.grain.describe(), baseline="none",
+            why_it_matters=(
+                f"{bad:,} of {n:,} rows {label}, yet their {date_col} is either empty or "
+                f"holds a 1900-01-01 stand-in rather than a real date. {why_tail} The "
+                "stand-in dates themselves are counted separately under PLC-001; this is "
+                "the contradiction they produce."
+            ),
+            evidence=[{"rows_affected": bad, "rows_scanned": n, "date_column": date_col}],
+        )
+        return CheckOutcome(result=result, findings=[finding])
+    return run
+
+
+check(
+    id="CON-013", family="CON", grain=_JOB_PROGRESS_GRAIN, baseline=Baseline.NONE,
+    severity="high", business_rule_ref=None,
+    title="Activity reports 100% progress but has no usable actual end date",
+)(_job_progress_vs_date(
+    "CON-013", "actual_end_date", ">= 1", "report 100% progress", Severity.HIGH,
+    "So the work is claimed finished with nothing recording when it finished: it cannot "
+    "be scheduled around, and any duration measured from it is meaningless.",
+))
+
+check(
+    id="CON-014", family="CON", grain=_JOB_PROGRESS_GRAIN, baseline=Baseline.NONE,
+    severity="medium", business_rule_ref=None,
+    title="Activity reports progress but has no usable actual start date",
+)(_job_progress_vs_date(
+    "CON-014", "actual_start_date", "> 0", "report work under way", Severity.MEDIUM,
+    "So work is reported as started with nothing recording when it started, which is "
+    "what makes elapsed-time and productivity figures for these rows unusable.",
 ))
 
 

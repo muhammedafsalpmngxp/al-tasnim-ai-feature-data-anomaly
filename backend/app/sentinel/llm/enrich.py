@@ -12,6 +12,7 @@ from typing import Any
 
 from app.db.store import FindingsStore
 from app.logging import get_logger
+from app.sentinel.llm.cache import narration_key, prompt_fingerprint
 from app.sentinel.llm.client import LLMClient, Role
 from app.sentinel.llm.prompts import (
     correlate_system_prompt,
@@ -32,6 +33,7 @@ class EnrichmentOutcome:
     skipped: bool = False
     skip_reason: str = ""
     findings_narrated: int = 0
+    findings_reused: int = 0
     findings_rejected: int = 0
     incidents_written: int = 0
     incidents_rejected: int = 0
@@ -47,13 +49,40 @@ def enrich_run(store: FindingsStore, run_id: str, client: LLMClient | None = Non
 
     findings = store.findings(run_id, limit=2000)
     outcome = EnrichmentOutcome()
-    log.info("enrich.started", run_id=run_id, findings_to_narrate=len(findings))
+
+    # Narration is the long pole of a run (~4 of ~6 minutes, ~95% of the tokens) and most
+    # findings recur unchanged between runs. Reuse is keyed on the finding's own measured
+    # data plus the model and prompt, so anything that moved gets written fresh -- see
+    # llm/cache.py for the cases.
+    narrate_system = narrate_system_prompt()
+    prompt_fp = prompt_fingerprint(narrate_system)
+    narrate_model = client.model_for(Role.NARRATE)
+    log.info(
+        "enrich.started", run_id=run_id, findings_to_narrate=len(findings),
+        model=narrate_model, prompt=prompt_fp,
+    )
 
     # ---------------------------------------------------------------------- 1. narrate
     for i, f in enumerate(findings, start=1):
+        key = narration_key(f, model=narrate_model, prompt_fp=prompt_fp)
+        if cached := store.find_cached_narration(key):
+            store.update_finding_narration(
+                f["finding_id"],
+                explanation=cached["llm_explanation"],
+                root_cause=cached["llm_root_cause"],
+                remediation=cached["llm_remediation"],
+                narration_key=key,
+            )
+            outcome.findings_reused += 1
+            log.info(
+                "enrich.reused", progress=f"{i}/{len(findings)}",
+                check_id=f["check_id"], tokens_saved_est=4000,
+            )
+            continue
+
         result = client.structured(
             Role.NARRATE,
-            system=narrate_system_prompt(),
+            system=narrate_system,
             user=narrate_user_prompt(f),
             json_schema=NARRATE_SCHEMA,
             schema_name="finding_narration",
@@ -71,6 +100,7 @@ def enrich_run(store: FindingsStore, run_id: str, client: LLMClient | None = Non
             explanation=result.data["explanation"],
             root_cause=result.data["root_cause"],
             remediation=result.data["remediation"],
+            narration_key=key,
         )
         outcome.findings_narrated += 1
         # Per-finding, because narration is the long pole of a run (~4 of ~6 minutes)
@@ -134,7 +164,8 @@ def enrich_run(store: FindingsStore, run_id: str, client: LLMClient | None = Non
     store.set_run_llm_usage(run_id, **outcome.usage)
     log.info(
         "enrich.complete", run_id=run_id, narrated=outcome.findings_narrated,
-        rejected=outcome.findings_rejected, incidents=outcome.incidents_written,
+        reused=outcome.findings_reused, rejected=outcome.findings_rejected,
+        incidents=outcome.incidents_written,
         tokens=outcome.usage.get("total_tokens", 0),
     )
     return outcome

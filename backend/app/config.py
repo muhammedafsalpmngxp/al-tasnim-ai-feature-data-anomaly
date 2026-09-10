@@ -88,23 +88,20 @@ class Settings(BaseSettings):
     dq_llm_temperature: float = Field(0.1, alias="DQ_LLM_TEMPERATURE")
     dq_llm_max_retries: int = Field(2, alias="DQ_LLM_MAX_RETRIES")
     dq_llm_timeout_seconds: int = Field(60, alias="DQ_LLM_TIMEOUT_SECONDS")
-    # Optional per-job overrides. Blank = "use OPENAI_MODEL for this job".
-    # gpt-4o (non-mini) must never be used here -- explicit user instruction, 2026-09-08.
-    # Only two models are approved: gpt-4o-mini (cheap, no reasoning-token overhead --
-    # confirmed live: 13 tokens for a trivial call) and gpt-5-mini (reasoning-capable, but
-    # confirmed live to burn tokens on internal reasoning even for trivial input -- 80
-    # tokens for the same trivial call -- and to REJECT the `temperature` parameter
-    # outright, handled by the self-healing detection in client.py).
-    # NARRATE/AGENT default to blank (-> OPENAI_MODEL, which is gpt-4o-mini in .env) --
-    # this is 90%+ of all call volume (docs/05), so it should be the cheap tier by
-    # default. CORRELATE/SUMMARY default to gpt-5-mini explicitly: each runs ONCE per
-    # report, so the extra reasoning-token cost is small in absolute terms, and that is
-    # exactly where cross-referencing many findings into one root cause benefits from a
-    # reasoning-tuned model.
+    # Optional per-job overrides, ALL BLANK BY DEFAULT. Blank means "use OPENAI_MODEL",
+    # so out of the box exactly one model -- whatever `.env` sets -- runs every LLM job:
+    # narrate, correlate, summarise and the suggestion agent. Explicit user instruction
+    # (2026-09-09): do not silently run a job on a different model than OPENAI_MODEL.
+    #
+    # These exist only so ONE job can be pointed elsewhere deliberately, by setting the
+    # variable. They previously defaulted CORRELATE/SUMMARY to gpt-5-mini, which meant a
+    # run using gpt-4o-mini for narration still made two calls on a model the user never
+    # asked for -- visible in the log as a 400 `llm.temperature_unsupported`, because
+    # gpt-5-mini rejects the `temperature` parameter outright.
     dq_llm_model_narrate: str = Field("", alias="DQ_LLM_MODEL_NARRATE")
     dq_llm_model_agent: str = Field("", alias="DQ_LLM_MODEL_AGENT")
-    dq_llm_model_correlate: str = Field("gpt-5-mini", alias="DQ_LLM_MODEL_CORRELATE")
-    dq_llm_model_summary: str = Field("gpt-5-mini", alias="DQ_LLM_MODEL_SUMMARY")
+    dq_llm_model_correlate: str = Field("", alias="DQ_LLM_MODEL_CORRELATE")
+    dq_llm_model_summary: str = Field("", alias="DQ_LLM_MODEL_SUMMARY")
 
     # ---- API (Phase 3; unused in Phase 1) --------------------------------------
     api_host: str = Field("0.0.0.0", alias="API_HOST")

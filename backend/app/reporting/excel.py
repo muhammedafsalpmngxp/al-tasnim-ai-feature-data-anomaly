@@ -13,6 +13,7 @@ import xlsxwriter
 
 from app.db.store import FindingsStore
 from app.logging import get_logger
+from app.reporting.labels import NO_DB_CHANGE_NOTE, action_label
 from app.sentinel.business_rules_index import describe, referenced_sections
 
 log = get_logger(__name__)
@@ -226,20 +227,24 @@ class ExcelReport:
     # ------------------------------------------------------- 5. Normalisation log
     def _sheet_normalisation(self, wb, fmt) -> None:
         ws = wb.add_worksheet("Normalisation Log")
-        headers = ["kind", "target", "rows_affected", "rows_total", "pct", "check_id"]
-        widths = [16, 40, 16, 14, 10, 12]
+        headers = ["issue found", "kind", "target", "rows_affected", "rows_total", "pct",
+                   "check_id"]
+        widths = [30, 16, 40, 16, 14, 10, 12]
         for i, (h, w) in enumerate(zip(headers, widths)):
             ws.write(0, i, h, fmt["header"])
             ws.set_column(i, i, w)
         ws.freeze_panes(1, 0)
+        r = 0
         for r, a in enumerate(self.store.normalisation_actions(self.run_id), start=1):
-            ws.write(r, 0, a["kind"])
-            ws.write(r, 1, a["target"])
-            ws.write_number(r, 2, a["rows_affected"], fmt["num"])
-            ws.write_number(r, 3, a["rows_total"], fmt["num"])
+            ws.write(r, 0, action_label(a["kind"]))
+            ws.write(r, 1, a["kind"])
+            ws.write(r, 2, a["target"])
+            ws.write_number(r, 3, a["rows_affected"], fmt["num"])
+            ws.write_number(r, 4, a["rows_total"], fmt["num"])
             if a.get("pct") is not None:
-                ws.write_number(r, 4, a["pct"] / 100.0, fmt["pct"])
-            ws.write(r, 5, a.get("check_id") or "")
+                ws.write_number(r, 5, a["pct"] / 100.0, fmt["pct"])
+            ws.write(r, 6, a.get("check_id") or "")
+        ws.merge_range(r + 2, 0, r + 2, len(headers) - 1, NO_DB_CHANGE_NOTE, fmt["wrap"])
 
     # ------------------------------------------------------- 6. Check catalogue
     def _sheet_check_catalogue(self, wb, fmt) -> None:

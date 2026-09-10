@@ -68,13 +68,23 @@ dedup:
     mode: keep_latest
     check_id: DUP-002
     severity: critical
-    enabled: false          # pending the business decision below
+    enabled: false          # SETTLED 2026-09-09 — measured redundant, see note
     note: >
       17,930,484 rows covering only 12 wells; duplication factor 206x-2,718x. created_at
       and updated_at are 100% NULL so there is no timestamp to pick a latest version by.
-      DISABLED pending confirmation that this table is live at all —
-      dbo.activity_taskplan_job_progress covers 694 wells in 84,790 rows and looks like the
-      real per-well source. Excluding this table removes ~89% of total scan cost.
+
+      DECISION (measured live 2026-09-09, was "pending"): stays disabled, because this
+      table adds NO well coverage. Its 12 distinct well_ids are ALL present in
+      dbo.activity_taskplan_job_progress, which covers 694 wells in 84,790 rows — the
+      overlap is 12 of 12 and there are ZERO wells found only here. So it is a deep
+      history of a handful of wells, not a source of wells nobody else sees, and
+      excluding it removes ~89% of total scan cost for no loss of coverage.
+
+      If it is ever re-enabled, the "no timestamp" objection above is solvable:
+      activity_task_plan_id is a clean unique ascending sequence (1..17,930,484, distinct
+      count == row count), so `order_by: activity_task_plan_id DESC` is a sound
+      latest-wins proxy. What would still be REQUIRED first is a grain declaration in
+      column_semantics.yaml — without one, every check over it counts each task 206x-2,718x.
 
 # ---------------------------------------------------------------------------------------
 # Placeholder dates standing in for NULL. Must be normalised BEFORE any check, or a

@@ -67,6 +67,7 @@ class RunOutcome:
     llm_enabled: bool = False
     llm_skip_reason: str = ""
     llm_findings_narrated: int = 0
+    llm_findings_reused: int = 0
     llm_incidents: int = 0
     llm_usage: dict[str, Any] = field(default_factory=dict)
     xlsx_path: str | None = None
@@ -144,6 +145,19 @@ class Orchestrator:
             snapshots = snapshotter.capture()
             diff = snapshotter.diff_against_baseline(self.store, run.run_id, snapshots)
             drift_findings = snapshotter.findings_for(diff)
+            # Coverage facts the check layer structurally cannot report: a table that is
+            # empty, and a table holding data that no declared check opens. Free -- the
+            # row counts come from the capture above.
+            drift_findings.extend(
+                snapshotter.coverage_findings(
+                    snapshots, self.spec.tables_touched | set(self.spec.tables)
+                )
+            )
+            drift_findings.extend(
+                snapshotter.dead_column_findings(
+                    snapshots, max_rows=self.s.dq_large_table_row_limit
+                )
+            )
             outcome.schema_drift = {
                 "tables_scanned": len(snapshots),
                 "baseline_run_id": diff.baseline_run_id,
@@ -298,6 +312,7 @@ class Orchestrator:
                 outcome.llm_enabled = not enrich_outcome.skipped
                 outcome.llm_skip_reason = enrich_outcome.skip_reason
                 outcome.llm_findings_narrated = enrich_outcome.findings_narrated
+                outcome.llm_findings_reused = enrich_outcome.findings_reused
                 outcome.llm_incidents = enrich_outcome.incidents_written
                 outcome.llm_usage = enrich_outcome.usage
                 if enrich_outcome.summary:

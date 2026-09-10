@@ -269,8 +269,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         ("tables normalised", n.get("tables_normalised", 0)),
         ("rows raw", _fmt(n.get("rows_raw", 0))),
         ("rows effective", _fmt(n.get("rows_effective", 0))),
-        ("ROWS REMOVED", f"{_fmt(n.get('rows_removed', 0))}"
-                         "   [dim]<- had to go before analysis could start[/]"),
+        ("rows set aside", f"{_fmt(n.get('rows_removed', 0))}"
+                           "   [dim]<- excluded from the analysis, NOT from the database[/]"),
         ("findings", outcome.findings_written),
         ("normalisation log", f"{outcome.actions_written} actions"),
     ]
@@ -283,7 +283,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         rows.append(("phases skipped", f"[dim]{', '.join(outcome.phases_skipped)}[/]"))
     if outcome.llm_enabled:
         rows.append(("LLM enrichment",
-                     f"{outcome.llm_findings_narrated} findings narrated, "
+                     f"{outcome.llm_findings_narrated} narrated, "
+                     f"{outcome.llm_findings_reused} reused from cache, "
                      f"{outcome.llm_incidents} incidents, "
                      f"{outcome.llm_usage.get('total_tokens', 0):,} tokens"))
     elif outcome.llm_skip_reason:

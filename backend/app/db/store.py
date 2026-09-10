@@ -31,7 +31,7 @@ from app.domain.models import (
 
 log = structlog.get_logger(__name__)
 
-SCHEMA_VERSION = 3  # v3 adds suggestion + agent_trace (Tier 2 suggestion agent)
+SCHEMA_VERSION = 4  # v4 adds finding.narration_key (cross-run LLM narration reuse)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -92,13 +92,19 @@ CREATE TABLE IF NOT EXISTS finding (
     -- lifecycle across runs: what is new this week vs recurring vs resolved
     first_seen_run_id    TEXT,
     status               TEXT NOT NULL DEFAULT 'new',
-    resolved_at          TEXT
+    resolved_at          TEXT,
+    -- fingerprint of this finding's narration inputs (see llm/cache.py). Lets an
+    -- unchanged finding reuse the prose a previous run already paid for.
+    narration_key        TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_finding_run       ON finding(run_id);
 CREATE INDEX IF NOT EXISTS ix_finding_well      ON finding(run_id, well_id);
 CREATE INDEX IF NOT EXISTS ix_finding_check     ON finding(run_id, check_id);
 CREATE INDEX IF NOT EXISTS ix_finding_severity  ON finding(run_id, severity);
 CREATE INDEX IF NOT EXISTS ix_finding_class     ON finding(run_id, finding_class);
+-- NOTE: ix_finding_narration is created in migrate(), NOT here. This script runs before
+-- the v3->v4 ALTER TABLE, and on an existing v3 file `finding.narration_key` does not
+-- exist yet -- indexing it here would abort the whole script with "no such column".
 
 CREATE TABLE IF NOT EXISTS incident (
     incident_id    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -243,11 +249,21 @@ class FindingsStore:
         elif current < SCHEMA_VERSION:
             if current < 2:
                 self._ensure_column("run", "llm_summary", "TEXT")
+            if current < 4:
+                # CREATE TABLE IF NOT EXISTS does nothing to an already-existing table,
+                # so an older sentinel.db needs this column added in place.
+                self._ensure_column("finding", "narration_key", "TEXT")
             self._cn.execute(
                 "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
                 (SCHEMA_VERSION, datetime.now().isoformat()),
             )
             log.info("store.upgraded", from_=current, to=SCHEMA_VERSION)
+        # Created here rather than in _SCHEMA because the column it indexes only exists
+        # after the v3->v4 ALTER above. Safe on both paths: a fresh file already has the
+        # column from CREATE TABLE, an upgraded one has just had it added.
+        self._cn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_finding_narration ON finding(narration_key)"
+        )
         self._cn.commit()
         return SCHEMA_VERSION
 
@@ -521,7 +537,8 @@ class FindingsStore:
         return [dict(r) for r in rs]
 
     def update_finding_narration(
-        self, finding_id: int, *, explanation: str, root_cause: str, remediation: str
+        self, finding_id: int, *, explanation: str, root_cause: str, remediation: str,
+        narration_key: str | None = None,
     ) -> None:
         """Write validated LLM narration back onto a finding row.
 
@@ -529,13 +546,35 @@ class FindingsStore:
         citation validation is never written, so a finding either has real,
         evidence-grounded prose or has none (the deterministic title/why_it_matters still
         stand alone in the report either way).
+
+        `narration_key` is stored alongside so a later run whose finding fingerprints
+        identically can reuse this text instead of paying for it again (llm/cache.py).
         """
         self._cn.execute(
-            """UPDATE finding SET llm_explanation=?, llm_root_cause=?, llm_remediation=?
+            """UPDATE finding SET llm_explanation=?, llm_root_cause=?, llm_remediation=?,
+                                  narration_key=COALESCE(?, narration_key)
                WHERE finding_id=?""",
-            (explanation, root_cause, remediation, finding_id),
+            (explanation, root_cause, remediation, narration_key, finding_id),
         )
         self._cn.commit()
+
+    def find_cached_narration(self, narration_key: str) -> dict[str, Any] | None:
+        """The most recent validated narration written under this exact fingerprint.
+
+        Only rows that actually carry prose are eligible: a finding whose narration was
+        rejected by the citation validator has NULL explanation, and must not be served
+        as a cache hit (that would make one rejection permanent).
+        """
+        row = self._cn.execute(
+            """
+            SELECT llm_explanation, llm_root_cause, llm_remediation
+            FROM finding
+            WHERE narration_key = ? AND llm_explanation IS NOT NULL
+            ORDER BY finding_id DESC LIMIT 1
+            """,
+            (narration_key,),
+        ).fetchone()
+        return dict(row) if row else None
 
     # -------------------------------------------------------------------- incidents
     def add_incident(

@@ -17,7 +17,7 @@ FastAPI backend and a React frontend are also built and verified live. Statistic
 and the Tier 3 investigation agent are not yet built.**
 
 Run the whole thing today with `python -m app.cli run`: it connects live, normalises,
-executes 52 checks (0 errors), narrates every finding and writes an executive summary with
+executes 55 checks (0 errors), narrates every finding (reusing prose for findings that have not changed since the last run) and writes an executive summary with
 your configured OpenAI model, then produces a real `.xlsx` and `.docx` in `output/<run_id>/`
 -- all in one command. `python -m app.cli report --run latest` rebuilds just the reports
 from an existing run without re-scanning the database. The same pipeline is also reachable
@@ -25,7 +25,7 @@ over HTTP -- see [**Running the app**](#running-the-app) below for the backend A
 frontend dashboard, where "Generate Report" does exactly this and gives you the Excel/Word
 files to download once it finishes.
 
-**A Tier 2 suggestion agent finds candidate NEW checks beyond the fixed 52.** It explores
+**A Tier 2 suggestion agent finds candidate NEW checks beyond the fixed 55.** It explores
 the live schema with bounded, read-only tools (`list_tables`/`describe_table`/`run_query`,
 same `ReadOnlyGuard` as everything else), verifies each hypothesis by actually re-running
 its own proposed SQL, and can only ever *propose* -- nothing it produces becomes a real
@@ -49,9 +49,13 @@ of a date (`2026-10-19` as "19 October 2026") as the same real data. Both are no
 regression tests (`tests/test_llm_validate.py`) that reproduce the exact live failures.
 
 **Model configuration is one variable.** `OPENAI_MODEL` in `.env` is what every LLM job
-(narrate/correlate/summarise) uses by default -- four optional `DQ_LLM_MODEL_*` vars exist
-only to run one specific job on a different model, and are blank (meaning "use
-`OPENAI_MODEL`") unless you set one. No model name is hardcoded in the Python code itself.
+uses -- narrate, correlate, summarise and the suggestion agent, all four. The optional
+`DQ_LLM_MODEL_*` vars exist only to point ONE job somewhere else deliberately, and all
+four are blank by default, so out of the box exactly one model runs everything and no job
+can quietly use a model you did not ask for. (Two of them used to default to `gpt-5-mini`,
+which meant a run configured for `gpt-4o-mini` still made two calls on another model --
+visible in the log as a 400 `llm.temperature_unsupported`, since `gpt-5-mini` rejects the
+`temperature` parameter. Fixed 2026-09-09; verified live, 52/52 calls on `OPENAI_MODEL`.)
 If no key is configured, or the API is unreachable, the report still builds correctly from
 the deterministic findings alone with a banner saying enrichment was skipped -- verified
 both ways.
@@ -62,9 +66,57 @@ builds 39 checks from `config/column_semantics.yaml` with zero table names in Py
 (date-order, future-date, range, minimum -- `generator.py`); and 13 hand-written checks
 encoding specific sections of the business rules that no generic invariant can express
 (§4 deadlines with the PENDING/GAP split, §7 lifecycle order, §9 WBS weightage, rig
-double-booking -- `business_rules.py`) -- 52 checks total. Verified deterministic across
-repeated runs and safe to call repeatedly in one long-lived process; `pytest tests/`, 146
+double-booking, logical contradictions -- `business_rules.py`) -- 55 checks total. Verified deterministic across
+repeated runs and safe to call repeatedly in one long-lived process; `pytest tests/`, 176
 tests, no live DB or API key required.
+
+**Narration is reused across runs, keyed on the data itself.** Narration was ~95% of every
+run's tokens and most findings recur unchanged, so a finding's prose is now cached and
+reused. The key is a fingerprint of the finding's own measured data (title, count,
+evidence, grain, rule ref) **plus the model and a hash of the prompt** — so on live data
+the cache is right about change, not just sameness: a partly-fixed anomaly (33 wells → 23)
+re-narrates because the prose quotes the number, a fixed one disappears, a new one is
+written fresh, and switching `OPENAI_MODEL` or editing `BUSINESS_RULES.md` invalidates
+everything rather than mixing two authors' text into one report. Measured live on
+consecutive runs: **222,228 tokens / 160s → 10,934 tokens / 44s (95% fewer tokens, 73%
+faster)**, and on the run that added three new checks: **52 reused, 3 narrated — exactly
+the three new findings**. See `llm/cache.py`; `tests/test_narration_cache.py` covers each
+change case.
+
+**The report states how much of the database it actually covered (PIP-010/011/012).** Three
+facts the check layer structurally cannot report about itself, all derived from the schema
+pass that already runs:
+
+* **PIP-010** — tables that exist but hold no rows *(3: `ref.division`, `ref.location`,
+  `ref.project_type`)*. An empty lookup table is a silent failure: anything joining to it
+  finds no match and blanks the value rather than erroring.
+* **PIP-011** — **this report examined 10 of 74 in-scope tables**; the other 61 hold
+  19,939,255 rows and have no declaration, so no check has ever opened them. Stated in the
+  report's Scope section as well as the register, because a reader who sees "55 findings"
+  would otherwise assume full coverage. Nothing says those tables are dirty — it says
+  nobody has looked.
+* **PIP-012** — columns that are NULL on every single row *(56 across 13 tables, worst
+  `well.well_master` with 20)*. Deliberately a full scan, never a sample: a column can be
+  NULL for a million rows and populated later, so a sampled "looks empty" would report
+  live fields as dead. Tables above `DQ_LARGE_TABLE_ROW_LIMIT` are skipped rather than
+  estimated, and the skip is named in the evidence.
+
+Caught before shipping: PIP-010 first reported **7** empty tables, and 3 were populated
+views (742, 36 and 11 rows). `table_row_counts()` covers user tables only (`sys.objects`
+type `'U'`) while the schema pass also snapshots views (`'V'`), and the absent count was
+defaulted to `0`. Emptiness is now taken only from a **measured** count and each candidate
+zero is then confirmed with a real `COUNT(*)` — `sys.partitions` is documented as
+approximate, and a medium-severity claim that someone's table is empty should rest on
+having counted it. Both failure modes are regression-tested
+(`tests/test_schema_coverage.py`).
+
+**Logical contradictions are checked, not just bad values (CON-012/013/014).** Reporting
+"51% of `actual_end_date` is 1900-01-01" says the data is wrong; these say what it makes
+wrong: an activity at 100% progress with no usable end date *(533 rows)*, work reported
+under way with no usable start date *(291)*, and a task at 100% progress whose completion
+flag still says not done *(2,812 tasks across 12 wells)*. That last one is one of the four
+anomaly classes the business named at the outset and was the only one with no check of its
+own — its 2,812 matches the 2,804 measured at discovery.
 
 **Normalisation reports what it rewrites, including at the value level.** Layer 0 nulls
 placeholder dates, blank strings and sentinel strings before any check runs, so nothing
@@ -359,7 +411,11 @@ positive variances.
 │   │   │                         finding's own evidence before it can print
 │   │   │                         -- suggest.py/tools.py: Tier 2 agent, bounded read-only
 │   │   │                         tool loop, human-approval gate via .py.suggested files
-│   │   ├── reporting/            excel.py (xlsxwriter, 7 sheets), word.py (python-docx)
+│   │   ├── reporting/            excel.py (xlsxwriter, 7 sheets) -- the complete working
+│   │   │                         data; word.py (python-docx) -- the ~8-page read-once
+│   │   │                         document: register table covers every finding, prose
+│   │   │                         only for critical/high (NARRATIVE_DEPTH), full text and
+│   │   │                         all-severity narration deferred to the workbook
 │   │   ├── sentinel/business_rules_index.py   parses BUSINESS_RULES.md's own "## N. Title"
 │   │   │                         headers so a report can expand "§4" into "§4 Milestone
 │   │   │                         deadlines" and quote the section's real text verbatim
@@ -370,7 +426,7 @@ positive variances.
 │   ├── config/
 │   │   ├── normalisation.yaml    dedup keys, placeholder values, sentinel strings
 │   │   └── column_semantics.yaml column ROLES (owner, baseline, grain) -- reviewed, not coded
-│   └── tests/                    146 tests; `pytest tests/` needs no live DB or API key
+│   └── tests/                    176 tests; `pytest tests/` needs no live DB or API key
 │
 └── frontend/                     React + Vite + TypeScript + Tailwind dashboard
     └── src/

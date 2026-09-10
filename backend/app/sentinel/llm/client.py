@@ -104,10 +104,16 @@ class LLMClient:
     def disabled_reason(self) -> str | None:
         return self._init_error
 
+    def model_for(self, role: Role) -> str:
+        """Public: which model this role will use. Callers need this BEFORE making the
+        call -- the narration cache keys on it, so switching model invalidates the cache
+        rather than mixing two models' prose into one report."""
+        return self._model_for(role)
+
     def _model_for(self, role: Role) -> str:
         """OPENAI_MODEL is the single source of truth: an empty per-role override falls
         back to it. Set a DQ_LLM_MODEL_* var only to run one specific job on a different
-        model than the rest (docs/05) -- most setups need none of them.
+        model than the rest -- most setups need none of them.
         """
         override = {
             Role.NARRATE: self._s.dq_llm_model_narrate,

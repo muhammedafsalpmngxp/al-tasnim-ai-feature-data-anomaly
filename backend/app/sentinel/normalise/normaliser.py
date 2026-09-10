@@ -392,20 +392,25 @@ class Normaliser:
         disagreeing = stats.get("groups_disagreeing", 0)
         identical = stats.get("groups_identical", 0)
 
+        keys = " + ".join(rule.keys)
         if rule.mode == "exact_only":
             why = (
-                f"{ref.full} has {stats.get('dup_groups', 0):,} duplicate groups on "
-                f"({', '.join(rule.keys)}) holding {excess:,} excess rows. "
-                f"{identical:,} groups are byte-identical and can be collapsed "
-                f"automatically; **{disagreeing:,} groups hold different values** — two "
-                "different truths for the same key, which needs a person, not a dedup rule."
+                f"{stats.get('dup_groups', 0):,} sets of rows in {ref.full} record the "
+                f"same {keys} more than once, {excess:,} rows more than there should be. "
+                f"{identical:,} of those sets are exact copies and could be collapsed "
+                f"safely, but {disagreeing:,} sets hold DIFFERENT values for the same "
+                "thing — two versions of one truth, which a person has to settle, because "
+                "picking one automatically would throw away something somebody recorded. "
+                "This report left every one of them in place and counted them as they are; "
+                "nothing in the source database was changed."
             )
         else:
             why = (
-                f"{ref.full} has {stats.get('dup_groups', 0):,} duplicate groups on "
-                f"({', '.join(rule.keys)}) holding {excess:,} excess rows of {total:,}. "
-                "Any statistic computed before deduplication is drawn from an inflated "
-                "population."
+                f"{stats.get('dup_groups', 0):,} sets of rows in {ref.full} record the "
+                f"same {keys} more than once — {excess:,} rows more than there should be, "
+                f"out of {total:,}. Any total or average taken straight from this table is "
+                "inflated by those repeats. For this report only the most recent row of "
+                "each set was counted; nothing in the source database was changed."
             )
         self._record(
             NormalisationAction(
@@ -422,9 +427,13 @@ class Normaliser:
                     "note": rule.note,
                 },
             ),
+            # States the DATA problem, not what the tool did about it. An earlier wording
+            # ("98,771 duplicate rows removed from well.well_progress") read, to anyone
+            # who does not know this tool's internals, as though rows had been deleted
+            # from the database -- they never are; the source account cannot write.
             title=(
-                f"{excess:,} duplicate rows removed from {ref.full} "
-                f"before analysis ({', '.join(rule.keys)})"
+                f"{ref.full}: {excess:,} duplicate rows — the same "
+                f"{' + '.join(rule.keys)} recorded more than once"
             ),
             finding_class=FindingClass.DEFECT if excess else FindingClass.DESIGN,
             severity=rule.severity if excess else Severity.INFO,
@@ -607,9 +616,11 @@ class Normaliser:
                 check_id=check_id,
                 detail={"by_column": by_column, "note": note},
             ),
+            # The data problem, in words that do not describe this tool's internals --
+            # "nulled before analysis" reads as though the database was edited.
             title=(
-                f"{rows_any:,} rows in {ref.full} carry a {label} value "
-                f"nulled before analysis ({worst[0]}: {worst[1]:,})"
+                f"{ref.full}: {rows_any:,} rows hold a {label} instead of a real value "
+                f"({worst[0]}: {worst[1]:,})"
             ),
             finding_class=FindingClass.DEFECT,
             severity=severity,
@@ -640,10 +651,12 @@ class Normaliser:
                 severity=spec.placeholder_dates.severity,
                 label="placeholder date",
                 why_template=(
-                    "{rows} of {total} rows ({pct}%) in {table} hold a placeholder date "
-                    "({columns}) standing in for NULL. This is missing data wearing a real "
-                    "date: any completion test reading `IS NOT NULL` counts these rows as "
-                    "finished, and any duration measured from one is measured from 1900."
+                    "{rows} of {total} rows ({pct}%) in {table} have a stand-in date such "
+                    "as 1900-01-01 where a real date should be ({columns}). This is missing "
+                    "information that looks filled in: anything asking \"does this have a "
+                    "date yet?\" counts these as done, and any duration calculated from one "
+                    "comes out over a century long. For this report they were treated as "
+                    "blank; nothing in the source database was changed."
                 ),
                 note=", ".join(values),
             )
@@ -655,12 +668,14 @@ class Normaliser:
                 predicate=lambda e: f"LTRIM(RTRIM({e})) = '' AND {e} IS NOT NULL",
                 check_id=spec.blank_to_null.check_id,
                 severity=spec.blank_to_null.severity,
-                label="blank string",
+                label="blank entry",
                 why_template=(
-                    "{rows} of {total} rows ({pct}%) in {table} use a blank string where "
-                    "other rows use NULL ({columns}) -- two representations of \"no value\" "
-                    "in one column, so any COUNT or IS NULL test disagrees with itself "
-                    "depending on which representation it happens to meet."
+                    "{rows} of {total} rows ({pct}%) in {table} have an empty text entry "
+                    "where other rows are left properly unset ({columns}) -- two different "
+                    "ways of recording \"nothing here\" in the same field. Counts of how "
+                    "many values are missing will disagree depending on which of the two a "
+                    "report happens to look for. For this report both were treated the same "
+                    "way; nothing in the source database was changed."
                 ),
             )
         if spec.sentinels and (cols := spec.sentinel_columns(ref.full)):
@@ -676,12 +691,15 @@ class Normaliser:
                 ),
                 check_id=spec.sentinels.check_id,
                 severity=spec.sentinels.severity,
-                label="sentinel string",
+                label="status message",
                 why_template=(
-                    "{rows} of {total} rows ({pct}%) in {table} hold a sentinel string "
-                    "instead of a value ({columns}) -- a status message or spreadsheet "
-                    "artefact stored in a typed column. It is not a value and not a NULL, "
-                    "so it corrupts both counts and joins on that column."
+                    "{rows} of {total} rows ({pct}%) in {table} hold a status message or "
+                    "spreadsheet error where a real value belongs ({columns}) -- text like "
+                    "\"NO FLAF\", \"N/A\" or \"#REF!\" typed into a field meant for an "
+                    "identifier or a measurement. It is neither a usable value nor properly "
+                    "empty, so it breaks both counts and any lookup that relies on that "
+                    "field matching. For this report these were treated as blank; nothing "
+                    "in the source database was changed."
                 ),
                 note=", ".join(spec.sentinels.values),
             )
