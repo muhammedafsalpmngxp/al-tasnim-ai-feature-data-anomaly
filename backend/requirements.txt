@@ -1,0 +1,42 @@
+# Pinned to exact versions. Bump deliberately, one package at a time, then re-run
+# `python -m eval.run_eval` before committing an upgrade — an unbounded `>=` lets a routine
+# `pip install` silently jump a major version.
+#
+# Install into your conda environment:
+#     conda activate <your-env>
+#     pip install -r requirements.txt
+
+# ── Core orchestration ──────────────────────────────────────────────────────────
+langgraph==1.2.9
+langchain-core==1.4.9
+langchain-openai==1.3.5     # used when LLM_PROVIDER=openai
+langchain-ollama==1.1.0     # used when LLM_PROVIDER=local
+
+# ── Database ────────────────────────────────────────────────────────────────────
+# pyodbc is a COMPILED extension: it needs a wheel for your exact Python version. It also needs
+# the Microsoft ODBC driver installed at the OS level — pip cannot provide that. See README.
+pyodbc==5.3.0
+
+# ── Config & terminal UI ────────────────────────────────────────────────────────
+python-dotenv==1.2.2
+rich==15.0.0                # colour agent trace + CLI tables
+
+# ── HTTP API ────────────────────────────────────────────────────────────────────
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+pydantic==2.13.4            # imported directly in app/api/schemas.py, so declared explicitly
+                            # rather than relied on as a fastapi transitive dependency
+
+# ── Report generation ───────────────────────────────────────────────────────────
+# Imported lazily inside app/report/*, so a missing one degrades to a clear error for THAT
+# format instead of breaking the whole app at import time.
+openpyxl==3.1.5             # .xlsx — write-only streaming mode keeps memory flat on huge sheets
+python-docx==1.2.0          # .docx
+
+# ── Optional Langfuse tracing ───────────────────────────────────────────────────
+# Inert unless LANGFUSE_PUBLIC_KEY is set, so installing them changes no behaviour on its own.
+# `langchain` is needed ONLY because langfuse.langchain.CallbackHandler imports it to read
+# __version__; every symbol it actually uses comes from langchain-core. 1.3.14 is pinned because
+# it is the newest release that does not drag langchain-core off 1.4.9.
+langfuse==4.15.0
+langchain==1.3.14

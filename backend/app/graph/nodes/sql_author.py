@@ -1,0 +1,151 @@
+"""Anomaly SQL Author node (LLM, MAIN tier) - writes the SUMMARY and DETAIL probe pair.
+
+BOTH QUERIES IN ONE CALL, DELIBERATELY.
+They must apply the same condition at the same grain - contract.sanity_concerns() compares
+them after execution and reports a disagreement as a defect. Writing them in two separate calls
+is precisely how they drift: the second call re-derives the condition from the prose rather
+than from the query it has to match. One call also halves the cost, since the schema, the
+hints and the rulebook would otherwise be sent twice per attempt.
+
+EVERY REJECTION REACHES THIS NODE AS TEXT.
+The validator, the executor, the contract checks and the verifier all phrase their findings as
+instructions, and they are appended below with the SQL that earned them. Showing the rejected
+query alongside its criticism is not cosmetic: without it the author has to infer which of its
+two queries the feedback refers to, and it frequently re-emits the same one.
+"""
+from __future__ import annotations
+
+from app.graph.nodes._common import numbered, rule_brief
+from app.graph.prompts import ANOMALY_SQL_AUTHOR_SYSTEM
+from app.graph.state import CompileState
+from app.llm import chat
+from app.observability import get_logger
+from app.utils import extract_sql_blocks, normalize_sql
+
+log = get_logger()
+
+
+def _pair_signature(summary_sql: str, detail_sql: str) -> str:
+    """Identity of an ATTEMPT, for recognising one already made.
+
+    Both halves together: changing only the detail query is a genuinely different attempt and
+    must not be mistaken for a repeat, while re-emitting both unchanged cannot earn a different
+    verdict and only burns a cycle.
+    """
+    return normalize_sql(summary_sql) + " ;; " + normalize_sql(detail_sql)
+
+
+def _feedback_sections(state: CompileState) -> list[str]:
+    """Everything the previous attempt got wrong, most actionable first."""
+    out: list[str] = []
+    previous = ""
+    if state.get("summary_sql") or state.get("detail_sql"):
+        previous = (
+            "YOUR PREVIOUS ATTEMPT WAS:\n\n"
+            f"SUMMARY:\n{state.get('summary_sql', '')}\n\n"
+            f"DETAIL:\n{state.get('detail_sql', '')}"
+        )
+
+    if state.get("validation_error"):
+        out.append(
+            previous + "\n\nIT WAS REJECTED BEFORE IT RAN:\n" + state["validation_error"]
+        )
+    elif state.get("exec_error"):
+        out.append(
+            previous + "\n\nIT FAILED WHEN RUN. The database reported:\n"
+            + state["exec_error"]
+            + "\nFix it - check the table and column names, the joins and the types against "
+              "the SCHEMA block above."
+        )
+    elif state.get("contract_error"):
+        out.append(
+            previous + "\n\nIT RAN, BUT WHAT IT RETURNED CANNOT BE USED:\n"
+            + state["contract_error"]
+        )
+    elif state.get("verify_feedback"):
+        out.append(
+            previous + "\n\nAN INDEPENDENT REVIEWER REJECTED IT.\nWHAT TO FIX:\n"
+            + state["verify_feedback"]
+            + "\n\nWrite a MATERIALLY DIFFERENT probe that addresses this. Do not resubmit the "
+              "same queries - they would return the same data and be rejected again. If you "
+              "believe the previous version was already right, make the smallest change that "
+              "satisfies the feedback."
+        )
+
+    if state.get("tried_sql"):
+        out.append(
+            f"You have already made {len(state['tried_sql'])} attempt(s) at this rule. Each new "
+            "attempt must differ materially from the ones before it."
+        )
+    return out
+
+
+def sql_author_node(state: CompileState) -> dict:
+    parts: list[str] = [
+        "SCHEMA (the ONLY tables and columns that exist - never reference another):\n"
+        + state.get("schema_block", ""),
+    ]
+    if state.get("hint_block"):
+        parts.append(state["hint_block"])
+    if state.get("patterns"):
+        parts.append("WORKED PROBE SHAPES:\n" + state["patterns"])
+    if state.get("coverage"):
+        parts.append(state["coverage"])
+
+    parts.append("THE RULE TO IMPLEMENT:\n" + rule_brief(dict(state)))
+
+    # A `seed` rule carries SQL written against a previous shape of this database. It is a
+    # starting point, never an answer: offering it without saying so invites a verbatim copy,
+    # which is exactly the stale query the recompile exists to replace.
+    if state.get("sql_mode") == "seed" and state.get("seed_summary_sql"):
+        parts.append(
+            "STARTING POINT - a previous version of this probe. Treat it as a draft, not as "
+            "truth: verify every table and column against the SCHEMA block above, and correct "
+            "anything that has been renamed, retyped or removed. Keep its intent, fix its "
+            "facts.\n\n"
+            f"SUMMARY:\n{state['seed_summary_sql']}\n\nDETAIL:\n{state['seed_detail_sql']}"
+        )
+
+    if state.get("concerns"):
+        parts.append(
+            "AUTOMATED CHECKS RAISED THESE CONCERNS ABOUT THE PREVIOUS ATTEMPT:\n"
+            + numbered(state["concerns"])
+        )
+    parts.extend(_feedback_sections(state))
+    parts.append("Write the two queries now, as the two tagged blocks described above.")
+
+    raw = chat(ANOMALY_SQL_AUTHOR_SYSTEM, "\n\n".join(p for p in parts if p), temperature=0.0)
+    blocks = extract_sql_blocks(raw)
+    summary_sql = blocks.get("summary", "")
+    detail_sql = blocks.get("detail", "")
+
+    if not summary_sql or not detail_sql:
+        # Not raised as an error here: the Validator owns retry accounting, and static_problems
+        # already reports a missing half as a contract violation in the author's own words.
+        log.warning(
+            "SQL[%s try%d]: reply had %s - expected both tagged blocks",
+            state.get("rule_id", ""), state.get("retry_count", 0),
+            ", ".join(sorted(blocks)) or "no tagged sql block",
+        )
+    else:
+        log.info(
+            "SQL[%s try%d]: summary %d chars, detail %d chars",
+            state.get("rule_id", ""), state.get("retry_count", 0),
+            len(summary_sql), len(detail_sql),
+        )
+
+    return {
+        "summary_sql": summary_sql,
+        "detail_sql": detail_sql,
+        "validation_error": "",
+        "exec_error": "",
+        "contract_error": "",
+        "concerns": [],
+        # verify_feedback is deliberately NOT cleared. It is the reviewer's semantic
+        # instruction and stays valid until the reviewer rules on the rewrite. Clearing it here
+        # dropped it the moment a rewrite tripped the validator or the database: the next
+        # attempt then saw only the syntax error, lost the reason it was rejected, and was free
+        # to drift back to the query that had already been refused.
+        "tried_sql": list(state.get("tried_sql", [])) + [_pair_signature(summary_sql, detail_sql)],
+        "llm_calls": state.get("llm_calls", 0) + 1,
+    }

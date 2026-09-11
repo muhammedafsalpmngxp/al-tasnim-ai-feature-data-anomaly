@@ -1,0 +1,30 @@
+# Secrets — NEVER commit
+backend/.env
+frontend/.env
+
+# Generated caches. Every file here is rebuilt from the live database on demand, so deleting
+# the folder is always safe and never loses anything a person wrote.
+backend/.cache/
+
+# Generated output
+backend/reports/
+backend/logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Node
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
