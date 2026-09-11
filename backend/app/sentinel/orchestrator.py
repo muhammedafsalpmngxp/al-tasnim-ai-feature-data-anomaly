@@ -18,6 +18,7 @@ from app.domain.models import CheckResult, Run, RunStatus, utcnow
 from app.logging import get_logger
 from app.sentinel.checks import business_rules  # noqa: F401 -- registers hand-written checks
 from app.sentinel.checks.base import CheckContext, all_checks, clear_generated_checks
+from app.sentinel.checks.compiled import register_compiled_checks
 from app.sentinel.checks.generator import register_all_generated
 from app.sentinel.llm.client import LLMClient
 from app.sentinel.llm.enrich import enrich_run
@@ -195,6 +196,7 @@ class Orchestrator:
                 self.spec,
                 live_columns=lambda table: normaliser.columns_of(TableRef.parse(table)),
             )
+            register_compiled_checks(self.store)  # the agentic layer's ONLY runtime touch
             check_ctx = CheckContext(
                 source=self.source, scope=self.scope, spec=self.spec,
                 sources=normaliser.sources, as_of_date=str(run.as_of_date),

@@ -25,8 +25,7 @@ is no separate, looser mechanism for generated code.
 """
 from __future__ import annotations
 
-import re
-
+from app.db.source import quote_ident as _q
 from app.domain.models import Baseline, Finding, FindingClass, Grain, Severity
 from app.logging import get_logger
 from app.sentinel.checks.base import CheckContext, CheckOutcome, register_check
@@ -35,13 +34,6 @@ from app.sentinel.normalise.spec import NormalisationSpec
 log = get_logger(__name__)
 
 DATE_TYPES = {"date", "datetime", "datetime2", "smalldatetime", "datetimeoffset"}
-_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-
-def _q(name: str) -> str:
-    if not _IDENT.match(name):
-        raise ValueError(f"refusing to interpolate non-identifier column name: {name!r}")
-    return f"[{name}]"
 
 
 # ------------------------------------------------------------------------ F1/F2 date order

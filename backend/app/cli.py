@@ -5,12 +5,16 @@
     python -m app.cli run --tables well.well_progress --dry-run
     python -m app.cli show --run latest           # what the last run found
     python -m app.cli sql well.task_daily         # print the normalised SELECT
+    python -m app.cli introspect                  # rebuild schema.txt/hint_data.txt
+    python -m app.cli compiled --list             # review the compiled-agent's checks
+    python -m app.cli compiled --activate CMP-1   # human sign-off before it can ever run
 """
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
 from rich import box
@@ -432,6 +436,12 @@ def build_parser() -> argparse.ArgumentParser:
     sc.add_argument("--persist", action="store_true", help="write the snapshot under a probe run_id")
     sc.set_defaults(func=cmd_schema)
 
+    ins = sub.add_parser(
+        "introspect",
+        help="rebuild .cache/{schema,hint_data}.txt -- the compile-time agent's knowledge base",
+    )
+    ins.set_defaults(func=cmd_introspect)
+
     rep = sub.add_parser(
         "report", help="rebuild Excel/Word from an existing run without re-scanning the DB"
     )
@@ -450,6 +460,19 @@ def build_parser() -> argparse.ArgumentParser:
     sug.add_argument("--max-calls", type=int, default=20)
     sug.add_argument("--max-seconds", type=int, default=120)
     sug.set_defaults(func=cmd_suggest)
+
+    cmp_ = sub.add_parser(
+        "compiled",
+        help="review the compiled-agent's generated_check table (list/activate/disable)",
+    )
+    cmp_.add_argument("--list", action="store_true", help="list compiled checks")
+    cmp_.add_argument(
+        "--status", default=None,
+        help="filter --list by status (needs_review|active|disabled)",
+    )
+    cmp_.add_argument("--activate", default=None, metavar="CHECK_ID")
+    cmp_.add_argument("--disable", default=None, metavar="CHECK_ID")
+    cmp_.set_defaults(func=cmd_compiled)
     return p
 
 
@@ -590,6 +613,65 @@ def cmd_suggest(args: argparse.Namespace) -> int:
         store.close()
 
 
+def cmd_compiled(args: argparse.Namespace) -> int:
+    """Human review queue for `generated_check` (checks/compiled.py).
+
+    A row only ever runs as a live check once it is 'active' -- this command is the ONLY
+    supported way to move it there. There is deliberately no `--add` here: writing new SQL
+    is the compile-time agent's job (or a human editing the table directly for a hand-
+    written proof, as tests/test_compiled_checks.py does); this command is about the
+    human-in-the-loop gate on what a written row is allowed to do, not about writing rows.
+    """
+    s = get_settings()
+    store = FindingsStore(s)
+    try:
+        if args.activate is not None:
+            row = store.get_generated_check(args.activate)
+            if not row:
+                print(f"no generated_check {args.activate!r}")
+                return 1
+            store.set_generated_check_status(args.activate, "active")
+            print(f"{args.activate}: -> active (will register on the next run)")
+            return 0
+        if args.disable is not None:
+            row = store.get_generated_check(args.disable)
+            if not row:
+                print(f"no generated_check {args.disable!r}")
+                return 1
+            store.set_generated_check_status(args.disable, "disabled")
+            print(f"{args.disable}: -> disabled")
+            return 0
+
+        rows = store.generated_checks(status=args.status)
+        _hr(f"COMPILED CHECKS{f' (status={args.status})' if args.status else ''}")
+        if not rows:
+            out.print("[dim]  (none)[/]")
+            return 0
+        t = Table(box=box.SIMPLE_HEAD, header_style="bold", expand=True)
+        t.add_column("check_id", no_wrap=True)
+        t.add_column("status", no_wrap=True)
+        t.add_column("severity", no_wrap=True)
+        t.add_column("table", no_wrap=True, style="dim")
+        t.add_column("grain", no_wrap=True, style="dim")
+        t.add_column("created_by", no_wrap=True, style="dim")
+        t.add_column("title", overflow="fold")
+        status_style = {"needs_review": "yellow", "active": "green", "disabled": "dim red"}
+        for r in rows:
+            t.add_row(
+                r["check_id"],
+                Text(r["status"], style=status_style.get(r["status"], "")),
+                _sev(r["severity"]),
+                Text(r["table_ref"] or ""),
+                Text(r["grain_kind"] or ""),
+                Text(r["created_by"] or ""),
+                Text(r["title"]),
+            )
+        out.print(t)
+        return 0
+    finally:
+        store.close()
+
+
 def _suggest_approve(store: FindingsStore, s, suggestion_id: int, note: str | None) -> int:
     from app.sentinel.llm.suggest import generate_boilerplate
 
@@ -667,6 +749,26 @@ def cmd_schema(args: argparse.Namespace) -> int:
     finally:
         src.close()
         store.close()
+
+
+# ------------------------------------------------------------------------ introspect
+def cmd_introspect(_: argparse.Namespace) -> int:
+    """Rebuild the compile-time agent's knowledge base: `.cache/schema.txt` (columns,
+    PK/FK, declared or measured-candidate grain) and `.cache/hint_data.txt` (null%,
+    distinct counts, small-lookup values -- PII already excluded).
+
+    Read-only, and independent of a normal report run: this never registers a check or
+    writes a finding. Re-run it whenever the source schema changes; `fingerprints.json`
+    is what a later compile step uses to tell which tables actually need re-compiling.
+    """
+    from app.sentinel.introspect import build_knowledge_base
+
+    _hr("INTROSPECT — rebuilding the agent's knowledge base")
+    paths = build_knowledge_base()
+    for label, path in paths.items():
+        size = Path(path).stat().st_size
+        print(f"  {label:12}: {path}  ({size:,} bytes)")
+    return 0
 
 
 if __name__ == "__main__":

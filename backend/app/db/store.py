@@ -31,7 +31,7 @@ from app.domain.models import (
 
 log = structlog.get_logger(__name__)
 
-SCHEMA_VERSION = 4  # v4 adds finding.narration_key (cross-run LLM narration reuse)
+SCHEMA_VERSION = 5  # v5 adds generated_check (compiled agent -> deterministic check bridge)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -193,6 +193,39 @@ CREATE TABLE IF NOT EXISTS agent_trace (
     elapsed_ms   INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_agent_trace_session ON agent_trace(session_id);
+
+-- The compile-time agent's OUTPUT, and the ONLY thing the agentic layer contributes to a
+-- live run: a saved SQL string, registered every run through the exact same
+-- register_check(source="generated") path as the 39 column_semantics.yaml-driven checks
+-- in generator.py (see checks/compiled.py). This table is written RARELY -- only when the
+-- schema changes (new tables/columns) or a human asks for a re-compile -- and read EVERY
+-- run, which is what keeps report numbers reproducible between runs that don't touch it.
+--
+-- status='needs_review' rows are never registered: a table whose grain could not be
+-- measured, or was measured but not yet confirmed by a human, stays here forever rather
+-- than being guessed at (see schema_snapshot.py GrainCandidate / measure_grain -- the same
+-- "never auto-pick a winning key" discipline applies to what gets to RUN, not just what
+-- gets published in schema.txt).
+CREATE TABLE IF NOT EXISTS generated_check (
+    check_id           TEXT PRIMARY KEY,
+    table_ref          TEXT NOT NULL,
+    title              TEXT NOT NULL,
+    severity           TEXT NOT NULL DEFAULT 'medium',
+    sql_text           TEXT NOT NULL,
+    grain_kind         TEXT NOT NULL DEFAULT 'row',
+    grain_keys         TEXT NOT NULL DEFAULT '',
+    grain_order_by     TEXT,
+    baseline           TEXT NOT NULL DEFAULT 'none',
+    business_rule_ref  TEXT,
+    why_it_matters     TEXT,
+    status             TEXT NOT NULL DEFAULT 'needs_review',  -- needs_review|active|disabled
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    created_by         TEXT NOT NULL DEFAULT 'agent',          -- 'agent' | 'human'
+    session_id         TEXT,
+    notes              TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_generated_check_status ON generated_check(status);
 """
 
 
@@ -821,3 +854,80 @@ class FindingsStore:
             "SELECT * FROM agent_trace WHERE session_id=? ORDER BY step_no", (session_id,)
         ).fetchall()
         return [dict(r) for r in rs]
+
+    # -------------------------------------------------------- compiled (generated_check)
+    def upsert_generated_check(
+        self, *, check_id: str, table_ref: str, title: str, sql_text: str,
+        severity: str = "medium", grain_kind: str = "row", grain_keys: str = "",
+        grain_order_by: str | None = None, baseline: str = "none",
+        business_rule_ref: str | None = None, why_it_matters: str | None = None,
+        status: str = "needs_review", created_by: str = "agent",
+        session_id: str | None = None, notes: str | None = None,
+    ) -> None:
+        """Write one compile-time agent output. A re-compile of the same check_id
+        overwrites the SQL/status in place -- the table holds the CURRENT compiled suite,
+        not a history of every compile (docs decision: rare writes, no versioning needed
+        yet). `status` defaults to 'needs_review' so nothing self-activates; only a human
+        (or a script acting on their explicit say-so) moves a row to 'active'.
+        """
+        now = datetime.now().isoformat()
+        self._cn.execute(
+            """
+            INSERT INTO generated_check (
+                check_id, table_ref, title, severity, sql_text, grain_kind, grain_keys,
+                grain_order_by, baseline, business_rule_ref, why_it_matters, status,
+                created_at, updated_at, created_by, session_id, notes
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(check_id) DO UPDATE SET
+                table_ref=excluded.table_ref, title=excluded.title,
+                severity=excluded.severity, sql_text=excluded.sql_text,
+                grain_kind=excluded.grain_kind, grain_keys=excluded.grain_keys,
+                grain_order_by=excluded.grain_order_by, baseline=excluded.baseline,
+                business_rule_ref=excluded.business_rule_ref,
+                why_it_matters=excluded.why_it_matters, status=excluded.status,
+                updated_at=excluded.updated_at, session_id=excluded.session_id,
+                notes=excluded.notes
+            """,
+            (
+                check_id, table_ref, title, severity, sql_text, grain_kind, grain_keys,
+                grain_order_by, baseline, business_rule_ref, why_it_matters, status,
+                now, now, created_by, session_id, notes,
+            ),
+        )
+        self._cn.commit()
+        log.info("store.generated_check_upserted", check_id=check_id, status=status)
+
+    def active_generated_checks(self) -> list[dict[str, Any]]:
+        """Only what `checks/compiled.py` is allowed to register and run."""
+        rs = self._cn.execute(
+            "SELECT * FROM generated_check WHERE status='active' ORDER BY check_id"
+        ).fetchall()
+        return [dict(r) for r in rs]
+
+    def generated_checks(self, status: str | None = None) -> list[dict[str, Any]]:
+        """Everything, for a human review queue -- unlike `active_generated_checks`,
+        includes 'needs_review' and 'disabled' rows."""
+        sql = "SELECT * FROM generated_check"
+        args: list[Any] = []
+        if status:
+            sql += " WHERE status = ?"
+            args.append(status)
+        sql += " ORDER BY updated_at DESC"
+        rs = self._cn.execute(sql, args).fetchall()
+        return [dict(r) for r in rs]
+
+    def get_generated_check(self, check_id: str) -> dict[str, Any] | None:
+        row = self._cn.execute(
+            "SELECT * FROM generated_check WHERE check_id = ?", (check_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def set_generated_check_status(self, check_id: str, status: str) -> None:
+        if status not in ("needs_review", "active", "disabled"):
+            raise ValueError(f"invalid generated_check status: {status!r}")
+        self._cn.execute(
+            "UPDATE generated_check SET status=?, updated_at=? WHERE check_id=?",
+            (status, datetime.now().isoformat(), check_id),
+        )
+        self._cn.commit()
+        log.info("store.generated_check_status_set", check_id=check_id, status=status)

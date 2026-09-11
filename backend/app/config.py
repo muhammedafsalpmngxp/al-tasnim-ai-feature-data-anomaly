@@ -148,6 +148,14 @@ class Settings(BaseSettings):
     def config_dir(self) -> Path:
         return BACKEND_ROOT / "config"
 
+    @property
+    def cache_dir(self) -> Path:
+        """The compile-time agent's knowledge base (schema.txt/hint_data.txt/
+        fingerprints.json). Under BACKEND_ROOT like config_dir, not REPO_ROOT like
+        output_dir/store_path -- this is generated build state next to the code that
+        reads it, not a data product like a run's reports."""
+        return BACKEND_ROOT / ".cache"
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

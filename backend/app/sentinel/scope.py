@@ -31,7 +31,9 @@ class TableRef:
 
     @property
     def bracketed(self) -> str:
-        return f"[{self.schema}].[{self.table}]"
+        # Same quoter as every other identifier path -- see db.source.quote_ident.
+        from app.db.source import quote_ident
+        return f"{quote_ident(self.schema)}.{quote_ident(self.table)}"
 
     @classmethod
     def parse(cls, value: str) -> "TableRef":

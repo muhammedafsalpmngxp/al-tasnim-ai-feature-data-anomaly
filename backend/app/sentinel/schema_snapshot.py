@@ -30,10 +30,11 @@ import hashlib
 import time
 from dataclasses import dataclass, field
 
-from app.db.source import SourceDatabase
+from app.db.source import SourceDatabase, quote_ident as _q
 from app.db.store import FindingsStore
 from app.domain.models import Finding, FindingClass, Severity
 from app.logging import get_logger
+from app.sentinel.normalise.spec import NormalisationSpec
 from app.sentinel.scope import Scope, TableRef
 
 log = get_logger(__name__)
@@ -41,6 +42,10 @@ log = get_logger(__name__)
 METRIC_COLUMN_FINGERPRINT = "column_fingerprint"
 METRIC_TABLE_FINGERPRINT = "table_fingerprint"
 METRIC_ROW_COUNT = "row_count"
+
+# COUNT(DISTINCT ...) is invalid on these in SQL Server -- found live on
+# dbo.mapping_master, where the grain probe crashed with error 8117.
+_UNCOUNTABLE_TYPES = {"text", "ntext", "image", "xml", "geography", "geometry"}
 
 
 @dataclass(slots=True)
@@ -59,16 +64,100 @@ class ColumnSnapshot:
         return hashlib.sha1(raw.encode()).hexdigest()[:12]  # fingerprint, not security
 
 
+@dataclass(slots=True, frozen=True)
+class ForeignKeyRef:
+    """One declared FK column and where it points. `nullable` matters on its own: an
+    enforced FK makes an ORPHAN impossible, so the only checkable defect on a declared
+    relationship is a row that is simply UNLINKED -- which is possible exactly when the
+    referencing column allows NULL. Measured: 41 FKs here, 0 disabled, 0 untrusted, 36
+    nullable columns."""
+
+    column: str
+    target_table: str
+    target_column: str
+    nullable: bool
+
+
+@dataclass(slots=True, frozen=True)
+class GrainCandidate:
+    """One candidate key and its MEASURED rows-per-distinct-value.
+
+    A candidate, never a conclusion. Live measurement showed why the distinction matters:
+    `well.well_master` is one row per well, but probing `well_type_id` (a dimension with
+    ~12 values) returns 67.8 rows per value -- which is low cardinality, not duplication.
+    Reporting that as "the grain" would be a false positive on a clean table, and picking
+    the other extreme (closest to unique) hides the real 206x duplication on
+    `dbo.activity_task_plan`'s business key. No naming rule separates a dimension from a
+    key, so the measurement is published and the judgement is left to config or a human.
+    """
+
+    columns: tuple[str, ...]
+    rows_per_value: float
+
+    @property
+    def is_unique(self) -> bool:
+        return self.rows_per_value <= 1.0
+
+    def describe(self) -> str:
+        return f"{', '.join(self.columns)} -> {self.rows_per_value:.2f}"
+
+
 @dataclass(slots=True)
 class TableSnapshot:
     ref: TableRef
     columns: dict[str, ColumnSnapshot] = field(default_factory=dict)
     row_count: int = 0
+    # Key metadata, for the agent's knowledge base and for graincheck. Empty for a view.
+    primary_key: tuple[str, ...] = ()
+    foreign_keys: tuple[ForeignKeyRef, ...] = ()
+    # The REVIEWED grain from column_semantics.yaml, when the table has one. Authoritative:
+    # it is already measured and human-confirmed, so it is never overridden by a probe.
+    declared_grain: str | None = None
+    declared_rows_per_key: float | None = None
+    # Measured candidates for a table with NO declared grain. Ordered closest-to-unique
+    # first. Explicitly unconfirmed -- a compiled check on such a table is registered as
+    # `needs_review` until someone states which of these is the entity key.
+    grain_candidates: tuple[GrainCandidate, ...] = ()
+
+    @property
+    def grain_is_confirmed(self) -> bool:
+        return self.declared_grain is not None
 
     @property
     def fingerprint(self) -> str:
+        """Columns only -- the DRIFT fingerprint, unchanged.
+
+        Deliberately NOT extended with the key metadata added above. `diff_against_baseline`
+        compares this against the value stored by the previous run, so folding keys in would
+        make every one of the 74 tables report as drifted exactly once after deploy: 74
+        spurious PIP-007 findings, and a real schema change hidden among them. Use
+        `compile_fingerprint` for anything that needs to notice a key change.
+        """
         raw = "|".join(f"{n}:{c.fingerprint}" for n, c in sorted(self.columns.items()))
         return hashlib.sha1(raw.encode()).hexdigest()[:12]  # 48 bits: exact in a float64, plenty of collision resistance for this purpose
+
+    @property
+    def compile_fingerprint(self) -> str:
+        """Everything a generated check could depend on: columns, PK, FKs, and the
+        measured grain.
+
+        Separate from `fingerprint` because the two answer different questions. Drift asks
+        "did the structure change, should a human be told?"; this asks "could a check
+        compiled against this table still be valid?" -- and a dropped FK or a grain that
+        moved from 1.0 to 3.03 rows per key invalidates a compiled check while changing
+        nothing a column-only hash would see.
+        """
+        parts = [
+            "|".join(f"{n}:{c.fingerprint}" for n, c in sorted(self.columns.items())),
+            "pk=" + ",".join(sorted(self.primary_key)),
+            "fk=" + ",".join(
+                f"{f.column}->{f.target_table}.{f.target_column}:{int(f.nullable)}"
+                for f in sorted(self.foreign_keys, key=lambda x: (x.column, x.target_table))
+            ),
+            f"grain={self.declared_grain or ''}:{self.declared_rows_per_key or ''}",
+            "cand=" + ";".join(c.describe() for c in self.grain_candidates),
+        ]
+        return hashlib.sha1("||".join(parts).encode()).hexdigest()[:16]
 
 
 @dataclass(slots=True)
@@ -143,13 +232,210 @@ class SchemaSnapshotter:
                 max_length=int(r["max_length"]),
                 ordinal=int(r["ordinal"]),
             )
+        self._attach_keys(snapshots)
         log.info(
             "schema_snapshot.captured",
             tables=len(snapshots),
             columns=sum(len(s.columns) for s in snapshots.values()),
+            primary_keys=sum(1 for s in snapshots.values() if s.primary_key),
+            foreign_keys=sum(len(s.foreign_keys) for s in snapshots.values()),
             seconds=round(time.perf_counter() - started, 2),
         )
         return snapshots
+
+    # ------------------------------------------------------------------- key metadata
+    def _attach_keys(self, snapshots: dict[str, TableSnapshot]) -> None:
+        """Fill in primary_key / foreign_keys from the catalogue. Two metadata queries,
+        no table scans.
+
+        A PK column that Scope hides is still recorded: the point of knowing the key is to
+        reason about GRAIN, and a hidden column still determines how many rows there are
+        per entity. Nothing here is rendered into a prompt directly -- `introspect.py`
+        applies the PII/visibility filter when it writes the knowledge files.
+        """
+        try:
+            pk_rows = self.src.rows(
+                """
+                SELECT s.name AS [schema], t.name AS [table], c.name AS column_name,
+                       ic.key_ordinal
+                FROM sys.indexes i
+                JOIN sys.index_columns ic
+                     ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+                JOIN sys.columns c
+                     ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+                JOIN sys.tables t ON t.object_id = i.object_id
+                JOIN sys.schemas s ON s.schema_id = t.schema_id
+                WHERE i.is_primary_key = 1
+                ORDER BY s.name, t.name, ic.key_ordinal
+                """
+            )
+            fk_rows = self.src.rows(
+                """
+                SELECT s.name AS [schema], t.name AS [table], c.name AS column_name,
+                       rs.name AS target_schema, rt.name AS target_table,
+                       rc.name AS target_column, c.is_nullable
+                FROM sys.foreign_key_columns fkc
+                JOIN sys.tables t ON t.object_id = fkc.parent_object_id
+                JOIN sys.schemas s ON s.schema_id = t.schema_id
+                JOIN sys.columns c
+                     ON c.object_id = fkc.parent_object_id
+                    AND c.column_id = fkc.parent_column_id
+                JOIN sys.tables rt ON rt.object_id = fkc.referenced_object_id
+                JOIN sys.schemas rs ON rs.schema_id = rt.schema_id
+                JOIN sys.columns rc
+                     ON rc.object_id = fkc.referenced_object_id
+                    AND rc.column_id = fkc.referenced_column_id
+                ORDER BY s.name, t.name, c.name
+                """
+            )
+        except Exception as exc:  # noqa: BLE001 -- metadata is additive; a run must not fail for it
+            log.warning("schema_snapshot.key_metadata_failed", error=str(exc)[:300])
+            return
+
+        pks: dict[str, list[str]] = {}
+        for r in pk_rows:
+            pks.setdefault(f"{r['schema']}.{r['table']}", []).append(r["column_name"])
+        fks: dict[str, list[ForeignKeyRef]] = {}
+        for r in fk_rows:
+            fks.setdefault(f"{r['schema']}.{r['table']}", []).append(
+                ForeignKeyRef(
+                    column=r["column_name"],
+                    target_table=f"{r['target_schema']}.{r['target_table']}",
+                    target_column=r["target_column"],
+                    nullable=bool(r["is_nullable"]),
+                )
+            )
+        for name, snap in snapshots.items():
+            snap.primary_key = tuple(pks.get(name, ()))
+            snap.foreign_keys = tuple(fks.get(name, ()))
+
+    def measure_grain(
+        self,
+        snapshots: dict[str, TableSnapshot],
+        *,
+        spec: NormalisationSpec | None = None,
+        min_rows: int = 100,
+        max_candidates: int = 6,
+    ) -> int:
+        """Measure rows-per-key, reporting the WORST duplication found, never the first.
+
+        A wrong grain is the recurring defect in this project, so this is the most
+        load-bearing line in the knowledge base -- and the first version of it was
+        DANGEROUSLY wrong, in a way only live data showed:
+
+          * `well.task_daily`: probing the first `*id` column found the surrogate `id`,
+            measured 1.0, and declared the table CLEAN. Its real grain is 3.03 rows per
+            (well_id, task_code) -- the exact table this project's documented grain bug
+            came from. A false "clean" is worse than no measurement, because it tells the
+            agent the most dangerous table in the database is safe.
+          * `dbo.activity_task_plan`: skipped entirely because it has a single-column PK,
+            yet it repeats (well_id, task_code, schedule_id) 206x-2,718x. "Has a PK" is
+            not "one row per entity" when the PK is a surrogate.
+          * `dbo.mapping_master`: the probe CRASHED -- COUNT(DISTINCT ...) is invalid on a
+            `text` column.
+
+        So now: a DECLARED grain is read from config rather than guessed (it is already
+        measured and human-reviewed there); otherwise several candidate keys are probed and
+        the worst ratio wins; uncountable types are skipped; and a single-column PK marks
+        the PK itself as unique WITHOUT concluding anything about the business key.
+        """
+        declared = 0
+        probes = 0
+        for name, snap in sorted(snapshots.items()):
+            if name not in self._row_counts or snap.row_count < min_rows:
+                continue
+
+            # 1. A reviewed grain is authoritative -- never re-guessed, only measured.
+            sem = spec.semantics_for(name) if spec else None
+            keys = tuple(getattr(getattr(sem, "grain", None), "keys", ()) or ()) if sem else ()
+            if keys:
+                snap.declared_grain = ", ".join(keys)
+                ratio = self._ratio_for(snap, list(keys))
+                if ratio is not None:
+                    probes += 1
+                    snap.declared_rows_per_key = round(ratio, 2)
+                declared += 1
+                continue
+
+            # 2. No declared grain: probe candidates and publish them ALL, ordered
+            # closest-to-unique first. Deliberately no winner is chosen -- see
+            # GrainCandidate for the two live cases that make any single rule wrong.
+            if snap.row_count > self.scope.large_table_row_limit:
+                # A multi-column COUNT(DISTINCT ...) over 17.9M rows took 10.7s live.
+                # Skipped rather than paid for on every introspect, and the skip is
+                # visible because grain_candidates stays empty.
+                log.info("schema_snapshot.grain_probe_skipped_large", table=name,
+                         rows=snap.row_count)
+                continue
+            countable = [
+                c for c, col in snap.columns.items()
+                if col.data_type.lower() not in _UNCOUNTABLE_TYPES
+            ]
+            combos: list[list[str]] = []
+            if snap.primary_key:
+                combos.append(list(snap.primary_key))
+            # `code` alongside `id`: found live on wbs.WBS_master, which has no PK and no
+            # `*id`-suffixed column at all, only WBS_Code/Activity_code/Cluster_code/
+            # Plant_Code -- an `endswith("id")`-only rule missed every one of them and
+            # this table (which is exactly the kind the agent most needs to reach) would
+            # have gone into the knowledge base with zero grain candidates.
+            key_cols = [c for c in countable if c.lower().endswith(("id", "code"))]
+            if len(key_cols) > 1:
+                combos.append(key_cols[:4])
+                combos.extend([key_cols[i], key_cols[i + 1]] for i in range(len(key_cols) - 1))
+            combos.extend([c] for c in key_cols)
+            seen: set[tuple[str, ...]] = set()
+            found: list[GrainCandidate] = []
+            for combo in combos:
+                key = tuple(combo)
+                if not combo or key in seen:
+                    continue
+                seen.add(key)
+                if len(found) >= max_candidates:
+                    break
+                ratio = self._ratio_for(snap, combo)
+                if ratio is None:
+                    continue
+                probes += 1
+                found.append(GrainCandidate(columns=key, rows_per_value=round(ratio, 2)))
+            snap.grain_candidates = tuple(
+                sorted(found, key=lambda c: c.rows_per_value)
+            )
+
+        log.info(
+            "schema_snapshot.grain_measured",
+            declared_from_config=declared,
+            candidates_measured=sum(len(s.grain_candidates) for s in snapshots.values()),
+            probes_run=probes,
+        )
+        return probes
+
+    def _ratio_for(self, snap: TableSnapshot, columns: list[str]) -> float | None:
+        """rows / distinct(columns) for one candidate key. None if it cannot be measured."""
+        if not columns:
+            return None
+        # COUNT(DISTINCT a, b) is not valid T-SQL, so a composite is counted over its
+        # concatenation. ISNULL guards a NULL member collapsing the whole key to NULL,
+        # which would silently under-count distinct values and overstate duplication.
+        if len(columns) == 1:
+            expr = _q(columns[0])
+        else:
+            expr = " + '|' + ".join(
+                f"ISNULL(CAST({_q(c)} AS nvarchar(200)), '')" for c in columns
+            )
+        try:
+            row = self.src.one(
+                f"SELECT COUNT(*) AS n, COUNT(DISTINCT {expr}) AS d "
+                f"FROM {_q(snap.ref.schema)}.{_q(snap.ref.table)}"
+            ) or {}
+        except Exception as exc:  # noqa: BLE001 -- one odd type must not stop the sweep
+            log.warning(
+                "schema_snapshot.grain_probe_failed",
+                table=snap.ref.full, key=",".join(columns), error=str(exc)[:160],
+            )
+            return None
+        n, d = int(row.get("n") or 0), int(row.get("d") or 0)
+        return (n / d) if d else None
 
     # ---------------------------------------------------------------- store + diff
     def persist(

@@ -24,6 +24,7 @@ from typing import Any
 
 from app.db.source import ReadOnlyViolation, SourceDatabase
 from app.logging import get_logger
+from app.sentinel import pii
 from app.sentinel.scope import Scope
 
 log = get_logger(__name__)
@@ -130,7 +131,16 @@ class ExplorationTools:
             """,
             (table,),
         )
-        visible = [c for c in cols if self.scope.column_allowed(schema, name, c["column_name"])]
+        # Both filters, not just Scope's. Scope covers DQ_EXCLUDED_COLUMNS and
+        # secret-looking names; the `pii_columns` patterns declared in
+        # column_semantics.yaml are enforced by app/sentinel/pii.py. Until that module
+        # existed this line let the agent profile `supervisor_email` and `task_assignee`,
+        # contradicting this method's own docstring.
+        visible = [
+            c for c in cols
+            if self.scope.column_allowed(schema, name, c["column_name"])
+            and not pii.is_pii(table, c["column_name"])
+        ]
         if not visible:
             return self._record(step, "describe_table", table, "error: no visible columns", False, t0)
         select_list = ", ".join(

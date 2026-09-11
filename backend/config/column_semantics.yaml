@@ -270,3 +270,11 @@ pii_columns:
   - core.engineering_task_plan.task_assignee
   - dbo.activity_taskplan_job_progress.supervisor_email
   - dbo.activity_taskplan_job_progress.task_assignee
+  # Found live 2026-09-10, building app/sentinel/introspect.py: dbo.activity_task_plan
+  # (the 17.9M-row table already excluded from dedup as redundant with
+  # activity_taskplan_job_progress -- see normalisation.yaml) carries the same
+  # supervisor_email column as its three sibling P6-family tables above, but was never
+  # declared here. Nothing had ever read this table's column-level data broadly enough
+  # to notice -- introspect.py's knowledge-base build was the first thing to do so, and
+  # it surfaced the column in hint_data.txt before this line existed.
+  - dbo.activity_task_plan.supervisor_email

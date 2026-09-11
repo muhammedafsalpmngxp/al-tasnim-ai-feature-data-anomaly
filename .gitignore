@@ -26,3 +26,5 @@ output/
 Thumbs.db
 Desktop.ini
 output/suggested_checks/
+
+backend/.cache/

@@ -50,6 +50,31 @@ class ReadOnlyViolation(RuntimeError):
     """Raised when a statement that could modify data is attempted."""
 
 
+def quote_ident(name: str) -> str:
+    """Bracket-quote one SQL Server identifier, escaping any embedded `]`.
+
+    THE canonical quoter -- `checks/generator.py`, `schema_snapshot.py`, `scope.TableRef`
+    and the agent all route through this, so identifier handling cannot differ between
+    the module that writes a check and the module that measures a table.
+
+    Doubling `]` is T-SQL's own escape inside a quoted identifier, which is what makes
+    this injection-safe: a name cannot terminate the bracket early. That is a stronger
+    guarantee than the character whitelist this replaced, which was safe but rejected 9
+    legitimate columns in this database outright --
+        dbo.RFI_form_data.[Form Number]
+        dbo.FTR_form_data.[No of FTR Items Identified]  (+5 more on that table)
+        well.task_daily.[plan]        <- a T-SQL RESERVED WORD; bare, SQL Server reports
+                                         "Incorrect syntax near the keyword 'plan'",
+                                         which reads as if the column does not exist.
+    A NUL byte cannot appear in a SQL Server identifier at all, so it stays refused.
+    """
+    if "\x00" in name:
+        raise ReadOnlyViolation(
+            f"refusing to interpolate a NUL byte in an identifier: {name!r}"
+        )
+    return "[" + name.replace("]", "]]") + "]"
+
+
 def _strip_noise(sql: str) -> str:
     """Remove comments and string literals so keyword scanning can't be fooled.
 
