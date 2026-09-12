@@ -41,8 +41,18 @@ _NUM_TABLE_RE = re.compile(r"^(\S+)\s+\(([\d,]+)\s+rows\)\s*$")
 # "  - col: min 0, max 0.3, avg 0.01, stdev 0.03, nulls 0% | <scale prose>"
 _NUM_COL_RE = re.compile(
     r"^\s+-\s+(\S+):\s+min\s+(\S+?),\s+max\s+(\S+?),\s+avg\s+(\S+?),\s+stdev\s+(\S+?),"
-    r"\s+nulls\s+(\d+)%\s*\|\s*(.+?)\s*$"
+    r"\s+nulls\s+(<?>?\d+)%\s*\|\s*(.+?)\s*$"
 )
+# The COMPACT form, "  - well_id: 628..37625", written for a column whose full statistics carry
+# nothing actionable (see _is_full_detail in db/introspect.py).
+#
+# ⚠ THIS READER AND THAT WRITER MUST BE CHANGED TOGETHER. Adding the compact form to the writer
+# without adding it here left every plain-number column invisible to the index - the table count
+# with statistics fell from 70 to 13 and nothing failed, because the ratio columns that the
+# generic probes actually need happened to still match the full pattern. A silent two-thirds
+# loss of the index is exactly the kind of regression this engine exists to catch in other
+# people's data, so eval/test_rules.py now asserts the two formats round-trip.
+_NUM_COMPACT_RE = re.compile(r"^\s+-\s+(\S+):\s+(-?[\d.eE+]+)\.\.(-?[\d.eE+]+)\s*$")
 # "  - col (text): 183 of 642 values do NOT parse ..." / "NONE of 17264 values parse ..."
 _TXT_BAD_RE = re.compile(r"^\s+-\s+(\S+)\s+\(text\):\s+(\d+)\s+of\s+(\d+)\s+values do NOT parse")
 _TXT_NONE_RE = re.compile(r"^\s+-\s+(\S+)\s+\(text\):\s+NONE of\s+(\d+)\s+values parse")
@@ -254,11 +264,21 @@ def _parse_numeric(text: str, tables: dict[str, Table]) -> None:
 
         m = _NUM_COL_RE.match(line)
         if m:
+            # "<1%" / ">99%" are emitted where rounding would otherwise claim 0% or 100% and
+            # contradict the statistics beside it, so strip the marker before converting.
             current.stats[m.group(1)] = NumericStat(
                 lo=_num(m.group(2)), hi=_num(m.group(3)),
                 avg=_num(m.group(4)), stdev=_num(m.group(5)),
-                null_pct=int(m.group(6)), scale=m.group(7),
+                null_pct=int(m.group(6).lstrip("<>")), scale=m.group(7),
             )
+            continue
+
+        m = _NUM_COMPACT_RE.match(line)
+        if m:
+            # Range only. `scale` stays empty, so is_ratio is False and bounds() returns None -
+            # which is correct: the writer chose the compact form precisely because this column
+            # has no meaningful scale, and inventing one here would be worse than having none.
+            current.stats[m.group(1)] = NumericStat(lo=_num(m.group(2)), hi=_num(m.group(3)))
             continue
 
         m = _TXT_BAD_RE.match(line)

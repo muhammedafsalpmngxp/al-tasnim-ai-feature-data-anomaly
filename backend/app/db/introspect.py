@@ -57,7 +57,7 @@ SECRET_COLUMN_MARKERS = (
 # Bumped whenever _render() changes the TEXT it emits for an unchanged database. The cache is
 # keyed on a fingerprint of the live STRUCTURE, so without this a rendering change would keep
 # serving the old cached text forever - the database has not changed, so nothing else notices.
-_RENDER_VERSION = "3-anomaly-honest-null-pct"
+_RENDER_VERSION = "4-anomaly-compact-plain-numerics"
 
 # T-SQL reserved keywords. A column whose NAME is one of these MUST be written [bracketed] or
 # the query fails to parse - and the error is misleading: SQL Server reports "Incorrect syntax
@@ -835,6 +835,40 @@ def _classify_scale(col: str, lo, hi, pk_columns: set[str] | None = None) -> str
     return "plain number"
 
 
+def _is_full_detail(col, lo, hi, avg, nulls: int, total: int, scale: str) -> bool:
+    """Whether this column earns a full statistics line rather than a bare range.
+
+    TOKEN COST, MEASURED. The hint files are ~33k characters of a ~90k-character author prompt -
+    a third of every call, on every retry, for every rule. Two thirds of those characters were
+    lines reading "plain number" for an identifier column, carrying an average and a standard
+    deviation nobody can act on. An id ranging 1..99589 needs no statistics; it needs one line
+    saying it exists and what it spans.
+
+    Full detail is kept wherever a figure is actually DECIDABLE from it:
+
+      * a column with a real SCALE (a fraction or a percentage), because getting that wrong is
+        the single most damaging mistake a probe can make - `< 100` against a 0-1 column flags
+        every row, `>= 1` against a 0-100 column flags none;
+      * a NEGATIVE minimum, which for a quantity, a duration or a count is usually the anomaly
+        itself and should be visible to whoever writes the rule;
+      * a high NULL rate, because it changes whether a join can require a match at all - the
+        71%-null classification column in this database silently discarded most of a table;
+      * an extreme MAXIMUM against the average, which marks the outlier a statistical rule will
+        be reasoning about.
+
+    Everything else gets "col: lo..hi", which is all a plain identifier or code ever needed.
+    """
+    if scale and scale != "plain number":
+        return True
+    if lo is not None and lo < 0:
+        return True
+    if total and nulls and (100.0 * nulls / total) >= 40:
+        return True
+    if avg and hi is not None and abs(avg) > 0 and abs(hi) > abs(avg) * 1000:
+        return True
+    return False
+
+
 def build_numeric_hints(use_cache: bool = True) -> str:
     """Measured range/scale/null-rate per numeric column, plus text columns that fail to parse.
 
@@ -921,14 +955,19 @@ def build_numeric_hints(use_cache: bool = True) -> str:
                 i += 5
                 nulls = n_rows - (non_null or 0)
                 scale = _classify_scale(c, lo, hi, tpk)
-                bits = [
-                    f"min {lo:g}" if lo is not None else "min -",
-                    f"max {hi:g}" if hi is not None else "max -",
-                    f"avg {avg:.4g}" if avg is not None else "avg -",
-                    f"stdev {sd:.4g}" if sd is not None else "stdev -",
-                    f"nulls {_null_pct(nulls, n_rows)}",
-                ]
-                out.append(f"  - {c}: {', '.join(bits)} | {scale}")
+                if _is_full_detail(c, lo, hi, avg, nulls, n_rows, scale):
+                    bits = [
+                        f"min {lo:g}" if lo is not None else "min -",
+                        f"max {hi:g}" if hi is not None else "max -",
+                        f"avg {avg:.4g}" if avg is not None else "avg -",
+                        f"stdev {sd:.4g}" if sd is not None else "stdev -",
+                        f"nulls {_null_pct(nulls, n_rows)}",
+                    ]
+                    out.append(f"  - {c}: {', '.join(bits)} | {scale}")
+                else:
+                    # Compact form. See _is_full_detail for why this is not a loss.
+                    rng = (f"{lo:g}..{hi:g}" if lo is not None and hi is not None else "-")
+                    out.append(f"  - {c}: {rng}")
             for c in textish:
                 non_null, bad = row[i : i + 2]
                 i += 2

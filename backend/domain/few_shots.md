@@ -1,109 +1,261 @@
-EXAMPLES (question -> correct T-SQL).
+WORKED PROBE EXAMPLES (an anomaly stated in business language -> the two queries that detect it).
 
-These are worked patterns, NOT a schema reference. The SCHEMA block above is the only authority on
-which tables and columns exist: if an example here ever disagrees with it, the SCHEMA block wins.
-(An earlier version of this file claimed every example had been run successfully against the
-database. That guarantee could not survive the database being changed underneath it — columns were
-renamed and a snapshot table became one-row-per-entity, leaving five examples referencing names
-that no longer existed. Trust the SCHEMA block, not this note.)
+These are PATTERNS, not a schema reference. The SCHEMA block is the only authority on which
+tables and columns exist: where an example disagrees with it, the SCHEMA block wins. Table and
+column names below are placeholders in angle brackets, never real names — copy the SHAPE, then
+resolve every identifier against the schema you were given.
 
-De-duplicate ONLY where the SCHEMA block marks a table "⚠ MANY ROWS PER <key>". Do not add a
-GROUP BY to a table that carries no such marker.
+Each example exists to show one trap that is easy to fall into and expensive to get wrong.
 
-Q: How many wells are there?
+---
+
+## 1. Scope is what you EXAMINED, not what you flagged
+
+Anomaly: "a record that has reached a milestone but is missing the date that proves it".
+
 ```sql
-SELECT COUNT(DISTINCT well_id) AS well_count
-FROM well.well_master;
-```
-
-Q: How many wells are completed?
-```sql
-SELECT COUNT(DISTINCT well_id) AS completed_wells
-FROM well.well_master
-WHERE eng_completion_date IS NOT NULL;
-```
-
-Q: How many wells are there per project?
-```sql
-SELECT p.project_id, p.project_name, COUNT(DISTINCT wm.well_id) AS well_count
-FROM well.well_master wm
-JOIN project.project_mstr p ON wm.project_id = p.project_id
-GROUP BY p.project_id, p.project_name
-ORDER BY well_count DESC;
-```
--- Join on the declared FK column (project_id), and select the real label column (project_name).
--- GROUP BY the KEY as well as the label: project names are NOT unique here (19 projects share 12
--- names), so grouping by name alone silently merges two different projects into one row. Group by
--- the identifier and carry the name along for display. This applies to any label column whose
--- table has a separate primary key.
--- COUNT(DISTINCT ...) is safe regardless of grain: no CTE, no ROW_NUMBER.
-
-Q: List 5 wells with their rig-on and completion dates.
-```sql
-SELECT TOP 5
-       well_id,
-       rig_on_date,
-       eng_completion_date
-FROM well.well_master
-ORDER BY well_id;
-```
--- No GROUP BY: well.well_master carries no "MANY ROWS PER well_id" marker, so it is already one
--- row per well. Adding a GROUP BY here would be wrong-headed, not merely redundant.
-
-Q: Show the latest overall progress for each well.
-```sql
-WITH latest_progress AS (
-    SELECT well_id, overall_progress, week_number,
-           ROW_NUMBER() OVER (PARTITION BY well_id ORDER BY week_number DESC) AS rn
-    FROM well.well_progress
+-- SUMMARY
+WITH scoped AS (
+    SELECT e.<entity_key>,
+           CASE WHEN e.<proof_date> IS NULL THEN 1 ELSE 0 END AS is_anomaly,
+           CAST(1 AS float)                                   AS sev
+    FROM <entity_table> e
+    WHERE e.<milestone_reached_flag> IS NOT NULL      -- SCOPE: what makes a record eligible
 )
-SELECT well_id, overall_progress, week_number
-FROM latest_progress
-WHERE rn = 1
-ORDER BY overall_progress DESC;
+SELECT 'RULE-ID'                                                   AS rule_id,
+       COUNT(*)                                                    AS scope_total,
+       SUM(is_anomaly)                                             AS anomaly_count,
+       CAST(100.0 * SUM(is_anomaly) / NULLIF(COUNT(*),0) AS decimal(9,4)) AS anomaly_pct,
+       MAX(CASE WHEN is_anomaly = 1 THEN sev END)                  AS worst_severity_val
+FROM scoped;
 ```
--- well.well_progress IS the weekly table (many rows per well), so ROW_NUMBER() by week_number is
--- the right way to pick one row per well — and it names WHICH row was chosen, unlike MAX().
 
-Q: How many wells are in each cluster?
-```sql
-SELECT c.cluster_name, COUNT(DISTINCT wm.well_id) AS well_count
-FROM well.well_master wm
-LEFT JOIN ref.cluster c ON wm.cluster_code = c.cluster_code
-GROUP BY c.cluster_name
-ORDER BY well_count DESC;
-```
--- Follow the FK that actually exists: cluster_code is on well.well_master and points straight at
--- ref.cluster. Do not route this through project.project_mstr — it has no cluster column.
--- LEFT JOIN keeps wells not yet mapped to a cluster; they group under NULL. Report that unmapped
--- group rather than dropping it, so the total still reconciles.
+⚠ The WHERE clause carries the SCOPE condition only. Putting the anomaly condition there too
+makes `scope_total` equal `anomaly_count`, so the percentage is always 100% and nobody can tell
+whether two findings out of five or two out of fifty thousand were found.
 
-Q: List 5 wells with their names.
+---
+
+## 2. A missing value past its deadline IS the finding — never filter it out
+
+Anomaly: "a milestone document was not issued by its deadline, where the deadline is a fixed
+number of days before a planned date".
+
 ```sql
-WITH latest AS (
-    SELECT well_id, well_name,
-           ROW_NUMBER() OVER (PARTITION BY well_id ORDER BY week_number DESC) AS rn
-    FROM well.well_progress
+-- SUMMARY
+WITH scoped AS (
+    SELECT e.<entity_key>,
+           DATEADD(day, -<deadline_days>, e.<planned_date>) AS deadline,
+           e.<issue_date>
+    FROM <entity_table> e
+    WHERE e.<planned_date> IS NOT NULL                -- a deadline must be computable
+),
+judged AS (
+    SELECT s.*,
+           CASE
+             -- issued, but late
+             WHEN s.<issue_date> IS NOT NULL AND s.<issue_date> > s.deadline THEN 1
+             -- never issued, and the deadline has already passed
+             WHEN s.<issue_date> IS NULL AND CAST(GETDATE() AS date) > s.deadline THEN 1
+             ELSE 0
+           END AS is_anomaly,
+           CASE
+             WHEN s.<issue_date> IS NOT NULL THEN DATEDIFF(day, s.deadline, s.<issue_date>)
+             ELSE DATEDIFF(day, s.deadline, CAST(GETDATE() AS date))
+           END AS days_late
+    FROM scoped s
 )
-SELECT TOP 5 well_id, well_name
-FROM latest
-WHERE rn = 1
-ORDER BY well_name;
+SELECT 'RULE-ID'                                                   AS rule_id,
+       COUNT(*)                                                    AS scope_total,
+       SUM(is_anomaly)                                             AS anomaly_count,
+       CAST(100.0 * SUM(is_anomaly) / NULLIF(COUNT(*),0) AS decimal(9,4)) AS anomaly_pct,
+       MAX(CASE WHEN is_anomaly = 1 THEN CAST(days_late AS float) END) AS worst_severity_val
+FROM judged;
 ```
--- Pick the table that HAS the column: well_name lives on well.well_progress, not on
--- well.well_master. Because that table is many-rows-per-well, take the latest row per well
--- explicitly instead of letting an arbitrary one through.
 
-Q: List employees named Amal (or any variation like "whose name is Amal").
+⚠ Adding `AND <issue_date> IS NOT NULL` removes exactly the worst offenders — the records where
+the document was never issued at all. A NULL past its deadline is a miss, not an unknown.
+
+---
+
+## 3. Read the measured SCALE before comparing a proportion
+
+Anomaly: "a task reports full completion but is not marked complete".
+
+NUMERIC HINTS states the scale of every numeric column. A progress column may be a 0-1 fraction
+or a 0-100 percentage, and the declared type never says which.
+
 ```sql
-SELECT TOP 10
-       id AS employee_id,
-       emp_name
-FROM ref.employee
-WHERE LOWER(emp_name) = 'amal'
-   OR LOWER(emp_name) LIKE 'amal %'
-   OR LOWER(emp_name) LIKE '% amal %'
-   OR LOWER(emp_name) LIKE '% amal'
-ORDER BY emp_name;
+-- when NUMERIC HINTS says FRACTION_1 (0-1):
+WHERE t.<progress> >= 1.0 AND t.<complete_flag> = 0
+
+-- when it says PERCENT_100 (0-100):
+WHERE t.<progress> >= 100 AND t.<complete_flag> = 0
 ```
--- When filtering by a specific person's name, DO NOT use a blanket `LIKE '%name%'`, as it incorrectly matches substrings (e.g. 'Jamal' when searching for 'Amal'). Always use exact word boundaries as shown above, regardless of how the user phrases the request.
+
+⚠ `>= 1.0` against a 0-100 column flags almost every row; `>= 100` against a 0-1 column flags
+none. Both look like working queries and neither fails. Use `>=` rather than `=`, so a
+recorded value above full still counts as complete.
+
+---
+
+## 4. Collapse history to one current record before judging an entity
+
+Anomaly: "a record's current state is self-contradictory", in a table that keeps one row per
+update.
+
+```sql
+-- DETAIL
+WITH current_row AS (
+    SELECT t.*,
+           ROW_NUMBER() OVER (PARTITION BY t.<entity_key>
+                              ORDER BY t.<updated_at> DESC) AS rn
+    FROM <history_table> t
+)
+SELECT c.<entity_key>                       AS entity_key,
+       CAST(c.<label> AS nvarchar(200))     AS entity_label,
+       CAST(1 AS float)                     AS severity_value,
+       c.<field_a>                          AS evidence_field_a,
+       c.<field_b>                          AS evidence_field_b,
+       CONCAT('<field_a> says ', CAST(c.<field_a> AS nvarchar(50)),
+              ' while <field_b> says ', CAST(c.<field_b> AS nvarchar(50)))
+                                            AS explain_text
+FROM current_row c
+WHERE c.rn = 1
+  AND <the contradiction>
+ORDER BY severity_value DESC;
+```
+
+⚠ The SCHEMA block marks such a table `MANY ROWS PER <key>`. Querying it without collapsing to
+one row per entity counts the same entity many times, so `anomaly_count` exceeds the number of
+real entities — and the headline figure in the report is simply wrong.
+
+---
+
+## 5. A threshold must come from the data or from the rule — never from nowhere
+
+Anomaly: "a measured value is far outside what is normal for its population".
+
+```sql
+-- DETAIL
+WITH observed AS (
+    SELECT t.<entity_key>, t.<group_key>, CAST(t.<measure> AS float) AS measure
+    FROM <table> t
+    WHERE t.<measure> IS NOT NULL
+),
+stats AS (
+    -- per GROUP, not across the whole table: a norm for one activity says nothing about another
+    SELECT <group_key>,
+           AVG(measure) AS mean_val,
+           STDEV(measure) AS sd_val,
+           COUNT(*) AS n_obs
+    FROM observed GROUP BY <group_key>
+)
+SELECT o.<entity_key>                                   AS entity_key,
+       CAST(o.<group_key> AS nvarchar(200))             AS entity_label,
+       ABS(o.measure - s.mean_val)                      AS severity_value,
+       o.measure                                        AS evidence_value,
+       CAST(s.mean_val AS decimal(18,4))                AS evidence_group_average,
+       CAST(s.mean_val + 2 * s.sd_val AS decimal(18,4)) AS evidence_threshold,
+       s.n_obs                                          AS evidence_sample_size,
+       CONCAT('Value ', CAST(CAST(o.measure AS decimal(18,2)) AS varchar(20)),
+              ' against a group average of ',
+              CAST(CAST(s.mean_val AS decimal(18,2)) AS varchar(20)))  AS explain_text
+FROM observed o
+JOIN stats s ON s.<group_key> = o.<group_key>
+WHERE s.n_obs >= 30                                  -- minimum sample: state this in the note
+  AND s.sd_val > 0                                   -- no spread means no outliers
+  AND ABS(o.measure - s.mean_val) > 2 * s.sd_val     -- the threshold IS the data
+ORDER BY severity_value DESC;
+```
+
+⚠ Two separate traps. Computing the statistics across the whole table rather than per group
+compares unrelated things. And a bare constant with no stated source is rejected — a threshold
+must be derived from the data as above, or taken from a value the rule itself declares.
+
+---
+
+## 6. Keep unmatched records visible when absence is the finding
+
+Anomaly: "a record cannot be resolved through its mapping".
+
+```sql
+-- SUMMARY
+WITH scoped AS (
+    SELECT t.<entity_key>,
+           CASE WHEN m.<mapped_key> IS NULL THEN 1 ELSE 0 END AS is_anomaly
+    FROM <fact_table> t
+    LEFT JOIN <mapping_table> m ON m.<mapped_key> = t.<lookup_key>
+)
+SELECT 'RULE-ID' AS rule_id, COUNT(*) AS scope_total, SUM(is_anomaly) AS anomaly_count,
+       CAST(100.0 * SUM(is_anomaly) / NULLIF(COUNT(*),0) AS decimal(9,4)) AS anomaly_pct,
+       CAST(SUM(is_anomaly) AS float) AS worst_severity_val
+FROM scoped;
+```
+
+⚠ An inner join here drops every unmapped record, so the count of unmapped records reads zero —
+the query reports perfection precisely because the problem exists. The same applies to a filter
+placed in the WHERE clause of a LEFT JOIN: it silently turns the join back into an inner one.
+Put such a condition in the `ON` clause instead.
+
+---
+
+## 7. A column that is mostly NULL cannot be joined as though it were populated
+
+Anomaly: "a record of a particular classification is in the wrong lifecycle state".
+
+NUMERIC HINTS reports a null rate for every column. When a classification column is, say, 71%
+NULL, requiring a match discards most of the table and the probe silently reports on the
+remaining fraction as if it were everything.
+
+```sql
+-- keep unclassified records IN SCOPE; their missing classification is itself a gap
+FROM <fact_table> f
+LEFT JOIN <lookup_table> l ON l.<id> = f.<classification_id>
+WHERE l.<name> IN ('<value_a>', '<value_b>') OR f.<classification_id> IS NULL
+```
+
+⚠ Name the values that qualify, rather than excluding the ones that do not. A value added to
+the lookup table later must not silently start being treated as qualifying.
+
+---
+
+## 8. Divide safely, and never let a NULL become a zero
+
+```sql
+-- a probe runs unattended, so a divide-by-zero is a failed rule, not a visible error
+SUM(<weight> * <value>) / NULLIF(SUM(<weight>), 0)   AS weighted_average
+```
+
+⚠ `ISNULL(x, 0)` is correct only where the business rule says an absent value counts as zero.
+Everywhere else a NULL means "unknown", and turning it into a zero invents data — a missing
+progress figure is not zero progress, and a missing date is not the epoch.
+
+---
+
+## 9. Prove the finding in the row itself
+
+Every DETAIL row must let a reader verify the finding without re-running anything.
+
+```sql
+SELECT e.<entity_key>                       AS entity_key,
+       CAST(e.<name> AS nvarchar(200))      AS entity_label,
+       CAST(<how_bad> AS float)             AS severity_value,
+       e.<date_a>                           AS evidence_first_date,
+       e.<date_b>                           AS evidence_second_date,
+       DATEDIFF(day, e.<date_a>, e.<date_b>) AS evidence_gap_days,
+       CONCAT('<date_b> (', CONVERT(varchar(10), e.<date_b>, 23),
+              ') precedes <date_a> (', CONVERT(varchar(10), e.<date_a>, 23), ')')
+                                            AS explain_text
+FROM <entity_table> e
+WHERE <the condition>
+ORDER BY severity_value DESC;
+```
+
+⚠ `explain_text` is read straight into the report, and near-identical sentences are grouped and
+counted there. Write it as one complete sentence naming the actual values, so a reader who never
+opens the database still understands what is wrong with that record.
+
+⚠ `ORDER BY severity_value DESC` is required. The runner caps how many rows it keeps, so without
+an explicit worst-first ordering the report shows an arbitrary sample instead of the records
+that matter most.

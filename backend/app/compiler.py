@@ -119,6 +119,7 @@ def _seed_state(
         "advice": [],
         "retry_count": 0,
         "verify_retry_count": 0,
+        "feedback_history": [],
         "llm_calls": 0,
         "applicable": True,
     }
@@ -131,6 +132,7 @@ def _failed_probe(rule: AnomalyRule, fingerprint: str, error: str) -> CompiledPr
         summary_sql="",
         detail_sql="",
         status="failed",
+        source=rule.source,
         rule_hash=rule.rule_hash,
         structure_fingerprint=fingerprint,
         compiled_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"),

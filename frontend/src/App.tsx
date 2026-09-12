@@ -314,6 +314,18 @@ function RunsTab({ runs, onOpen }: { runs: RunRow[]; onOpen: (id: string) => voi
   )
 }
 
+// **double asterisks** become bold, matching exactly what the summarizer is told it may use
+// and what the Word report renders. Printing the line verbatim showed the reader
+// "**89.3 out of 100**", asterisks included.
+//
+// Split on the delimiter rather than setting innerHTML: the summary is model-written text and
+// must never reach the page as markup.
+function renderEmphasis(text: string) {
+  return text.split(/\*\*(.+?)\*\*/g).map((part, i) =>
+    i % 2 === 1 ? <strong key={i}>{part}</strong> : <span key={i}>{part}</span>
+  )
+}
+
 export default function App() {
   const [tab, setTab] = useState<Tab>('dashboard')
   const [status, setStatus] = useState<Status | null>(null)
@@ -393,9 +405,15 @@ export default function App() {
               <section className="card">
                 <h2>Executive summary</h2>
                 {run.summary
-                  ? run.summary.split('\n').filter(Boolean).map((line, i) => (
-                      <p key={i}>{line.replace(/^[-*•]\s*/, '• ')}</p>
-                    ))
+                  ? run.summary.split('\n').filter(Boolean).map((line, i) => {
+                      const bullet = /^[-*•]\s+/.test(line)
+                      const text = line.replace(/^[-*•]\s*/, '')
+                      return (
+                        <p key={i} className={bullet ? 'summary-bullet' : undefined}>
+                          {renderEmphasis(text)}
+                        </p>
+                      )
+                    })
                   : <p className="muted">No summary was written for this run.</p>}
               </section>
 

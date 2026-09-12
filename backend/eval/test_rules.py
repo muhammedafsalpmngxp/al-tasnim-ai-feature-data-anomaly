@@ -38,6 +38,54 @@ def check(condition: bool, message: str) -> None:
         _failures.append(message)
 
 
+# ── 0. Every module parses and imports ─────────────────────────────────────────
+
+def test_every_module_parses() -> None:
+    """Catch a broken module before a 25-minute compile does.
+
+    THIS TEST EXISTS BECAUSE THE SUITE MISSED ONE. Everything below imports the rule loader and
+    the report helpers, so a syntax error in a GRAPH NODE - the half of the system that only
+    runs during a compile - passed every check and then aborted `compile` on the first import.
+    A test suite that reports "all passed" while a module cannot be imported is worse than no
+    suite, because it is trusted.
+
+    Parsing is separated from importing on purpose: parsing needs nothing installed, so it runs
+    everywhere and pinpoints the file and line. Importing additionally catches a bad name at
+    module scope, but needs the third-party packages, so it is skipped when they are absent
+    rather than reported as a failure.
+    """
+    import ast
+    import importlib
+    import pathlib
+
+    root = pathlib.Path(_BACKEND)
+    modules = [
+        f for f in sorted((root / "app").rglob("*.py")) if "__pycache__" not in str(f)
+    ]
+    check(bool(modules), "no modules found to check")
+
+    for f in modules:
+        try:
+            ast.parse(f.read_text(encoding="utf-8"))
+        except SyntaxError as exc:
+            check(False, f"{f.relative_to(root)}:{exc.lineno} does not parse - {exc.msg}")
+
+    try:
+        import pyodbc  # noqa: F401
+    except Exception:  # noqa: BLE001 - dependency absent; parsing above already ran
+        print("         (import check skipped - pyodbc not installed)")
+        return
+
+    for f in modules:
+        if f.name == "__init__.py":
+            continue
+        name = ".".join(f.relative_to(root).with_suffix("").parts)
+        try:
+            importlib.import_module(name)
+        except Exception as exc:  # noqa: BLE001
+            check(False, f"{name} cannot be imported - {type(exc).__name__}: {exc}")
+
+
 # ── 1. No business SQL in Python ───────────────────────────────────────────────
 # Catalogue queries are legitimate: they describe the ENGINE, are identical on every database,
 # and carry no business knowledge. Anything else naming a table is a leak of domain knowledge
@@ -98,6 +146,86 @@ def test_no_business_sql() -> None:
                         f"{rel}: SQL references '{ref}', which is not a catalogue object. "
                         f"All business SQL belongs in domain/*.md, never in Python.",
                     )
+
+
+def test_numeric_hints_round_trip() -> None:
+    """Every line db/introspect.py can WRITE, rules/schema_index.py must be able to READ.
+
+    THIS TEST EXISTS BECAUSE THE TWO DRIFTED. A token-saving change added a compact
+    "col: lo..hi" line to the writer and did not add it to the reader, so every plain-number
+    column became invisible to the index - tables with statistics fell from 70 to 13. Nothing
+    failed and nothing was logged as wrong, because the ratio columns the generic probes
+    actually consume happened to still match the old pattern.
+
+    A silent two-thirds loss of an internal index is precisely the class of defect this engine
+    exists to find in other people's data. Asserting the round trip costs nothing and makes the
+    coupling explicit.
+    """
+    from app.rules.schema_index import load_index
+
+    sample = "\n".join([
+        "NUMERIC HINTS (measured):",
+        "demo.table_one  (1,234 rows)",
+        "  - plain_id: 16..21581",
+        "  - negative_measure: min -66, max 16092, avg 27.75, stdev 258.2, nulls 0% | plain number",
+        "  - a_fraction: min 0, max 1, avg 0.26, stdev 0.43, nulls <1% | FRACTION_1 (0-1) - x100",
+        "  - a_percentage: min 0, max 100, avg 50, stdev 52.2, nulls >99% | PERCENT_100 (0-100)",
+        "  - some_text (text): 183 of 642 values do NOT parse as a number - TRY_CAST required",
+        "  - code_text (text): NONE of 17264 values parse as a number - holds codes/labels",
+    ])
+    schema = "\n".join([
+        "TABLE demo.table_one",
+        "  - plain_id int NOT NULL PK",
+        "  - negative_measure decimal",
+        "  - a_fraction decimal",
+        "  - a_percentage decimal",
+        "  - some_text nvarchar(50)",
+        "  - code_text nvarchar(50)",
+        "",
+    ])
+
+    index = load_index(schema_text=schema, numeric_text=sample)
+    table = index.get("demo.table_one")
+    check(table is not None, "the sample table did not parse")
+    if table is None:
+        return
+
+    check(table.row_count == 1234, f"row count not parsed (got {table.row_count})")
+    check(
+        len(table.stats) == 6,
+        f"expected statistics for all 6 columns, parsed {len(table.stats)}: "
+        f"{sorted(table.stats)}",
+    )
+
+    compact = table.stats.get("plain_id")
+    check(compact is not None, "the COMPACT 'col: lo..hi' form did not parse")
+    if compact:
+        check(compact.lo == 16 and compact.hi == 21581, "compact bounds wrong")
+        check(not compact.is_ratio, "a compact line must carry no scale")
+        check(compact.bounds() is None, "a column with no measured scale must offer no bounds")
+
+    fraction = table.stats.get("a_fraction")
+    check(fraction is not None and fraction.is_ratio, "FRACTION_1 not recognised as a ratio")
+    if fraction:
+        check(fraction.bounds() == (0.0, 1.0), f"fraction bounds wrong: {fraction.bounds()}")
+
+    percentage = table.stats.get("a_percentage")
+    check(percentage is not None, "a '>99%' null rate broke the full-detail pattern")
+    if percentage:
+        check(percentage.bounds() == (0.0, 100.0), "percentage bounds wrong")
+
+    negative = table.stats.get("negative_measure")
+    check(negative is not None and negative.lo == -66, "a negative minimum did not parse")
+
+    text_bad = table.stats.get("some_text")
+    check(text_bad is not None and text_bad.text_bad == 183, "partial cast failure not parsed")
+    check(text_bad is not None and not text_bad.text_is_codes,
+          "a partial failure must not be marked codes-only")
+
+    codes = table.stats.get("code_text")
+    check(codes is not None and codes.text_is_codes,
+          "a column where NOTHING parses must be marked codes-only, or a cast probe is "
+          "generated that reports 100% of the table as anomalous")
 
 
 # ── 2. Rule parsing ────────────────────────────────────────────────────────────
@@ -437,7 +565,9 @@ def test_generic_templates_parse() -> None:
 
 def main() -> int:
     tests = [
+        ("every module parses and imports", test_every_module_parses),
         ("no business SQL in Python", test_no_business_sql),
+        ("numeric hints round-trip", test_numeric_hints_round_trip),
         ("rules parse", test_rules_parse),
         ("parser rejects bad rules", test_parser_rejects_bad_rules),
         ("pinned SQL meets the contract", test_pinned_sql_meets_contract),

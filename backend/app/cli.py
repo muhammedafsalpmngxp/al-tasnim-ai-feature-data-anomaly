@@ -528,6 +528,81 @@ def cmd_runs(args) -> int:
     return 0
 
 
+def cmd_catalog(args) -> int:
+    """Show the compiled catalog, grouped by WHERE EACH PROBE'S SQL CAME FROM.
+
+    Provenance is the first question anyone asks of a data-quality finding - "did a model write
+    this check, or did the schema?" - so it gets its own command rather than being something to
+    dig out of a 475 KB JSON file.
+    """
+    from rich.table import Table
+
+    from app.rules import catalog as catalog_store
+
+    console = _console()
+    cat = catalog_store.load()
+    if not cat.probes:
+        console.print("[yellow]No catalog yet.[/] Run: python -m app.cli compile")
+        return 1
+
+    agent = [p for p in cat.probes.values() if p.authored_by_agent]
+    templated = [p for p in cat.probes.values() if not p.authored_by_agent]
+
+    summary = Table(title="Where the SQL came from", header_style="bold cyan")
+    summary.add_column("Origin")
+    summary.add_column("Probes", justify="right")
+    summary.add_column("LLM calls", justify="right")
+    summary.add_column("How it was produced")
+    summary.add_row(
+        "[magenta]AI agent[/]", str(len(agent)),
+        str(sum(p.llm_calls for p in agent)),
+        "grounding -> sql_author -> verifier, from domain/data_anomalies.md",
+    )
+    summary.add_row(
+        "[blue]Template[/]", str(len(templated)),
+        str(sum(p.llm_calls for p in templated)),
+        "domain/generic_probes.md rendered against schema.txt",
+    )
+    console.print(summary)
+
+    if args.origin in ("agent", "all"):
+        t = Table(title="AI-authored probes", header_style="bold magenta")
+        for col in ("ID", "Status", "LLM", "Tables grounded to"):
+            t.add_column(col, overflow="fold")
+        for p in sorted(agent, key=lambda x: x.rule_id):
+            colour = {"active": "green", "failed": "red"}.get(p.status, "yellow")
+            t.add_row(p.rule_id, f"[{colour}]{p.status}[/]", str(p.llm_calls),
+                      ", ".join(p.tables[:4]) or "-")
+        console.print(t)
+
+    if args.origin in ("template", "all"):
+        by_family: dict[str, int] = {}
+        for p in templated:
+            by_family[p.rule_id.rsplit("-", 1)[0]] = by_family.get(p.rule_id.rsplit("-", 1)[0], 0) + 1
+        t = Table(title="Templated probes (no model involved)", header_style="bold blue")
+        t.add_column("Family"); t.add_column("Probes", justify="right")
+        for fam, n in sorted(by_family.items()):
+            t.add_row(fam, str(n))
+        console.print(t)
+
+    if args.sql:
+        probe = cat.get(args.sql)
+        if probe is None:
+            console.print(f"[red]No probe with id {args.sql}[/]")
+            return 1
+        origin = "AI agent" if probe.authored_by_agent else "template (no model)"
+        console.print(f"[bold]{probe.rule_id}[/]  origin: {origin}  status: {probe.status}")
+        for note in ("grounding_note", "verifier_note", "threshold_note", "error"):
+            value = getattr(probe, note)
+            if value:
+                console.print(f"[dim]{note}:[/] {value}")
+        console.print("[bold]SUMMARY[/]")
+        console.print(probe.summary_sql)
+        console.print("[bold]DETAIL[/]")
+        console.print(probe.detail_sql)
+    return 0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="anomaly",
@@ -596,6 +671,16 @@ def main() -> None:
         "--top", type=int, default=20, help="how many findings to print (default 20)"
     )
     p_run.set_defaults(func=cmd_run)
+
+    p_cat = sub.add_parser(
+        "catalog", help="show the compiled probes and where each one's SQL came from"
+    )
+    p_cat.add_argument(
+        "--origin", choices=("agent", "template", "all"), default="all",
+        help="list only AI-authored probes, only templated ones, or both",
+    )
+    p_cat.add_argument("--sql", metavar="RULE_ID", help="print one probe's SQL and provenance")
+    p_cat.set_defaults(func=cmd_catalog)
 
     p_runs = sub.add_parser("runs", help="show the recorded run history and score trend")
     p_runs.add_argument("--limit", type=int, default=20, help="how many runs to show")

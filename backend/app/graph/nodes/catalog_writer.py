@@ -92,6 +92,9 @@ def catalog_writer_node(state: CompileState) -> dict:
         summary_sql=state.get("summary_sql", ""),
         detail_sql=state.get("detail_sql", ""),
         status=status,
+        # Carried from the rule, not guessed from the id: this is what lets a reader of the
+        # catalog (or of the report) tell an agent-written check from a templated one.
+        source=state.get("source", "declared"),
         rule_hash=state.get("rule_hash", ""),
         structure_fingerprint=state.get("structure_fingerprint", ""),
         compiled_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"),

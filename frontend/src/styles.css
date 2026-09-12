@@ -113,3 +113,18 @@ pre.sql, pre.prose {
   font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
 }
 pre.prose { font-family: inherit; font-size: 13px; background: #fbfbfd; }
+
+
+/* A summary bullet. The leading marker is stripped in App.tsx and re-added here, so a line that
+   is not a bullet keeps a normal paragraph indent instead of a hanging one. */
+.summary-bullet {
+  position: relative;
+  padding-left: 1.1rem;
+  margin: 0.35rem 0;
+}
+.summary-bullet::before {
+  content: "2";
+  position: absolute;
+  left: 0.25rem;
+  opacity: 0.65;
+}

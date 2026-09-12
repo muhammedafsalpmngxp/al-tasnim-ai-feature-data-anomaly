@@ -76,6 +76,31 @@ def rule_brief(state: dict) -> str:
         f"entity: {state.get('entity', '')} | method: {state.get('method', '')}"
         + (f" | tolerance: {tolerance}" if tolerance else ""),
     ]
+
+    # EVERY value the rule declares, not just the tolerance.
+    #
+    # Only `tolerance` used to be rendered, so a rule could declare `placeholder_date`,
+    # `deadline_days`, `epsilon`, `min_sample` or `grace_days` and NEITHER agent would ever see
+    # it. Observed on DQ-D02: the rule declared the placeholder date the probe had to exclude,
+    # the author had to guess it, and the reviewer then rejected the probe because "the schema
+    # and supplied hints do not define the known placeholder value" - which was true, because
+    # the one place it WAS defined was being dropped here.
+    #
+    # Labelled as DECLARED so the reviewer can tell these apart from a constant the author
+    # invented. That distinction is the whole basis on which it rejects invented thresholds,
+    # and without it the two are indistinguishable in the prompt.
+    declared = {
+        key: value
+        for key, value in (state.get("params") or {}).items()
+        if key != "tolerance" and str(value).strip()
+    }
+    if declared:
+        parts.append(
+            "VALUES DECLARED BY THIS RULE (stated by the business, NOT invented - you may use "
+            "each as a literal, and you must use the stated value rather than one of your own):"
+        )
+        parts.extend(f"  {key} = {value}" for key, value in sorted(declared.items()))
+
     if state.get("grounding_note"):
         parts.append(f"HOW THIS MAPS ONTO THE TABLES: {state['grounding_note']}")
     body = (state.get("body") or "").strip()

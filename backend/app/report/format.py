@@ -133,3 +133,28 @@ def cap_note(total: int, shown: int, limit_name: str) -> str:
         f"Showing the {shown:,} most serious of {total:,} affected records. The complete list "
         f"is in the Excel workbook ({limit_name})."
     )
+
+_EMPHASIS = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
+
+
+def emphasis_runs(text: str) -> list[tuple[str, bool]]:
+    """Split a line into (fragment, is_bold) pairs on **double asterisks**.
+
+    The summarizer is told it may emphasise a figure this way and use nothing else. Both
+    renderers - the Word document and the web page - previously printed the line verbatim, so
+    the reader saw "**89.3 out of 100**", asterisks included. Parsing it in ONE place means the
+    two cannot disagree about what the markup means.
+
+    Returns a single non-bold fragment when there is no emphasis, so callers need no special
+    case for the common line.
+    """
+    out: list[tuple[str, bool]] = []
+    position = 0
+    for match in _EMPHASIS.finditer(text or ""):
+        if match.start() > position:
+            out.append((text[position:match.start()], False))
+        out.append((match.group(1), True))
+        position = match.end()
+    if position < len(text or ""):
+        out.append((text[position:], False))
+    return out or [(text or "", False)]

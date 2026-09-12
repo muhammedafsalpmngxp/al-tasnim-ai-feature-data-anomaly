@@ -367,4 +367,9 @@ RULES:
 
 FORMAT: 150-300 words. A short opening paragraph stating the overall picture, then 3-6 bullets
 covering the themes that matter, each naming the number of records affected.
+
+MARKUP: plain sentences, and "- " to begin a bullet. You may emphasise a figure with **double
+asterisks**, and nothing else - no headings, no tables, no backticks, no links, no nested
+bullets. Every renderer downstream understands exactly that much; anything else is printed
+literally to the reader, asterisks and all.
 """.strip()

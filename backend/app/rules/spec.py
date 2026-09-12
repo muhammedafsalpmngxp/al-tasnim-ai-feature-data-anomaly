@@ -134,6 +134,15 @@ class CompiledProbe:
     detail_sql: str
     # active | failed | not_applicable | disabled
     status: str = "active"
+    # WHERE THIS SQL CAME FROM - "declared" (an agent wrote it) or "generic" (a template in
+    # domain/generic_probes.md rendered against the schema, with no model involved).
+    #
+    # Recorded EXPLICITLY rather than inferred from the "GEN-" id prefix. Provenance is the
+    # first thing anyone asks of a data-quality finding - "did a model write this check?" - and
+    # answering it from a naming convention is one rename away from being wrong. It also keeps
+    # `llm_calls == 0` meaning what it says: a reused probe reports 0 calls for THIS compile,
+    # which is not the same as never having been written by a model.
+    source: str = "declared"
     rule_hash: str = ""
     structure_fingerprint: str = ""
     compiled_at: str = ""
@@ -153,12 +162,18 @@ class CompiledProbe:
     error: str = ""
     llm_calls: int = 0
 
+    @property
+    def authored_by_agent(self) -> bool:
+        """True when an LLM wrote this SQL. False when a template did."""
+        return self.source != "generic"
+
     def to_json(self) -> dict[str, Any]:
         return {
             "rule_id": self.rule_id,
             "summary_sql": self.summary_sql,
             "detail_sql": self.detail_sql,
             "status": self.status,
+            "source": self.source,
             "rule_hash": self.rule_hash,
             "structure_fingerprint": self.structure_fingerprint,
             "compiled_at": self.compiled_at,
@@ -177,6 +192,11 @@ class CompiledProbe:
             summary_sql=data.get("summary_sql", ""),
             detail_sql=data.get("detail_sql", ""),
             status=data.get("status", "active"),
+            # Older catalogs predate this field; fall back to the id convention so an existing
+            # cache stays readable instead of silently reporting every probe as agent-written.
+            source=data.get("source") or (
+                "generic" if str(data.get("rule_id", "")).startswith("GEN-") else "declared"
+            ),
             rule_hash=data.get("rule_hash", ""),
             structure_fingerprint=data.get("structure_fingerprint", ""),
             compiled_at=data.get("compiled_at", ""),

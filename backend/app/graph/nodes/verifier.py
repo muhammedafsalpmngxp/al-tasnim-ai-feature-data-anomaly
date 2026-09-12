@@ -90,6 +90,24 @@ def verifier_node(state: CompileState) -> dict:
             + numbered(state["advice"])
         )
 
+    # WHAT THIS REVIEWER ALREADY DEMANDED, so it cannot contradict itself.
+    #
+    # Observed on DQ-D03: the first rejection said "replace progress >= 1.0 with progress =
+    # 1.0"; the author complied; the second rejection said "use >= 1.0 rather than = 1.0". Both
+    # retries were spent obeying opposite instructions and a correct probe was recorded as
+    # failed. A reviewer that cannot see its own previous verdict has no way to notice it is
+    # reversing itself - so it is shown, with an explicit instruction about what to do when it
+    # now disagrees with its earlier self.
+    if state.get("feedback_history"):
+        parts.append(
+            "YOU ALREADY REJECTED AN EARLIER VERSION OF THIS PROBE, SAYING:\n"
+            + numbered(state["feedback_history"])
+            + "\n\nThe author has acted on that. Do NOT now ask for the opposite of what you "
+              "asked for before - if your earlier instruction was wrong, say so plainly in the "
+              "feedback and give the corrected instruction ONCE. If the author did what you "
+              "asked and the probe is now sound, APPROVE it."
+        )
+
     parts.append(
         "Does this probe correctly detect the anomaly the rule describes? Reply with the JSON "
         "verdict."
@@ -183,6 +201,10 @@ def _reject(state: CompileState, feedback: str, spent: int, note: str = "") -> d
     return {
         "verify_ok": False,
         "verify_feedback": truncate(feedback, MAX_FEEDBACK_CHARS),
+        # Appended, never replaced: the whole point is that the NEXT review can see what this
+        # one demanded.
+        "feedback_history": list(state.get("feedback_history") or [])
+        + [truncate(feedback, MAX_FEEDBACK_CHARS)],
         "verifier_note": note,
         "verify_retry_count": state.get("verify_retry_count", 0) + 1,
         "retry_count": 0,

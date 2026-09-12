@@ -104,6 +104,9 @@ class CompileState(TypedDict, total=False):
     # ── Rule Verifier ──
     verify_ok: bool
     verify_feedback: str
+    # Every rejection this reviewer has issued for this rule, in order. Shown back to it so a
+    # second review cannot demand the opposite of the first - see verifier.py.
+    feedback_history: list[str]
     # SEMANTIC rewrites used. Deliberately a SEPARATE counter from retry_count: sharing one
     # budget lets a couple of syntax errors early in a rule leave the Verifier with zero
     # rewrites, so it rejects and is overruled in the same breath - the worst of both.
