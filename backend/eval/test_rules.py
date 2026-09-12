@@ -356,6 +356,66 @@ def test_eval_bands_catch_regressions() -> None:
     check(len(broken.failed) == 1, "a probe that errored was not reported as failed")
 
 
+def test_zero_scope_probe_is_never_stored_active() -> None:
+    """A probe that examined nothing must never reach the catalog as `active`.
+
+    Regression test for a real failure. Asked to review a probe whose SUMMARY returned
+    scope_total = 0, the reviewer APPROVED it and explained - correctly - that the rule could
+    not be implemented against this schema. Correct diagnosis, wrong verdict: the probe was
+    stored active and would then have reported "0 examined, 0 anomalies" on every run, which
+    every reader downstream takes as a clean bill of health for a subject nobody is checking.
+
+    The guard is deterministic on purpose. The query ran, the database said it matched no
+    rows, and that is decidable without asking a model - so it must not depend on one.
+    """
+    from app.graph.nodes.catalog_writer import _status
+
+    approved_but_empty = {
+        "applicable": True,
+        "summary_sql": "SELECT 1 AS rule_id",
+        "detail_sql": "SELECT 1 AS entity_key",
+        "summary_columns": ["rule_id", "scope_total", "anomaly_count"],
+        "summary_row": ["X-1", 0, 0],
+        "verify_ok": True,
+        "verifier_note": "cannot be implemented against the provided schema",
+    }
+    status, reason = _status(approved_but_empty)
+    check(
+        status != "active",
+        "a probe that examined 0 records was stored as ACTIVE - it would report 'clean' forever",
+    )
+    check(status == "not_applicable", f"expected not_applicable for a zero-scope probe, got {status}")
+    check(bool(reason.strip()), "a retired probe must carry a reason a person can act on")
+
+    # The same probe with real scope is fine - the guard must not reject working probes.
+    working = dict(approved_but_empty, summary_row=["X-1", 5000, 12])
+    check(_status(working)[0] == "active", "a probe with real scope was wrongly rejected")
+
+    # A probe with no summary at all must not be mistaken for a zero-scope one.
+    unknown = dict(approved_but_empty, summary_columns=[], summary_row=[])
+    check(
+        _status(unknown)[0] == "active",
+        "a probe whose scope is UNKNOWN was treated as if it had examined nothing",
+    )
+
+
+def test_verifier_prompt_offers_the_not_applicable_verdict() -> None:
+    """The reviewer must have the vocabulary its instructions assume.
+
+    It is told never to approve a probe that examines nothing, and never to reject a rule no
+    query can fix. Those two instructions are only satisfiable together if it has a third
+    verdict available, so the JSON template has to offer one.
+    """
+    from app.graph.prompts import RULE_VERIFIER_SYSTEM
+
+    check("not_applicable" in RULE_VERIFIER_SYSTEM,
+          "the verifier is never told it can return not_applicable")
+    check('"not_applicable"' in RULE_VERIFIER_SYSTEM,
+          "the verifier's JSON template does not include a not_applicable field")
+    check("scope_total = 0" in RULE_VERIFIER_SYSTEM,
+          "the verifier is not warned that a zero scope is never a clean result")
+
+
 def test_generic_templates_parse() -> None:
     """The generic templates must keep their {{placeholders}} - they are filled from the
     schema at generation time, not from rule metadata."""
@@ -384,6 +444,8 @@ def main() -> int:
         ("static contract ignores comments", test_static_contract_reads_only_executable_sql),
         ("prompts state the enforced contract", test_prompts_state_the_enforced_contract),
         ("eval bands catch regressions", test_eval_bands_catch_regressions),
+        ("zero-scope probe never stored active", test_zero_scope_probe_is_never_stored_active),
+        ("verifier can say not applicable", test_verifier_prompt_offers_the_not_applicable_verdict),
         ("generic templates parse", test_generic_templates_parse),
     ]
     for name, fn in tests:

@@ -1,6 +1,10 @@
 // Baseline for python -m eval.run_eval. Regenerate with --record after a
 // deliberate change to the rules, the schema, or the prompts. One probe per
 // line; `share` is anomaly_count / scope_total at the time it was recorded.
+{"rule_id": "DQ-001", "scope_total": 0, "anomaly_count": 0, "share": 0.0, "llm_calls": 3}
+{"rule_id": "DQ-002", "scope_total": 0, "anomaly_count": 0, "share": 0.0, "llm_calls": 3}
+{"rule_id": "DQ-002B", "scope_total": 340, "anomaly_count": 0, "share": 0.0, "llm_calls": 3}
+{"rule_id": "DQ-004", "scope_total": 337, "anomaly_count": 311, "share": 0.922849, "llm_calls": 4}
 {"rule_id": "GEN-CAST-001", "scope_total": 32258, "anomaly_count": 32084, "share": 0.994606, "llm_calls": 0}
 {"rule_id": "GEN-CAST-002", "scope_total": 2836, "anomaly_count": 10, "share": 0.003526, "llm_calls": 0}
 {"rule_id": "GEN-CAST-003", "scope_total": 7440, "anomaly_count": 44, "share": 0.005914, "llm_calls": 0}

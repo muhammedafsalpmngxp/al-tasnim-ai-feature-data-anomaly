@@ -302,10 +302,21 @@ You are shown at most SAMPLE_ROWS detail rows. That is a sample for judging whet
 kind of record came back - never count, total or rank from it, and never conclude the anomaly
 is rare because few rows are shown. The counts in the summary row are the truth.
 
+WHEN THE RULE SIMPLY CANNOT BE IMPLEMENTED HERE, SAY SO - DO NOT APPROVE.
+Sometimes the honest answer is neither "correct" nor "fixable": this database does not record
+the thing the rule is about, so no query over this schema could ever detect it. Set
+`not_applicable` true and name the missing concept in `reason`.
+⚠ DO NOT approve a probe in this situation. Approving one means it is stored and re-run
+unattended for months, reporting "0 examined, 0 anomalies" - which every reader downstream will
+take as a clean bill of health for a subject nobody is actually checking. Marking it not
+applicable retires it honestly and says why, in the report, where someone can act on it.
+Equally, do not reject: rejecting asks the SQL writer to fix something no query can fix, and it
+will simply burn its rewrites and fail.
+
 If ok is false, `feedback` must be the ONE concrete change to make: under 400 characters, a
 specific instruction, not an essay, not a list of options, not a question.
 Respond with ONLY this JSON on a single line, no prose:
-{"ok": true|false, "feedback": "", "threshold_note": "", "note": ""}
+{"ok": true|false, "not_applicable": false, "reason": "", "feedback": "", "threshold_note": "", "note": ""}
 """.strip()
 # The Verifier needs the SAME rulebook the Author had. A reviewer without it reviews blind: it
 # cannot know that a table is a snapshot needing de-duplication, or that a rule's "Do NOT flag"

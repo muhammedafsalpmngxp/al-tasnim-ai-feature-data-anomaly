@@ -15,6 +15,7 @@ import datetime as dt
 
 from app.graph.state import CompileState
 from app.observability import get_logger
+from app.rules.contract import summary_values
 from app.rules.spec import CompiledProbe
 
 log = get_logger()
@@ -29,10 +30,46 @@ def _failure_reason(state: CompileState) -> str:
     return "the rule could not be compiled into a usable probe"
 
 
+def _examined_nothing(state: CompileState) -> bool:
+    """True when the probe's own SUMMARY reported a scope of zero at compile time.
+
+    Read from what the database actually returned, not from anyone's opinion about it.
+    """
+    columns = state.get("summary_columns") or []
+    row = state.get("summary_row") or []
+    if not columns or not row:
+        return False
+    values = summary_values(columns, row)
+    try:
+        return int(values.get("scope_total") or 0) <= 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _status(state: CompileState) -> tuple[str, str]:
     """(status, error). Decided from the state alone, never from how the graph got here."""
     if state.get("applicable") is False:
         return "not_applicable", state.get("not_applicable_reason", "")
+
+    # A PROBE THAT EXAMINED NOTHING IS NEVER STORED AS ACTIVE. This is a deterministic
+    # backstop, and it exists because the alternative was observed in practice: asked to
+    # review a probe whose scope was zero, the reviewer approved it and explained that the
+    # rule "cannot be implemented against the provided schema" - a correct diagnosis, but the
+    # verdict it produced meant the probe was stored active and then reported "0 of 0, clean"
+    # on every run thereafter. A check that proves nothing while reading as a pass is the
+    # exact failure this whole engine exists to prevent, so it cannot be left to a model's
+    # judgement: the query ran, the database said it matched no rows, and that is decidable
+    # here without asking anyone.
+    if _examined_nothing(state):
+        reason = (
+            "the compiled probe examined 0 records, so it can prove nothing about its "
+            "subject. This is normally a join that matches nothing, a filter on a value that "
+            "does not exist, or a rule whose concepts this database does not record."
+        )
+        note = (state.get("verifier_note") or "").strip()
+        if note:
+            reason += f" The reviewer's assessment: {note}"
+        return "not_applicable", reason
     if not state.get("summary_sql", "").strip() or not state.get("detail_sql", "").strip():
         return "failed", _failure_reason(state)
     # Any unresolved mechanical fault means the last attempt never reached a working state.

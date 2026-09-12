@@ -125,6 +125,25 @@ def verifier_node(state: CompileState) -> dict:
     note = str(data.get("note") or "").strip()
     threshold_note = str(data.get("threshold_note") or "").strip()
 
+    # THE THIRD VERDICT. Without it this node could only approve or reject, and neither is
+    # honest when a rule's subject matter simply is not recorded in this database: approving
+    # stores a probe that reports "0 examined, clean" forever, and rejecting spends every
+    # rewrite asking the author to fix something no query can fix. Observed in practice - the
+    # reviewer approved a zero-scope probe while explaining, correctly, that the rule could
+    # not be implemented against the schema. It needed a way to say that as a verdict.
+    if bool(data.get("not_applicable")):
+        reason = str(data.get("reason") or "").strip() or note or "no reason given"
+        log.info("verify: %s is NOT APPLICABLE to this database - %s", rule_id, reason[:160])
+        return {
+            "applicable": False,
+            "not_applicable_reason": reason,
+            "status": "not_applicable",
+            "verify_ok": True,   # nothing is pending a rewrite; the graph moves to the catalog
+            "verify_feedback": "",
+            "verifier_note": note,
+            "llm_calls": spent,
+        }
+
     if bool(data.get("ok")):
         log.info("verify: ok [%s] %s", rule_id, note[:120])
         return {
