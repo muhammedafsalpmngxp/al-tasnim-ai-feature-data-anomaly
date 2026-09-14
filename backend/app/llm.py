@@ -176,6 +176,63 @@ def get_llm(temperature: float | None = 0.0, fast: bool = False):
     return ChatOllama(**kwargs)
 
 
+def chat_structured(
+    system: str,
+    user: str,
+    schema: type,
+    temperature: float = 0.0,
+    fast: bool = False,
+):
+    """One-shot call that returns an INSTANCE of `schema`, or None if that was not possible.
+
+    WHY THIS EXISTS. A node that needs a verdict used to ask for JSON in the prompt, receive
+    free text, and parse it. That parse fails on anything the prompt did not anticipate - a
+    fenced code block, a trailing comma, a sentence of commentary before the object - and the
+    nodes here treat an unreadable verdict as a REJECTION, because approving on a failed parse
+    would let a bad probe through. So a formatting slip by the model costs a rewrite cycle and
+    is recorded as if the reviewer had objected to the SQL.
+
+    Structured output removes that class of failure: the provider is given the schema and
+    constrains its own decoding to match, so the reply either satisfies the schema or the call
+    raises. Verified against the configured model with a prompt explicitly demanding markdown
+    and commentary - it still returned a clean object.
+
+    RETURNS None RATHER THAN RAISING when the provider cannot do this at all (an older local
+    model, say). The caller then falls back to asking for text and parsing it, so enabling this
+    can never make a node worse than it was - only better where it is supported.
+    """
+    messages = [SystemMessage(content=system), HumanMessage(content=user)]
+    from app.tracing import enabled as _tracing_on
+
+    cfg = {"run_name": _agent_label(system)} if _tracing_on() else None
+    start = time.perf_counter()
+
+    def _call(temp):
+        return get_llm(temp, fast).with_structured_output(schema).invoke(messages, config=cfg)
+
+    try:
+        result = _call(temperature)
+    except Exception as exc:  # noqa: BLE001
+        # Same temperature quirk the text path handles: some reasoning models reject a
+        # non-default value and must be called without one.
+        if _is_openai() and "temperature" in str(exc).lower():
+            try:
+                result = _call(None)
+            except Exception as inner:  # noqa: BLE001
+                log.warning("llm: structured output unavailable (%s) - falling back", inner)
+                return None
+        else:
+            log.warning("llm: structured output unavailable (%s) - falling back", exc)
+            return None
+
+    _log_call(system, fast, time.perf_counter() - start)
+    # Usage is not recorded here: with_structured_output returns the PARSED object, not the
+    # response envelope that carries the token counts, so there is nothing to read. The call is
+    # still counted in the log line above. Attributing zero tokens would be worse than omitting
+    # it - the usage report would quietly under-report the cost of every review.
+    return result
+
+
 def chat(system: str, user: str, temperature: float = 0.0, fast: bool = False) -> str:
     """One-shot system+user call, returning the raw text content."""
     messages = [SystemMessage(content=system), HumanMessage(content=user)]

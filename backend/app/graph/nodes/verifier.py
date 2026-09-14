@@ -27,11 +27,13 @@ genuinely free.
 """
 from __future__ import annotations
 
+from pydantic import BaseModel, Field
+
 from app.config import settings
 from app.graph.nodes._common import numbered, probe_sql, rows_to_table, rule_brief, summary_line
 from app.graph.prompts import RULE_VERIFIER_SYSTEM
 from app.graph.state import CompileState
-from app.llm import chat
+from app.llm import chat, chat_structured
 from app.observability import get_logger
 from app.utils import extract_json, truncate
 
@@ -40,6 +42,31 @@ log = get_logger()
 # extract_json hands back this exact object when it cannot parse a verdict, so a parse failure
 # stays distinguishable from a genuine {"ok": true}.
 _UNREADABLE: dict = {"__unreadable__": True}
+
+
+class VerifierVerdict(BaseModel):
+    """The reviewer's verdict, as a schema the provider must satisfy.
+
+    Field names and meanings are IDENTICAL to the JSON the prompt already asks for, so the
+    prompt, this schema and the parsing below cannot drift apart. Every field has a default:
+    a reviewer that approves has nothing to say in `feedback`, and requiring it would force the
+    model to invent an objection in order to answer at all.
+    """
+
+    ok: bool = Field(description="true only when the probe correctly detects the anomaly")
+    not_applicable: bool = Field(
+        default=False,
+        description="true when this database cannot express the rule at all",
+    )
+    reason: str = Field(default="", description="why it is not applicable, when it is not")
+    feedback: str = Field(
+        default="",
+        description="on a rejection, the concrete change the SQL author must make",
+    )
+    threshold_note: str = Field(
+        default="", description="where an auto-derived threshold came from"
+    )
+    note: str = Field(default="", description="one sentence summarising the verdict")
 
 # Feedback is re-sent on every rewrite, so it needs a bound - but a hard slice is dangerous:
 # a cut landing inside the instruction leaves the author acting on a fragment. truncate() cuts
@@ -114,11 +141,23 @@ def verifier_node(state: CompileState) -> dict:
     )
 
     spent = state.get("llm_calls", 0) + 1
+    user = "\n\n".join(parts)
+
+    # STRUCTURED FIRST. The provider constrains its own decoding to the schema, so a verdict
+    # cannot arrive wrapped in a code fence or prefaced with a sentence of commentary - the
+    # shapes that made a parse fail and, because this node fails closed, spent a rewrite cycle
+    # on a formatting slip rather than a real objection.
+    #
+    # The text path below is kept as a fallback, not as the normal route: a provider that
+    # cannot do structured output (an older local model) still gets reviewed exactly as before.
+    data: dict | None = None
     try:
-        raw = chat(RULE_VERIFIER_SYSTEM, "\n\n".join(parts), temperature=0.0)
+        verdict = chat_structured(
+            RULE_VERIFIER_SYSTEM, user, VerifierVerdict, temperature=0.0
+        )
+        if verdict is not None:
+            data = verdict.model_dump()
     except Exception as exc:  # noqa: BLE001
-        # A provider failure is not evidence the probe is good. Fail closed, exactly as an
-        # unreadable verdict does - but say plainly that the review did not happen.
         log.warning("verify: the review call failed [%s] - %s", rule_id, exc)
         return _reject(
             state,
@@ -127,8 +166,23 @@ def verifier_node(state: CompileState) -> dict:
             spent,
         )
 
-    data = extract_json(raw, default=_UNREADABLE)
-    if data is _UNREADABLE or not isinstance(data, dict) or "ok" not in data:
+    if data is None:
+        try:
+            raw = chat(RULE_VERIFIER_SYSTEM, user, temperature=0.0)
+        except Exception as exc:  # noqa: BLE001
+            # A provider failure is not evidence the probe is good. Fail closed, exactly as an
+            # unreadable verdict does - but say plainly that the review did not happen.
+            log.warning("verify: the review call failed [%s] - %s", rule_id, exc)
+            return _reject(
+                state,
+                "The automated review could not be completed. Re-check the probe against the "
+                "schema and the business rules, and correct anything that looks wrong.",
+                spent,
+            )
+        parsed = extract_json(raw, default=_UNREADABLE)
+        data = parsed if isinstance(parsed, dict) and parsed is not _UNREADABLE else None
+
+    if data is None or "ok" not in data:
         log.warning(
             "verify: verdict unreadable [%s] (%d chars) - failing closed, not approving",
             rule_id, len(raw or ""),

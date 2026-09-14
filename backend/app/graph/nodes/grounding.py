@@ -19,17 +19,41 @@ full schema and continues. Losing the prune costs tokens; refusing to compile co
 """
 from __future__ import annotations
 
+from pydantic import BaseModel, Field
+
 from app.graph.context import build_context, table_index
 from app.graph.nodes._common import rule_brief
 from app.graph.prompts import GROUNDING_SYSTEM
 from app.graph.state import CompileState
-from app.llm import chat
+from app.llm import chat, chat_structured
 from app.observability import get_logger
 from app.utils import extract_json
 
 log = get_logger()
 
 _UNREADABLE: dict = {"__unreadable__": True}
+
+
+class GroundingResult(BaseModel):
+    """Which tables a rule concerns, as a schema the provider must satisfy.
+
+    Mirrors the JSON the prompt already asks for, so prompt and parsing cannot drift. Note
+    `applicable` defaults to TRUE: only an EXPLICIT false retires a rule, and a model that
+    simply omitted the field must never be read as saying "this database cannot express it".
+    """
+
+    tables: list[str] = Field(
+        default_factory=list,
+        description="every table needed, schema-qualified, exactly as the index spells it",
+    )
+    applicable: bool = Field(
+        default=True,
+        description="false ONLY when this database cannot express the rule at all",
+    )
+    reason: str = Field(default="", description="the missing concept, when not applicable")
+    notes: str = Field(
+        default="", description="how the rule's business language maps onto those tables"
+    )
 
 
 def _fallback(state: CompileState, why: str) -> dict:
@@ -48,7 +72,7 @@ def _fallback(state: CompileState, why: str) -> dict:
 
 
 def grounding_node(state: CompileState) -> dict:
-    index = table_index(state.get("schema", ""))
+    index = table_index(state.get("schema", ""), state.get("numeric_hints", ""))
     if not index.strip():
         return _fallback(state, "the schema block is empty")
 
@@ -61,13 +85,30 @@ def grounding_node(state: CompileState) -> dict:
     )
 
     spent = state.get("llm_calls", 0) + 1
+
+    # Structured first, for the same reason as the verifier: an unparseable reply here costs
+    # the schema prune and sends the author the WHOLE database, which on a wide schema is the
+    # difference between a focused question and an unusable one. The text path stays as a
+    # fallback so a provider without structured output still grounds exactly as before.
+    data: dict | None = None
     try:
-        raw = chat(GROUNDING_SYSTEM, user, temperature=0.0, fast=True)
+        grounded = chat_structured(
+            GROUNDING_SYSTEM, user, GroundingResult, temperature=0.0, fast=True
+        )
+        if grounded is not None:
+            data = grounded.model_dump()
     except Exception as exc:  # noqa: BLE001 - a provider failure must not lose the rule
         return {**_fallback(state, f"the model call failed ({exc})"), "llm_calls": spent}
 
-    data = extract_json(raw, default=_UNREADABLE)
-    if data is _UNREADABLE or not isinstance(data, dict):
+    if data is None:
+        try:
+            raw = chat(GROUNDING_SYSTEM, user, temperature=0.0, fast=True)
+        except Exception as exc:  # noqa: BLE001 - a provider failure must not lose the rule
+            return {**_fallback(state, f"the model call failed ({exc})"), "llm_calls": spent}
+        parsed = extract_json(raw, default=_UNREADABLE)
+        data = parsed if isinstance(parsed, dict) and parsed is not _UNREADABLE else None
+
+    if data is None:
         return {**_fallback(state, "the reply could not be parsed"), "llm_calls": spent}
 
     # Only an EXPLICIT false retires a rule. A missing or malformed `applicable` key means the

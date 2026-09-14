@@ -69,18 +69,45 @@ def _bare(name: str) -> str:
     return name[1:-1] if name.startswith("[") and name.endswith("]") else name
 
 
-def table_index(schema_text: str) -> str:
-    """One line per table: its name and its column names, with no types or keys.
+def table_index(schema_text: str, numeric_text: str = "") -> str:
+    """One line per table: its name, HOW MANY ROWS IT HOLDS, and its column names.
 
     This is what Grounding reads instead of the full schema. Types, nullability, primary keys
     and foreign keys are what the AUTHOR needs in order to write correct SQL; Grounding only
     has to answer "which tables is this rule about?", and a name list is both sufficient for
     that and roughly a third of the size.
+
+    THE ROW COUNT IS THERE BECAUSE NAMES ALONE MISLEAD IT. This database holds an EMPTY table
+    whose name and 41 columns read almost identically to the populated one beside it. Shown
+    only names, Grounding cannot tell them apart and picked the empty one - so seven rules
+    compiled against a table with no rows, examined nothing, and were filed "not applicable to
+    this database" when the concept was perfectly expressible against its populated twin.
+
+    A count is measured evidence, not another naming rule, and it is the one fact that
+    distinguishes them.
     """
+    counts: dict[str, int | None] = {}
+    if numeric_text:
+        try:
+            from app.rules.schema_index import load_index
+
+            counts = {
+                name: table.row_count
+                for name, table in load_index(schema_text, numeric_text).tables.items()
+            }
+        except Exception:  # noqa: BLE001 - a missing count must not cost the whole index
+            counts = {}
+
     lines: list[str] = []
     for table, block in split_blocks(schema_text).items():
         cols = [_bare(c) for c in _COLUMN_NAME_RE.findall(block)]
-        lines.append(f"{table}: {', '.join(cols)}")
+        rows = counts.get(table)
+        # "EMPTY" rather than "0 rows": it has to be impossible to skim past. A table with no
+        # rows can support no finding at all, whatever its name suggests.
+        size = ""
+        if table in counts:
+            size = f" [{rows:,} rows]" if rows else " [EMPTY - nothing can be found here]"
+        lines.append(f"{table}{size}: {', '.join(cols)}")
     return "\n".join(lines)
 
 
