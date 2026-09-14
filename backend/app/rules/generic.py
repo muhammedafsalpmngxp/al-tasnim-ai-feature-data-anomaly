@@ -62,6 +62,21 @@ _DATE_PREFIX_PAIRS: tuple[tuple[str, str], ...] = (("start", "end"), ("start", "
 _PLANNED_MARKERS = (
     "ex_", "expect", "target", "planned", "plan_", "committed", "forecast", "earl_",
     "_req_", "req_date", "due", "next_", "estimate", "sched",
+    # TEMPORARY, and evidence-based rather than another guess about spelling. Measured on
+    # well.task_daily (app/rules/semantics.py measure_table):
+    #
+    #   endDate      8.56% of 107,484 values in the future, max 2071-03-24
+    #   target_end   8.35% of 107,483 values in the future, max 2071-03-24   <- already excluded
+    #   actual_end   0.00% of  83,076 values in the future, max 2026-08-15
+    #   actual_start 0.00% of 103,100 values in the future
+    #
+    # endDate tracks target_end almost exactly, down to the same maximum date, while the real
+    # actuals sit at precisely zero. It is the schedule, and the word-list included it only
+    # because "endDate" happens to contain none of the words above - which is the whole reason
+    # this list is being retired. It was reporting 9,198 + 776 records as defects.
+    #
+    # Remove these two once the semantic map drives this decision (app/rules/semantics.py).
+    "startdate", "enddate",
 )
 
 

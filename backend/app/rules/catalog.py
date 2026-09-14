@@ -142,19 +142,62 @@ def save(catalog: Catalog) -> str:
     return _CATALOG_PATH
 
 
+def structure_moved(
+    probe: CompiledProbe,
+    structure_fingerprint: str,
+    table_signatures: dict[str, str] | None = None,
+) -> tuple[bool, str]:
+    """(has the structure this probe depends on changed, why).
+
+    Deliberately shared by the compiler and the run's catalog loader. The two must never
+    disagree about whether a probe is current: one deciding to recompile while the other is
+    happy to execute the old SQL is precisely how stale queries reach a report.
+
+    Preference order, most specific first:
+      1. a table the probe reads has GONE - it cannot run at all, whatever else is true;
+      2. the probe's own tables, when both sides know them;
+      3. the whole database, for an entry compiled before per-table hashes existed.
+    """
+    from app.db import introspect
+
+    if table_signatures:
+        gone = introspect.missing_tables(probe.tables, table_signatures)
+        if gone:
+            return True, (
+                "it reads " + ", ".join(gone) + ", which no longer exist(s) in the database"
+            )
+        if probe.table_fingerprint and probe.tables:
+            current = introspect.probe_fingerprint(probe.tables, table_signatures)
+            if current and current != probe.table_fingerprint:
+                return True, "the structure of the tables it reads changed"
+            return False, ""
+
+    if structure_fingerprint and probe.structure_fingerprint != structure_fingerprint:
+        return True, "the database structure changed"
+    return False, ""
+
+
 def is_stale(
     probe: CompiledProbe | None,
     rule: AnomalyRule,
     structure_fingerprint: str,
     retry_failed: bool = False,
+    table_signatures: dict[str, str] | None = None,
 ) -> tuple[bool, str]:
-    """(needs recompiling, why). The why is logged, so a recompile is never mysterious."""
+    """(needs recompiling, why). The why is logged, so a recompile is never mysterious.
+
+    `table_signatures` narrows the structural test to the tables this probe actually reads.
+    Without it the whole-database fingerprint is used, which is correct but blunt: it marks
+    every probe stale over a column added to a table none of them touch.
+    """
     if probe is None:
         return True, "not compiled yet"
     if probe.rule_hash != rule.rule_hash:
         return True, "the rule definition changed"
-    if structure_fingerprint and probe.structure_fingerprint != structure_fingerprint:
-        return True, "the database structure changed"
+
+    structure_changed, why = structure_moved(probe, structure_fingerprint, table_signatures)
+    if structure_changed:
+        return True, why
     if probe.status == "failed":
         if retry_failed:
             return True, "retrying a rule that previously failed"

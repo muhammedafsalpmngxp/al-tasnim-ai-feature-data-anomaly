@@ -148,6 +148,58 @@ def test_no_business_sql() -> None:
                     )
 
 
+def test_render_version_does_not_invalidate_catalog() -> None:
+    """A presentation change must never force a full LLM recompile.
+
+    structure_fingerprint() guards the compiled catalog; _live_fingerprint() guards the rendered
+    files. The RENDER VERSION belongs only to the second: a probe's SQL depends on which tables
+    and columns exist, never on how they were printed into a prompt.
+
+    Including it cost a 25-minute, ~150-call recompile four times in a row, and a run that
+    refused to execute 148 of 166 probes. This asserts the separation rather than trusting a
+    comment to hold.
+    """
+    # Read the SOURCE rather than importing the module: app.db.introspect pulls in pyodbc, and a
+    # check this important must run in any environment, including one without a database driver.
+    import ast
+
+    path = os.path.join(_APP, "db", "introspect.py")
+    tree = ast.parse(open(path, encoding="utf-8").read())
+    bodies = {
+        node.name: ast.get_source_segment(open(path, encoding="utf-8").read(), node)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name in ("_structure_signature", "_live_fingerprint")
+    }
+    check(len(bodies) == 2, f"expected both fingerprint functions, found {sorted(bodies)}")
+    if len(bodies) != 2:
+        return
+    structure_src = bodies["_structure_signature"]
+    live_src = bodies["_live_fingerprint"]
+
+    code_only = [
+        line for line in structure_src.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    check(
+        not any("_RENDER_VERSION" in line for line in code_only),
+        "_structure_signature folds in _RENDER_VERSION, so every rendering tweak invalidates "
+        "the whole compiled catalog and demands a full LLM recompile.",
+    )
+    check(
+        "_RENDER_VERSION" in live_src,
+        "_live_fingerprint must fold in _RENDER_VERSION - schema.txt and the hint files ARE "
+        "the rendering, so a renderer change really does make them stale.",
+    )
+    # The signals that MUST invalidate a compiled probe, because each can make its SQL wrong.
+    for signal in ("allowed_schemas", "excluded_tables", "excluded_columns", "db_name"):
+        check(
+            signal in structure_src,
+            f"_structure_signature no longer folds in {signal}; a probe could keep running "
+            f"against a table that setting now hides, or against a different database.",
+        )
+
+
 def test_numeric_hints_round_trip() -> None:
     """Every line db/introspect.py can WRITE, rules/schema_index.py must be able to READ.
 
@@ -563,11 +615,104 @@ def test_generic_templates_parse() -> None:
         check("{{rule_id}}" in block, f"{fam}: does not use {{{{rule_id}}}}")
 
 
+def test_staleness_is_judged_per_probe() -> None:
+    """Regression: staleness must be decided against the tables a probe READS.
+
+    The whole-database fingerprint alone marked all 149 compiled probes stale whenever any
+    column changed anywhere, which made both honest responses to a stale catalog unusable: a
+    run that refuses stale SQL would refuse everything, and one that recompiles would recompile
+    everything at full LLM price.
+    """
+    from app.db.introspect import missing_tables, probe_fingerprint
+    from app.rules.catalog import structure_moved
+    from app.rules.spec import CompiledProbe
+
+    signatures = {"well.well_master": "aaa", "ref.cluster": "bbb", "other.untouched": "ccc"}
+
+    def probe(**kw) -> CompiledProbe:
+        return CompiledProbe(rule_id="T-1", summary_sql="x", detail_sql="y", **kw)
+
+    # Identical input, any spelling or order, must give the same hash - otherwise a probe would
+    # look stale purely because Grounding listed its tables differently this time.
+    check(
+        probe_fingerprint(["well.well_master", "ref.cluster"], signatures)
+        == probe_fingerprint(["REF.Cluster", " well.well_master "], signatures),
+        "probe_fingerprint is not stable across table-name case and ordering",
+    )
+    check(
+        probe_fingerprint([], signatures) == "",
+        "an unknown table list must yield no fingerprint, so the caller falls back",
+    )
+
+    unchanged = probe(
+        tables=("well.well_master",), structure_fingerprint="old-whole-database-hash"
+    )
+    unchanged.table_fingerprint = probe_fingerprint(unchanged.tables, signatures)
+    moved, why = structure_moved(unchanged, "a-different-whole-database-hash", signatures)
+    check(
+        not moved,
+        f"a probe whose own tables are unchanged was still called stale ({why}) - this is the "
+        "regression that forced full recompiles over an unrelated column",
+    )
+
+    changed = probe(tables=("well.well_master",), table_fingerprint="stale-hash")
+    moved, _ = structure_moved(changed, "", signatures)
+    check(moved, "a probe whose table structure changed was not detected as stale")
+
+    # A renamed or dropped table must be named, not left to fail later at the database with an
+    # "Invalid object name" the report cannot explain.
+    ghost = probe(tables=("well.well_master", "well.renamed_away"), table_fingerprint="any")
+    moved, why = structure_moved(ghost, "", signatures)
+    check(moved, "a probe reading a table that no longer exists was not detected")
+    check(
+        "well.renamed_away" in why,
+        f"the reason does not name the missing table, so a reader cannot act on it: {why!r}",
+    )
+    check(
+        missing_tables(["well.well_master", "gone.table"], signatures) == ["gone.table"],
+        "missing_tables did not identify exactly the table that is absent",
+    )
+
+    # An entry written before per-table hashes existed must still be judged, by the blunt
+    # whole-database signal. Treating "I cannot tell" as "nothing changed" would silently run
+    # stale SQL, which is the one outcome this whole mechanism exists to prevent.
+    legacy = probe(tables=("well.well_master",), structure_fingerprint="old")
+    moved, _ = structure_moved(legacy, "new", signatures)
+    check(moved, "a probe with no table fingerprint was not falling back to the whole-database test")
+
+
+def test_a_stale_catalog_is_never_silently_executed() -> None:
+    """Regression: ANOMALY_AUTO_COMPILE was defined in config and documented in the catalog
+    loader's own docstring, but never read anywhere. Every run executed stale SQL and reported
+    its numbers as findings, with only a warning banner to say so.
+    """
+    from app.config import settings
+
+    with open(os.path.join(_APP, "graph", "nodes", "catalog_loader.py"), encoding="utf-8") as fh:
+        source = fh.read()
+    check(
+        "settings.auto_compile" in source,
+        "catalog_loader does not read settings.auto_compile - stale probes run regardless, "
+        "which is exactly the bug this test exists to prevent",
+    )
+    check(
+        "auto_compile_max_rules" in source,
+        "catalog_loader does not bound the automatic recompile, so a schema-wide change would "
+        "start an unbounded LLM spend inside a detection run",
+    )
+    check(
+        hasattr(settings, "auto_compile") and hasattr(settings, "auto_compile_max_rules"),
+        "the auto-compile settings are missing from config",
+    )
+
+
 def main() -> int:
     tests = [
         ("every module parses and imports", test_every_module_parses),
         ("no business SQL in Python", test_no_business_sql),
         ("numeric hints round-trip", test_numeric_hints_round_trip),
+        ("render version does not invalidate the catalog",
+         test_render_version_does_not_invalidate_catalog),
         ("rules parse", test_rules_parse),
         ("parser rejects bad rules", test_parser_rejects_bad_rules),
         ("pinned SQL meets the contract", test_pinned_sql_meets_contract),
@@ -577,6 +722,8 @@ def main() -> int:
         ("zero-scope probe never stored active", test_zero_scope_probe_is_never_stored_active),
         ("verifier can say not applicable", test_verifier_prompt_offers_the_not_applicable_verdict),
         ("generic templates parse", test_generic_templates_parse),
+        ("staleness is judged per probe", test_staleness_is_judged_per_probe),
+        ("a stale catalog is never silently executed", test_a_stale_catalog_is_never_silently_executed),
     ]
     for name, fn in tests:
         before = len(_failures)

@@ -1462,3 +1462,190 @@ percentage silently flags every well.
 **Do NOT flag**
 Wells with no activity records or no recorded progress — there is nothing to reconcile, and
 "missing" is a different finding from "inconsistent".
+
+---
+
+# GROUP G — Structural rules, applied across the whole schema
+
+Every rule above is about **one specific thing**: a named milestone, a particular deadline, a
+known rollup. The six below are different. Each is written **once** and applied to **every
+matching feature the schema declares** — one probe per foreign key, per grain marker, per
+measured numeric column — so a finding still names the individual relationship or column that
+is broken, rather than collapsing dozens of unrelated problems into a single number.
+
+That is what `expands_over` means. It names a **schema feature**, never a table:
+
+| `expands_over` | Applied to |
+|---|---|
+| `foreign_key` | every foreign key the database declares |
+| `duplicate_key` | every table with a `MANY ROWS PER` grain marker |
+| `date_pair` | every start/end date pair |
+| `future_date` | every date column recording an actual |
+| `numeric_range` | every numeric column with a measured scale |
+| `text_numeric` | every text column holding numbers |
+
+A rule here must NOT carry SQL — it is applied to tables it was not written against, so the
+query is written per feature. The parser rejects one that does.
+
+These are `draft` until the expansion path is built and its results have been compared, probe
+for probe, against the `GEN-*` probes they replace. Until then the deterministic templates in
+`generic_probes.md` remain the live implementation, and activating these would report every
+record twice.
+
+---
+
+## RULE DQ-G01 - Orphan child rows
+- category: Referential integrity
+- severity: high
+- entity: row
+- method: rule
+- expands_over: foreign_key
+- status: draft
+
+**What is wrong**
+A child row holds a foreign-key value that has no matching parent. The relationship is
+*declared* in the database, so this should be impossible — where it happens, the constraint is
+untrusted or was added after the bad data.
+
+**Why it matters**
+Every join through this key silently drops the orphan, so it vanishes from reports rather than
+appearing as an error.
+
+**How to detect**
+Keep the child rows whose key has no matching parent row, ignoring rows where the key is not
+set at all. No threshold: one orphan is a defect.
+
+**Do NOT flag**
+A NULL key. "Not linked yet" is a different finding from "linked to something that does not
+exist", and conflating them hides both.
+
+---
+
+## RULE DQ-G02 - Repeated key in a table expected to be one row per entity
+- category: Grain integrity
+- severity: high
+- entity: row
+- method: rule
+- expands_over: duplicate_key
+- status: draft
+
+**What is wrong**
+A key that identifies an entity appears on more than one row.
+
+**Why it matters**
+Any count, sum or average over this table double-counts the duplicated entity. This is the
+single most damaging silent error in this kind of database, because the query runs perfectly
+and simply returns a number that is too big.
+
+**How to detect**
+Group by the key and keep the groups holding more than one row. No threshold.
+
+**Do NOT flag**
+A NULL key, and tables where repetition is legitimate — a history or snapshot table is
+*supposed* to hold many rows per entity. Where that is the case, disable the generated probe
+rather than widening the condition: the grain is a property of the table, not of this check.
+
+---
+
+## RULE DQ-G03 - End date precedes start date
+- category: Date integrity
+- severity: high
+- entity: row
+- method: rule
+- expands_over: date_pair
+- status: draft
+
+**What is wrong**
+A paired end date falls before its start date.
+
+**Why it matters**
+Every duration derived from the pair is negative, which silently corrupts averages and totals
+rather than failing.
+
+**How to detect**
+Compare the two directly. No threshold: a negative duration is impossible, not merely unusual.
+
+**Do NOT flag**
+Rows where either date is missing — that is a different finding. Never compare across
+families: an actual start against a planned end measures the plan slipping, not a broken
+record, and reporting it here would be wrong.
+
+---
+
+## RULE DQ-G04 - Actual date recorded in the future
+- category: Date integrity
+- severity: medium
+- entity: row
+- method: rule
+- expands_over: future_date
+- status: draft
+
+**What is wrong**
+A column recording something that has *already happened* holds a date later than today.
+
+**Why it matters**
+Usually a typo in the year. It makes completed work look outstanding, or pulls a forecast years
+out.
+
+**How to detect**
+Compare against the database's own current date, so the check uses the same clock the data was
+written against.
+
+**Do NOT flag**
+Any column holding a target, schedule, forecast, commitment or expected date. Those are
+*supposed* to be in the future — that is what they are for — and flagging them is how this check
+previously reported roughly ten thousand records as defects. Only a column recording an
+outcome belongs here. Where it is not established which of the two a column is, it must be
+left unchecked and reported as a gap in coverage, never assumed to be an actual.
+
+---
+
+## RULE DQ-G05 - Numeric value outside its measured bounds
+- category: Value range
+- severity: medium
+- entity: row
+- method: rule
+- expands_over: numeric_range
+- status: draft
+
+**What is wrong**
+A value falls outside the range its column is supposed to occupy — most often a percentage
+above 100, or a negative quantity.
+
+**Why it matters**
+An out-of-range progress figure propagates into every rollup that averages or weights it.
+
+**How to detect**
+Compare against the bounds recorded in NUMERIC HINTS, which were **measured** from the column
+rather than assumed: a 0-1 fraction is checked against its own scale and a 0-100 percentage
+against its own. Never substitute a bound of your own — the measured scale is the authority,
+and assuming the wrong one silently flags or clears the entire column.
+
+**Do NOT flag**
+Columns with no measured scale. An unmeasured column has no bounds to be outside of.
+
+---
+
+## RULE DQ-G06 - Quantity stored as text that will not parse as a number
+- category: Type integrity
+- severity: medium
+- entity: row
+- method: rule
+- expands_over: text_numeric
+- status: draft
+
+**What is wrong**
+A column storing a quantity as text holds a value that cannot be read as a number.
+
+**Why it matters**
+Every calculation on the column has to cast it safely, and a safe cast turns the bad value into
+NULL — so the row is silently dropped from the calculation instead of failing it. The defect is
+invisible precisely because the safe cast hides it.
+
+**How to detect**
+Attempt a numeric conversion that yields NULL on failure; a value that is present and non-blank
+but fails to convert is the anomaly. No threshold.
+
+**Do NOT flag**
+Blank and NULL values, and columns where *no* value parses as a number — those hold codes or
+identifiers, the column was never numeric, and flagging it would report the whole table.

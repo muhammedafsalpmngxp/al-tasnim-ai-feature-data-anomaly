@@ -41,6 +41,10 @@ class CompileState(TypedDict, total=False):
     params: dict[str, str]
     rule_hash: str
     structure_fingerprint: str
+    # One structural hash per table in the database. The catalog writer folds the entries for
+    # THIS probe's tables into its stored table_fingerprint, so staleness can later be judged
+    # against the tables it reads rather than against the whole database.
+    table_signatures: dict[str, str]
 
     # Seed SQL from the markdown. For `pinned` this IS the final SQL; for `seed` it is a
     # starting point; for `authored` both are empty.
@@ -55,6 +59,16 @@ class CompileState(TypedDict, total=False):
     numeric_hints: str
     patterns: str                 # the ## PATTERNS section of data_anomalies.md
     coverage: str                 # what the generic probes already cover
+
+    # ── Family rules (expands_over) ──
+    # A rule applied to every matching feature in the schema. `placeholders` lists the tokens
+    # the authored query must use in place of literal names; the templates are what get reused
+    # across the other features, while summary_sql/detail_sql above always hold the runnable,
+    # substituted form that the gates and the reviewer actually judge.
+    expands_over: str
+    placeholders: tuple[str, ...]
+    summary_sql_template: str
+    detail_sql_template: str
 
     # ── Grounding ──
     tables: list[str]             # the tables this rule actually concerns

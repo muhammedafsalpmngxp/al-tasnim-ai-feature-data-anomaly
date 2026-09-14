@@ -82,6 +82,37 @@ class AnomalyRule:
     source: str = "declared"
     tags: tuple[str, ...] = ()
 
+    # A STRUCTURAL family: one rule written once, applied to every matching feature the schema
+    # has. `expands_over: foreign_key` on a rule about orphan rows becomes one probe per
+    # declared foreign key - 36 of them here - each reported separately, so a finding names the
+    # relationship that is broken rather than a single number covering all of them.
+    #
+    # Named after the SCHEMA FEATURE, never a table: that is what keeps one sentence of business
+    # prose portable to a database with different tables and a different number of them.
+    # Empty for an ordinary rule, which is about one specific thing and expands over nothing.
+    expands_over: str = ""
+
+    # Set on each rule PRODUCED by expanding a family: the id of the family rule it came from.
+    # Recorded explicitly rather than parsed back out of "DQ-G01-004", because deriving identity
+    # from a naming convention is one rename away from being silently wrong - and this one
+    # decides which probes share an authored query.
+    family_id: str = ""
+
+    @property
+    def is_family(self) -> bool:
+        """A rule still waiting to be applied to many features. Never compiled itself.
+
+        `expands_over` stays set on the expansions too - it is the feature KIND, and the author
+        needs it to know which tokens its query may use. What tells the two apart is
+        `family_id`: present only once a rule IS one concrete feature.
+        """
+        return bool(self.expands_over) and not self.family_id
+
+    @property
+    def is_expanded(self) -> bool:
+        """One concrete probe produced FROM a family rule."""
+        return bool(self.family_id)
+
     # The prose sections (what is wrong / why it matters / how to detect / do NOT flag).
     # Fed to the SQL Author and to the Verifier verbatim - this is the business intent, and
     # the Verifier cannot judge a probe without knowing what it was meant to find.
@@ -145,6 +176,14 @@ class CompiledProbe:
     source: str = "declared"
     rule_hash: str = ""
     structure_fingerprint: str = ""
+    # The structure of just THIS probe's tables (introspect.probe_fingerprint). Checked before
+    # the whole-database fingerprint above, which moves whenever anything anywhere changes and
+    # would otherwise force a full recompile over a column added to an unrelated table.
+    #
+    # Empty on an entry written before this existed; staleness then falls back to the
+    # whole-database fingerprint, which is the conservative direction - recompiling something
+    # that did not need it costs money, missing something that did costs correctness.
+    table_fingerprint: str = ""
     compiled_at: str = ""
 
     # Which tables the probe reads, from Grounding. Used to prune the schema block on a wide
@@ -176,6 +215,7 @@ class CompiledProbe:
             "source": self.source,
             "rule_hash": self.rule_hash,
             "structure_fingerprint": self.structure_fingerprint,
+            "table_fingerprint": self.table_fingerprint,
             "compiled_at": self.compiled_at,
             "tables": list(self.tables),
             "grounding_note": self.grounding_note,
@@ -199,6 +239,7 @@ class CompiledProbe:
             ),
             rule_hash=data.get("rule_hash", ""),
             structure_fingerprint=data.get("structure_fingerprint", ""),
+            table_fingerprint=data.get("table_fingerprint", ""),
             compiled_at=data.get("compiled_at", ""),
             tables=tuple(data.get("tables") or ()),
             grounding_note=data.get("grounding_note", ""),

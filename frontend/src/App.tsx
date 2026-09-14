@@ -48,6 +48,14 @@ function Actions({ onDone, busy }: { onDone: () => void; busy: boolean }) {
               } — ${d.llm_calls} LLM call(s)`
             : `score ${d.score} — ${d.totals?.records_flagged?.toLocaleString() ?? 0} record(s) flagged`,
         )
+        // A detection run exists to produce the report, so hand it over rather than leaving the
+        // reader to find the download button. Compile produces no report at all - it only
+        // rebuilds the SQL - so there is deliberately nothing to deliver on that path.
+        if (job === 'run' && d.run_id && d.report_paths?.docx) {
+          downloadReport(d.run_id, 'docx').catch((e) =>
+            setError(`The run finished but the Word report could not be downloaded: ${e}`),
+          )
+        }
       },
       onError: setError,
       onEnd: () => {
@@ -261,7 +269,15 @@ function RulesTab({ onPick }: { onPick: (id: string) => void }) {
   )
 }
 
-function RunsTab({ runs, onOpen }: { runs: RunRow[]; onOpen: (id: string) => void }) {
+function RunsTab({
+  runs,
+  onOpen,
+  onError,
+}: {
+  runs: RunRow[]
+  onOpen: (id: string) => void
+  onError: (message: string) => void
+}) {
   return (
     <>
       <section className="card">
@@ -297,7 +313,9 @@ function RunsTab({ runs, onOpen }: { runs: RunRow[]; onOpen: (id: string) => voi
                       <button
                         key={f}
                         className="link"
-                        onClick={() => downloadReport(r.run_id, f)}
+                        onClick={() =>
+                          downloadReport(r.run_id, f).catch((e) => onError(String(e)))
+                        }
                       >
                         {f}
                       </button>
@@ -436,7 +454,12 @@ export default function App() {
                   <div>
                     {(['xlsx', 'docx'] as const).map((f) =>
                       run.report_paths?.[f] ? (
-                        <button key={f} onClick={() => downloadReport(run.run_id, f)}>
+                        <button
+                          key={f}
+                          onClick={() =>
+                            downloadReport(run.run_id, f).catch((e) => setError(String(e)))
+                          }
+                        >
                           Download {f === 'xlsx' ? 'Excel' : 'Word'}
                         </button>
                       ) : null,
@@ -463,7 +486,7 @@ export default function App() {
       )}
 
       {tab === 'rules' && <RulesTab onPick={setPicked} />}
-      {tab === 'runs' && <RunsTab runs={runs} onOpen={openRun} />}
+      {tab === 'runs' && <RunsTab runs={runs} onOpen={openRun} onError={setError} />}
 
       {picked && <RuleDrawer id={picked} onClose={() => setPicked('')} />}
     </div>

@@ -493,8 +493,20 @@ def _structure_signature(cur, h: hashlib._Hash) -> None:
     h.update(("!schemas=" + ",".join(sorted(settings.allowed_schemas))).encode("utf-8"))
     h.update(("!excluded=" + ",".join(sorted(settings.excluded_tables))).encode("utf-8"))
     h.update(("!excluded_cols=" + ",".join(sorted(settings.excluded_columns))).encode("utf-8"))
-    h.update(("!render=" + _RENDER_VERSION).encode("utf-8"))
     h.update(f"!db={settings.db_server}:{settings.db_port}/{settings.db_name}".encode("utf-8"))
+    # ⚠ _RENDER_VERSION IS DELIBERATELY NOT FOLDED IN HERE. It describes how schema.txt is
+    # FORMATTED for a prompt - bracketing, spacing, which statistics are abbreviated. A probe's
+    # stored SQL depends on which tables and columns EXIST, never on how they were printed, so
+    # a rendering change cannot make that SQL wrong.
+    #
+    # It was included, and the consequence was severe: four presentation tweaks in a row each
+    # invalidated all 166 compiled probes, and the run then refused to execute 148 of them and
+    # demanded a ~150-call, 25-minute recompile. That is the same failure this module's header
+    # warns about for row counts - an invalidation signal that has nothing to do with whether
+    # the SQL still works - repeated one level up.
+    #
+    # It still belongs in _live_fingerprint(), which guards the RENDERED files themselves: those
+    # genuinely are stale when the renderer changes.
     h.update(b"\n")
     for row in cur.fetchall():
         h.update("|".join("" if v is None else str(v) for v in row).encode("utf-8"))
@@ -516,9 +528,14 @@ def _live_fingerprint(cur) -> str:
     Row counts are included here because all three artefacts describe DATA: the grain warnings,
     the sampled lookup values and the observed numeric ranges all go stale when rows change,
     even though every column stayed the same.
+
+    The RENDER VERSION is folded in here and nowhere else. These three files ARE the rendering,
+    so a renderer change genuinely makes them stale - unlike the compiled catalog, whose SQL
+    does not care how a schema was printed. See the note in _structure_signature().
     """
     h = hashlib.sha256()
     _structure_signature(cur, h)
+    h.update(("!render=" + _RENDER_VERSION).encode("utf-8"))
     # Row counts need VIEW DATABASE STATE. A login without it still gets structure-only drift
     # detection rather than a failed startup.
     try:
@@ -552,6 +569,106 @@ def structure_fingerprint(cur=None) -> str:
         return h.hexdigest()
     finally:
         conn.close()
+
+
+def table_signatures(cur=None) -> dict[str, str]:
+    """One STRUCTURAL hash per table, keyed "schema.table" in lower case.
+
+    structure_fingerprint() above answers "has ANYTHING in the database changed?". That is the
+    right question for the rendered caches, and far too blunt for the catalog: one column added
+    anywhere marks every compiled probe stale and forces a full, LLM-priced recompile of rules
+    that never read the changed table. These answer the narrower question a probe actually
+    cares about - "has anything changed in the tables I read?" - so a rename recompiles the
+    probes over that table and leaves the rest alone.
+
+    Structure ONLY, exactly as _structure_signature defines it. A table whose ROWS changed
+    overnight keeps its signature, or the daily run stops being nearly free.
+    """
+    if cur is None:
+        conn = get_connection()
+        try:
+            return table_signatures(conn.cursor())
+        finally:
+            conn.close()
+
+    # The same global inputs the whole-database fingerprint folds in. They belong in every
+    # per-table hash rather than only in the global one: hiding a table or changing the render
+    # version can change what a probe may legitimately read, and a purely per-table comparison
+    # would otherwise never notice.
+    prefix = "|".join((
+        "schemas=" + ",".join(sorted(settings.allowed_schemas)),
+        "excluded=" + ",".join(sorted(settings.excluded_tables)),
+        "excluded_cols=" + ",".join(sorted(settings.excluded_columns)),
+        "render=" + _RENDER_VERSION,
+        f"db={settings.db_server}:{settings.db_port}/{settings.db_name}",
+    ))
+
+    parts: dict[str, list[str]] = {}
+    placeholders = ",".join("?" for _ in settings.allowed_schemas)
+    cur.execute(
+        f"""
+        SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH,
+               IS_NULLABLE
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE LOWER(TABLE_SCHEMA) IN ({placeholders})
+        ORDER BY TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME
+        """,
+        *settings.allowed_schemas,
+    )
+    for row in cur.fetchall():
+        key = f"{row[0]}.{row[1]}".lower()
+        parts.setdefault(key, []).append(
+            "|".join("" if v is None else str(v) for v in row[2:])
+        )
+
+    # Keys and constraints, grouped onto the table they belong to. Every row _key_signature
+    # returns is (KIND, schema, table, ...), which is what makes this grouping safe. A foreign
+    # key is recorded against the CHILD table, so dropping the parent changes the child's
+    # signature too - which is correct, because that is whose query breaks.
+    try:
+        for row in _key_signature(cur):
+            key = f"{row[1]}.{row[2]}".lower()
+            parts.setdefault(key, []).append(
+                "$" + "|".join("" if v is None else str(v) for v in (row[0], *row[3:]))
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.info("schema: key/constraint signal unavailable (%s) - tracking columns only", exc)
+
+    out: dict[str, str] = {}
+    for key, lines in parts.items():
+        h = hashlib.sha256()
+        h.update((prefix + "\n" + key + "\n").encode("utf-8"))
+        for line in sorted(lines):
+            h.update(line.encode("utf-8"))
+            h.update(b"\n")
+        out[key] = h.hexdigest()
+    return out
+
+
+def probe_fingerprint(tables, signatures: dict[str, str]) -> str:
+    """One hash standing for the structure of every table a probe reads.
+
+    Returns "" when `tables` is empty - an unknown table list cannot be judged per-table, and
+    the caller falls back to the whole-database fingerprint rather than treating "I know
+    nothing" as "nothing changed".
+    """
+    names = sorted({str(t).strip().lower() for t in (tables or []) if str(t).strip()})
+    if not names:
+        return ""
+    h = hashlib.sha256()
+    for name in names:
+        # A table with no signature is missing from the database. Folding a marker in rather
+        # than skipping it means its disappearance MOVES the hash instead of being invisible.
+        h.update(f"{name}={signatures.get(name, '<missing>')}\n".encode("utf-8"))
+    return h.hexdigest()
+
+
+def missing_tables(tables, signatures: dict[str, str]) -> list[str]:
+    """The probe's tables that no longer exist - dropped, renamed, or newly out of scope."""
+    return sorted(
+        str(t) for t in (tables or [])
+        if str(t).strip() and str(t).strip().lower() not in signatures
+    )
 
 
 def _read_fingerprint() -> str:

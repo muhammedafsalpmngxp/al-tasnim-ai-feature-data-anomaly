@@ -72,7 +72,16 @@ def _route_after_loader(state: CompileState) -> str:
     # has to be shown the tables the query actually reads, and without grounding it would be
     # reviewing against the whole database - which on a wide schema is the same as reviewing
     # against nothing.
-    return "validator" if state.get("source") == "generic" else "grounding"
+    #
+    # An EXPANDED rule skips grounding too, but for the opposite reason to a generic one: its
+    # SQL has still to be written, yet the feature it was expanded from already names its
+    # tables exactly. It goes straight to the author, and unlike a generic probe it is still
+    # reviewed afterwards - a model wrote that query, so something independent must read it.
+    if state.get("source") == "generic":
+        return "validator"
+    if state.get("source") == "expanded":
+        return "sql_author"
+    return "grounding"
 
 
 def _route_after_grounding(state: CompileState) -> str:
@@ -150,7 +159,7 @@ def build_compile_graph():
     g.add_edge(START, "rule_loader")
     g.add_conditional_edges(
         "rule_loader", _route_after_loader,
-        {"grounding": "grounding", "validator": "validator"},
+        {"grounding": "grounding", "validator": "validator", "sql_author": "sql_author"},
     )
     g.add_conditional_edges(
         "grounding", _route_after_grounding,

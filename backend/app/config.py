@@ -130,6 +130,13 @@ class Settings:
         default_factory=lambda: _get_int("ANOMALY_SCHEMA_PRUNE_ABOVE_TABLES", 60)
     )
     auto_compile: bool = field(default_factory=lambda: _get_bool("ANOMALY_AUTO_COMPILE", True))
+    # How many outdated probes a detection run may rebuild by itself before it stops and asks.
+    # Auto-compile exists for DRIFT - a handful of probes left behind by a column rename. A
+    # schema-wide change invalidates everything at once, and silently spending an hour of LLM
+    # calls inside what the operator asked to be a run is not a decision this should make alone.
+    auto_compile_max_rules: int = field(
+        default_factory=lambda: _get_int("ANOMALY_AUTO_COMPILE_MAX_RULES", 25)
+    )
     generic_probes: bool = field(
         default_factory=lambda: _get_bool("ANOMALY_GENERIC_PROBES", True)
     )

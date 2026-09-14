@@ -2,9 +2,14 @@
 
 It answers one awkward question honestly: is the stored SQL still trustworthy?
 
-A catalog is stale when the database STRUCTURE has moved under it. Row counts moving is not
+A probe is stale when the STRUCTURE IT READS has moved under it. Row counts moving is not
 staleness - data changes every day and the probes were written against the shape of the
 tables, not their contents. That distinction is the whole reason a daily run is nearly free.
+
+Judged PER PROBE, against its own tables. The whole-database fingerprint is still the
+fallback for an entry compiled before per-table hashes existed, but on its own it is far too
+blunt to act on: one column added anywhere marks every probe stale, so a node that refused to
+run stale SQL would refuse the entire run, and one that recompiled would recompile all of it.
 
 WHEN THE CATALOG IS STALE THERE ARE ONLY TWO HONEST OPTIONS, AND BOTH ARE OFFERED:
   ANOMALY_AUTO_COMPILE=true   recompile the affected rules first, then run. Correct, slower.
@@ -44,6 +49,49 @@ def _all_rules_by_id() -> dict:
     return by_id
 
 
+def _recompile(rule_ids: list[str], note: str) -> tuple[dict[str, str], str]:
+    """Rebuild exactly the outdated probes, then report what is still not runnable.
+
+    Imported inside the function on purpose: app.compiler imports the compile graph, and the
+    compile graph imports this package. A module-level import would be a cycle.
+
+    Only the named rules are compiled. A full recompile here would be minutes of LLM calls in
+    the middle of what the operator asked to be a detection run, to rebuild probes that were
+    already correct.
+    """
+    from app.compiler import compile_rules
+
+    log.warning("catalog: recompiling %d outdated probe(s) before running", len(rule_ids))
+    try:
+        catalog, report, _errors = compile_rules(only=rule_ids)
+    except Exception as exc:  # noqa: BLE001 - a failed recompile must not lose the whole run
+        log.warning("catalog: the automatic recompile failed (%s)", exc)
+        return (
+            {rule_id: f"it is out of date and the automatic recompile failed: {exc}"
+             for rule_id in rule_ids},
+            note + f" The automatic recompile failed ({exc}), so they were not run.",
+        )
+
+    # Whatever did not come back active still must not run, and must still be visible.
+    still_bad = {
+        rule_id: (
+            (catalog.get(rule_id).error if catalog.get(rule_id) else "")
+            or "it could not be recompiled against the current schema"
+        )
+        for rule_id in rule_ids
+        if not (catalog.get(rule_id) and catalog.get(rule_id).status == "active")
+    }
+    rebuilt = len(rule_ids) - len(still_bad)
+    note += (
+        f" {rebuilt} were rebuilt automatically before this run"
+        f" ({report.llm_calls} LLM call(s), {report.seconds:.0f}s)."
+    )
+    if still_bad:
+        note += f" {len(still_bad)} could not be rebuilt and did not run."
+    log.warning("catalog: %s", note)
+    return still_bad, note
+
+
 def catalog_loader_node(state: RunState) -> dict:
     catalog = catalog_store.load()
     rules = _all_rules_by_id()
@@ -63,32 +111,77 @@ def catalog_loader_node(state: RunState) -> dict:
     except Exception as exc:  # noqa: BLE001
         log.warning("probe: structure fingerprint unavailable (%s) - assuming current", exc)
         fingerprint = ""
+    try:
+        signatures = introspect.table_signatures()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("probe: per-table signatures unavailable (%s)", exc)
+        signatures = {}
 
-    stale = bool(fingerprint and catalog.structure_fingerprint and
-                 fingerprint != catalog.structure_fingerprint)
+    only = {r.strip().lower() for r in (state.get("only") or [])}
+    selected = [
+        p for p in catalog.probes.values()
+        if not only or p.rule_id.lower() in only
+    ]
+
+    # Judged per probe, against the tables it actually reads. A column added to a table this
+    # probe never touches is not a reason to distrust - or recompile - its SQL.
+    outdated: dict[str, str] = {}
+    for probe in selected:
+        if probe.status != "active":
+            continue
+        moved, why = catalog_store.structure_moved(probe, fingerprint, signatures)
+        if moved:
+            outdated[probe.rule_id] = why
+
+    stale = bool(outdated)
     note = ""
     if stale:
         note = (
-            "The database structure has changed since these probes were compiled. Recompile "
-            "with: python -m app.cli compile"
+            f"{len(outdated)} of {len(selected)} compiled probe(s) no longer match the database "
+            "structure they were written against."
         )
         log.warning("catalog: %s", note)
+        # The choice this node exists to make. Running SQL whose tables have moved is not among
+        # the options: it either fails loudly or - far worse - still executes and quietly
+        # measures something else, and a report cannot tell you which happened.
+        too_many = len(outdated) > settings.auto_compile_max_rules
+        if settings.auto_compile and not too_many:
+            outdated, note = _recompile(sorted(outdated), note)
+            catalog = catalog_store.load()
+            rules = _all_rules_by_id()
+            selected = [
+                p for p in catalog.probes.values()
+                if not only or p.rule_id.lower() in only
+            ]
+        else:
+            note += (
+                " They were NOT run, because their stored SQL can no longer be trusted against "
+                "this schema. Recompile with: python -m app.cli compile"
+            )
+            if too_many:
+                # A whole-schema change, not drift. Rebuilding it is a deliberate, budgeted
+                # operation, not something to start inside a run the operator is waiting on.
+                note += (
+                    f" (Too many to rebuild automatically - {len(outdated)} exceeds "
+                    f"ANOMALY_AUTO_COMPILE_MAX_RULES={settings.auto_compile_max_rules}, which "
+                    "usually means the schema changed broadly rather than drifted.)"
+                )
+            else:
+                note += "  (or set ANOMALY_AUTO_COMPILE=true to rebuild them before each run)."
+            log.warning("catalog: refusing to run stale probes - %s", note)
 
-    only = {r.strip().lower() for r in (state.get("only") or [])}
     probes: list = []
     not_running: list[dict[str, str]] = []
 
-    for probe in catalog.probes.values():
-        if only and probe.rule_id.lower() not in only:
-            continue
-        if probe.status == "active":
+    for probe in selected:
+        if probe.status == "active" and probe.rule_id not in outdated:
             probes.append(probe)
             continue
         not_running.append({
             "rule_id": probe.rule_id,
             "title": getattr(rules.get(probe.rule_id), "title", ""),
-            "status": probe.status,
-            "reason": probe.error or "",
+            "status": "stale" if probe.rule_id in outdated else probe.status,
+            "reason": outdated.get(probe.rule_id) or probe.error or "",
         })
 
     # Sorted so a run's log and its report list rules in the same, stable order every time.

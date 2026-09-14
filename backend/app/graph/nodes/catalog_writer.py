@@ -84,8 +84,11 @@ def _status(state: CompileState) -> tuple[str, str]:
 
 
 def catalog_writer_node(state: CompileState) -> dict:
+    from app.db.introspect import probe_fingerprint
+
     status, error = _status(state)
     rule_id = state.get("rule_id", "")
+    tables = tuple(state.get("tables", []) or ())
 
     probe = CompiledProbe(
         rule_id=rule_id,
@@ -97,8 +100,11 @@ def catalog_writer_node(state: CompileState) -> dict:
         source=state.get("source", "declared"),
         rule_hash=state.get("rule_hash", ""),
         structure_fingerprint=state.get("structure_fingerprint", ""),
+        # What this probe's OWN tables looked like when it was written, so a later change to an
+        # unrelated table does not drag it into a recompile it does not need.
+        table_fingerprint=probe_fingerprint(tables, state.get("table_signatures") or {}),
         compiled_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
-        tables=tuple(state.get("tables", []) or ()),
+        tables=tables,
         grounding_note=state.get("grounding_note", ""),
         verifier_note=state.get("verifier_note", ""),
         threshold_note=state.get("threshold_note", ""),

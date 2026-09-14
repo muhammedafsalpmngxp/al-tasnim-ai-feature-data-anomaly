@@ -69,7 +69,15 @@ _META_LINE = re.compile(r"^\s*[-*]\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*?)\s*$")
 _PLACEHOLDER = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 # Metadata keys consumed as structure; anything else becomes a SQL placeholder.
 _RESERVED_KEYS = frozenset(
-    ("category", "severity", "entity", "method", "sql_mode", "status", "tags", "title")
+    ("category", "severity", "entity", "method", "sql_mode", "status", "tags", "title",
+     "expands_over")
+)
+
+# Schema features a rule may expand over - one probe per matching feature. Validated here
+# rather than at expansion time so an unknown value fails when the file is parsed, on a
+# numbered line, instead of silently producing no probes at all.
+EXPANDS_OVER = (
+    "foreign_key", "duplicate_key", "date_pair", "future_date", "numeric_range", "text_numeric",
 )
 
 
@@ -225,6 +233,23 @@ def _build_rule(rule_id: str, title: str, block: str, path: str, line_no: int) -
     # line at all and cannot be set to something the file contradicts.
     default_mode = "seed" if (summary_sql and detail_sql) else "authored"
     sql_mode = _validate("sql_mode", meta.get("sql_mode", default_mode), SQL_MODES, rule_id)
+
+    expands_over = (meta.get("expands_over") or "").strip().lower()
+    if expands_over:
+        if expands_over not in EXPANDS_OVER:
+            raise RuleParseError(
+                f"expands_over is '{expands_over}', which is not a schema feature this engine "
+                f"can enumerate. Use one of: {', '.join(EXPANDS_OVER)}."
+            )
+        if summary_sql or detail_sql:
+            # The whole point of a family rule is that its SQL is written per feature. SQL
+            # written here would name one table and be wrong for the other thirty-five.
+            raise RuleParseError(
+                "a rule with expands_over must not carry its own SQL - it is applied to every "
+                "matching feature in the schema, so the query is written per feature. Remove "
+                "the ```sql blocks."
+            )
+
     if sql_mode in ("pinned", "seed") and not (summary_sql and detail_sql):
         raise RuleParseError(
             f"sql_mode is '{sql_mode}' but the rule carries no SQL. Add ```sql summary and "
@@ -241,6 +266,7 @@ def _build_rule(rule_id: str, title: str, block: str, path: str, line_no: int) -
         sql_mode=sql_mode,
         status=_validate("status", meta.get("status", "active").lower(), STATUSES, rule_id),
         source="declared",
+        expands_over=expands_over,
         tags=tuple(t.strip() for t in meta.get("tags", "").split(",") if t.strip()),
         body=_strip_sql_fences(body),
         summary_sql=summary_sql,

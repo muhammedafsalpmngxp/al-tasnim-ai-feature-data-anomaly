@@ -18,6 +18,7 @@ from __future__ import annotations
 from app.graph.nodes._common import numbered, rule_brief
 from app.graph.prompts import ANOMALY_SQL_AUTHOR_SYSTEM
 from app.graph.state import CompileState
+from app.rules.expand import substitute
 from app.llm import chat
 from app.observability import get_logger
 from app.utils import extract_sql_blocks, normalize_sql
@@ -111,6 +112,28 @@ def sql_author_node(state: CompileState) -> dict:
             "AUTOMATED CHECKS RAISED THESE CONCERNS ABOUT THE PREVIOUS ATTEMPT:\n"
             + numbered(state["concerns"])
         )
+    # A FAMILY rule is written once and applied to every matching feature in the schema, so the
+    # query must name the feature through tokens rather than literally. The author still writes
+    # against ONE real feature - the values below - so it can check its work against the schema
+    # and the hints exactly as it would for any other rule; the tokens are only what makes the
+    # result reusable for the other thirty-five.
+    placeholders = state.get("placeholders") or ()
+    params = state.get("params") or {}
+    if placeholders:
+        parts.append(
+            "THIS QUERY IS WRITTEN ONCE AND REUSED.\n"
+            f"It will be applied to every {state.get('expands_over', 'feature')} in this "
+            "database, so wherever one of the following belongs, write the TOKEN, spelled "
+            "exactly as shown, instead of the literal name:\n"
+            + "\n".join(
+                f"  {{{{{name}}}}}  = {params.get(name, '')}" for name in placeholders
+            )
+            + "\n\nThe values on the right are the real feature you are writing against - use "
+            "them to check the schema, the types and the hints, then write the token. Every "
+            "token above must appear in your queries; a literal name where a token belongs "
+            "makes the same query run against the wrong table for every other feature."
+        )
+
     parts.extend(_feedback_sections(state))
     parts.append("Write the two queries now, as the two tagged blocks described above.")
 
@@ -118,6 +141,16 @@ def sql_author_node(state: CompileState) -> dict:
     blocks = extract_sql_blocks(raw)
     summary_sql = blocks.get("summary", "")
     detail_sql = blocks.get("detail", "")
+
+    # Keep the token form as the reusable template, and hand the SUBSTITUTED form downstream.
+    # Everything after this node - the safety gate, the database, the contract check, the
+    # reviewer - must judge a query that actually runs, against real data. Reviewing the
+    # template instead would approve SQL nobody had executed.
+    summary_template = detail_template = ""
+    if placeholders and summary_sql and detail_sql:
+        summary_template, detail_template = summary_sql, detail_sql
+        summary_sql = substitute(summary_sql, params)
+        detail_sql = substitute(detail_sql, params)
 
     if not summary_sql or not detail_sql:
         # Not raised as an error here: the Validator owns retry accounting, and static_problems
@@ -137,6 +170,8 @@ def sql_author_node(state: CompileState) -> dict:
     return {
         "summary_sql": summary_sql,
         "detail_sql": detail_sql,
+        "summary_sql_template": summary_template,
+        "detail_sql_template": detail_template,
         "validation_error": "",
         "exec_error": "",
         "contract_error": "",
