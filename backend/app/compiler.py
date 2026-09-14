@@ -18,6 +18,7 @@ either finished or untouched.
 from __future__ import annotations
 
 import datetime as dt
+import re
 from dataclasses import dataclass, field
 
 from app.config import settings
@@ -139,6 +140,38 @@ def _seed_state(
     }
 
 
+_BRACKETED = re.compile(r"\[([^\]]+)\]")
+
+
+def _foreign_columns(sql: str, tables: tuple[str, ...]) -> list[str]:
+    """Bracketed identifiers that are not a column of any table this probe reads.
+
+    Deliberately checks only BRACKETED names. Every column the author is shown is rendered
+    bracketed in the schema block, so a real column reference is bracketed - while CTE names,
+    aliases and computed labels are not. Matching bare words instead would flag every alias in
+    the query and reject correct work, which is worse than the bug being prevented.
+
+    Returns nothing when the schema index is unavailable: an unverifiable probe must not be
+    failed on the strength of a check that could not run.
+    """
+    try:
+        index = load_index()
+    except Exception:  # noqa: BLE001
+        return []
+    known: set[str] = set()
+    for name in tables:
+        table = index.tables.get(name)
+        if table is None:
+            return []  # a table we cannot resolve makes the whole check unsound
+        known |= {c.name.lower() for c in table.columns}
+    if not known:
+        return []
+    return sorted({
+        m.group(1) for m in _BRACKETED.finditer(sql or "")
+        if m.group(1).lower() not in known
+    })
+
+
 def _instantiate(
     rule: AnomalyRule,
     template: tuple[str, str] | None,
@@ -175,6 +208,23 @@ def _instantiate(
     tables = tuple(dict.fromkeys(
         value for key, value in rule.params.items() if key.endswith("table") and value
     ))
+
+    # A column the author named LITERALLY, that exists only in the table it wrote against.
+    # The token guard in the validator proves the required tokens were used; it cannot prove
+    # nothing ELSE was. Observed twice: a template referencing `document_name` - a real column
+    # of the author's own table - was cloned onto two tables that have no such column, and both
+    # failed at the database with "invalid column name".
+    #
+    # Caught here the failure is named, attributed to the family, and visible in the report as
+    # a check that did not run. Left to the database it is a cryptic ODBC error per clone.
+    foreign = _foreign_columns(summary_sql + "\n" + detail_sql, tables)
+    if foreign:
+        return _failed_probe(
+            rule, fingerprint,
+            "the family's query names " + ", ".join(foreign) + ", which exist(s) in the table "
+            "the query was written against but not in this one. The query must reference only "
+            "the columns supplied as tokens.",
+        )
     return CompiledProbe(
         rule_id=rule.rule_id,
         summary_sql=summary_sql,
