@@ -106,9 +106,12 @@ def rules(source: str | None = Query(default=None)) -> dict:
     """Every rule, with its compiled state. The control surface, as the engine sees it."""
     from app.rules import catalog as catalog_store
     from app.rules.generic import generate as generate_generic
+    from app.rules.expand import expand_families
     from app.rules.loader import load_rules
 
     declared, errors = load_rules()
+    declared, notes = expand_families(declared)
+    errors += notes
     all_rules = list(declared)
     if settings.generic_probes:
         try:
@@ -153,9 +156,11 @@ def rule_detail(rule_id: str) -> dict:
     """
     from app.rules import catalog as catalog_store
     from app.rules.generic import generate as generate_generic
+    from app.rules.expand import expand_families
     from app.rules.loader import load_rules
 
     declared, _ = load_rules()
+    declared, _notes = expand_families(declared)
     found = next((r for r in declared if r.rule_id == rule_id), None)
     if found is None and settings.generic_probes:
         try:

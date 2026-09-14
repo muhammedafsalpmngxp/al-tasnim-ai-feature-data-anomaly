@@ -72,6 +72,11 @@ def _num(text: str) -> float | None:
         return None
 
 
+# Types SQL Server cannot compare, sort or group. A probe keyed on one of these is
+# syntactically valid and fails at execution every time, so they are never an entity key.
+_UNSORTABLE = re.compile(r"^\s*(text|ntext|image)\s*$", re.IGNORECASE)
+
+
 @dataclass
 class Column:
     name: str
@@ -162,24 +167,31 @@ class Table:
         Preference order: a single-column primary key, then the first *_id column, then the
         first NOT NULL column. Returns None when a table offers nothing usable - better to skip
         generating a probe than to emit findings nobody can trace back to a record.
+
+        A `text`, `ntext` or `image` column is never usable here, whatever its name. SQL Server
+        cannot compare or sort those types at all, and the probe contract requires DETAIL to be
+        ordered - so a probe keyed on one parses, validates, is approved by the reviewer, and
+        then fails at the database every single run. Observed on dbo.mapping_master, whose
+        Activity_ID is `text`: it was chosen for ending in "_id", and the probe never ran.
         """
-        pks = self.pk_columns
+        usable = [c for c in self.columns if not _UNSORTABLE.match(c.data_type or "")]
+        pks = [p for p in self.pk_columns if any(c.name == p for c in usable)]
         if len(pks) == 1:
             return pks[0]
         # A bare "id" is checked BEFORE the *_id suffix: "id".endswith("_id") is False, so a
         # table whose row identity is plainly `id` would otherwise fall through to the first
         # FOREIGN key that happens to end in _id - labelling every finding with somebody
         # else's identifier.
-        for c in self.columns:
+        for c in usable:
             if c.name.lower() == "id":
                 return c.name
-        for c in self.columns:
+        for c in usable:
             if c.name.lower().endswith("_id"):
                 return c.name
-        for c in self.columns:
+        for c in usable:
             if not c.nullable:
                 return c.name
-        return self.columns[0].name if self.columns else None
+        return usable[0].name if usable else None
 
 
 class SchemaIndex:

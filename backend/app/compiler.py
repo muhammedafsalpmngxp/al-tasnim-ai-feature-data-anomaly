@@ -27,13 +27,14 @@ from app.llm import get_usage_report, start_usage_tracking
 from app.observability import get_logger
 from app.rules import catalog as catalog_store
 from app.rules.expand import (
-    PLACEHOLDERS,
     expand_families,
     substitute,
+    tokens_for,
     unfilled_tokens,
 )
 from app.rules.generic import coverage_summary, generate as generate_generic
 from app.rules.loader import load_patterns, load_rules
+from app.rules.schema_index import load_index
 from app.rules.spec import AnomalyRule, CompiledProbe
 
 log = get_logger()
@@ -119,7 +120,7 @@ def _seed_state(
         # Set only for a rule produced by expanding a family. The author then writes its query
         # with these tokens in place of literal names, so the one query can serve every feature.
         "expands_over": rule.expands_over,
-        "placeholders": PLACEHOLDERS.get(rule.expands_over, ()) if rule.is_expanded else (),
+        "placeholders": tokens_for(rule.expands_over) if rule.is_expanded else (),
         "summary_sql_template": "",
         "detail_sql_template": "",
         "rule_hash": rule.rule_hash,
@@ -170,8 +171,9 @@ def _instantiate(
             "never built",
         )
 
-    summary_sql = substitute(template[0], rule.params)
-    detail_sql = substitute(template[1], rule.params)
+    values = {**rule.params, "rule_id": rule.rule_id}
+    summary_sql = substitute(template[0], values)
+    detail_sql = substitute(template[1], values)
     leftover = unfilled_tokens(summary_sql) + unfilled_tokens(detail_sql)
     if leftover:
         return _failed_probe(
@@ -319,12 +321,42 @@ def compile_rules(
     # re-authored and every member re-instantiated from it. Re-substituting a member that was
     # already current costs nothing and keeps a family from drifting into two versions of the
     # same query.
+    # The member chosen to be authored is the one with the MOST DATA, not the first in the list.
+    # That is not a preference, it is correctness: the author's query is executed and reviewed
+    # against its own feature, and a feature whose table is empty examines zero records, which
+    # the catalog writer correctly records as "proves nothing". No template is produced, and
+    # every other member of the family fails with it.
+    #
+    # Observed exactly that: dbo.task_daily_project is empty and happened to sort first among
+    # the date pairs, so one empty table cost all fifteen probes in that family.
+    index = load_index(schema)
+    by_id = {r.rule_id: r for r in runnable}
+
+    def _rows_behind(rule: AnomalyRule) -> int:
+        best = 0
+        for key, value in rule.params.items():
+            if key.endswith("table"):
+                table = index.tables.get(value)
+                best = max(best, (table.row_count or 0) if table else 0)
+        return best
+
     authors: dict[str, str] = {}        # family_id -> the member that will be authored
     templates: dict[str, tuple[str, str]] = {}
     for rule in runnable:
         if not rule.is_expanded:
             continue
-        authors.setdefault(rule.family_id, rule.rule_id)
+        current = authors.get(rule.family_id)
+        if current is None or _rows_behind(rule) > _rows_behind(by_id[current]):
+            authors[rule.family_id] = rule.rule_id
+
+    # Every author compiles BEFORE any member that will clone from it. Choosing the author by
+    # data volume means it is no longer the first of its family, and a member reached earlier
+    # would find no template and be recorded as unbuildable - which is exactly what happened to
+    # the first four date-pair probes. A stable sort keeps everything else in its existing
+    # order, so only the handful of authors move.
+    if authors:
+        chosen = set(authors.values())
+        runnable = sorted(runnable, key=lambda r: 0 if r.rule_id in chosen else 1)
     if not force:
         current = {
             family for family, first in authors.items()

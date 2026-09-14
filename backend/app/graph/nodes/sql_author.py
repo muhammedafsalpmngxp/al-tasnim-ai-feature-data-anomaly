@@ -132,6 +132,13 @@ def sql_author_node(state: CompileState) -> dict:
             "them to check the schema, the types and the hints, then write the token. Every "
             "token above must appear in your queries; a literal name where a token belongs "
             "makes the same query run against the wrong table for every other feature."
+            "\n\nWRITE IT TO SURVIVE A DIFFERENT COLUMN TYPE. The other features this query is "
+            "copied to have their own declared types, and yours is only one of them. In "
+            "particular a `text`, `ntext` or `image` column cannot be compared, trimmed, "
+            "grouped or sorted at all - so wrap every such use as CAST(col AS nvarchar(max)) "
+            "even when the column you can see would not need it. A query that is correct only "
+            "for your column's type fails at the database for every feature that differs, and "
+            "that failure is not visible while you are writing it."
         )
 
     parts.extend(_feedback_sections(state))
@@ -149,8 +156,9 @@ def sql_author_node(state: CompileState) -> dict:
     summary_template = detail_template = ""
     if placeholders and summary_sql and detail_sql:
         summary_template, detail_template = summary_sql, detail_sql
-        summary_sql = substitute(summary_sql, params)
-        detail_sql = substitute(detail_sql, params)
+        values = {**params, "rule_id": state.get("rule_id", "")}
+        summary_sql = substitute(summary_sql, values)
+        detail_sql = substitute(detail_sql, values)
 
     if not summary_sql or not detail_sql:
         # Not raised as an error here: the Validator owns retry accounting, and static_problems

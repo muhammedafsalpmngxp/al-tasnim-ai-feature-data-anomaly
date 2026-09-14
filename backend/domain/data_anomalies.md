@@ -698,8 +698,19 @@ but does not state that the order between them is mandatory. Do not activate unt
 - entity: task
 - method: rule
 - sql_mode: authored
-- status: active
+- status: disabled
 - tags: task, dates, planning
+
+> **Disabled 2026-09-14: this was reported twice.** The structural layer already checks every
+> start/end date pair in the schema, `target_start`/`target_end` among them, and both checks
+> found the SAME 46 records in the run of 2026-09-12 - once here and once as a structural
+> finding. Two rule ids over one set of records inflates the flagged-record total and the count
+> of checks with findings.
+>
+> This rule is the one disabled because the "Already covered deterministically" table above
+> says a rule must not be written for an inverted date pair, and because the structural check
+> also covers the `committed_*` and `startDate`/`endDate` pairs that this one never did.
+> Coverage is unchanged; only the duplicate reporting is gone.
 
 **What is wrong**
 A task's planned (target) start falls after its planned finish.
@@ -724,9 +735,19 @@ Tasks missing either target date — that is DQ-D10.
 - entity: task
 - method: rule
 - sql_mode: authored
-- status: active
+- status: disabled
 - placeholder_date: 1900-01-01
 - tags: task, dates, execution
+
+> **Disabled 2026-09-14: this was reported twice.** Same situation as DQ-D01. The structural
+> check over `actual_start`/`actual_end` found the SAME 209 records in the run of 2026-09-12,
+> so those records were counted under two rule ids.
+>
+> One thing IS lost by disabling this rather than the structural check, and it is recorded here
+> so the decision can be revisited: this rule excluded the `1900-01-01` placeholder (DQ-D06's
+> subject) from its scope, and the structural check does not. A row carrying the placeholder in
+> both actual dates is therefore now reported by DQ-D06 and by the structural pair check. That
+> is a smaller overlap than the one being fixed, but it is not zero.
 
 **What is wrong**
 A task's actual start falls after its actual finish.
@@ -1175,6 +1196,273 @@ Employees legitimately not assigned to any crew.
 
 ---
 
+## RULE DQ-D18 - Task started after it was due to finish
+
+- category: Task integrity
+- severity: high
+- entity: task
+- method: rule
+- sql_mode: authored
+- status: active
+- placeholder_date: 1900-01-01
+- tags: task, dates, plan-vs-actual
+
+**What is wrong**
+A task's actual start falls after its planned (target) finish — work began after the date it
+was supposed to have been completed.
+
+**Why it matters**
+The task was never going to meet its plan, and the schedule showed no warning of it. Unlike an
+inverted pair within one family, both dates here are individually valid, so nothing flags this
+unless the plan and the outcome are compared against each other.
+
+**How to detect**
+Restrict the scope to tasks where both the actual start and the target finish are present.
+Flag those where the actual start is later than the target finish. Severity is the size of the
+overrun in days.
+
+**Do NOT flag**
+Tasks missing either date. Rows where either date is the known placeholder value — that is
+DQ-D06, and counting it here as well would double-report the same record.
+
+---
+
+## RULE DQ-D19 - Task finished before it was due to start
+
+- category: Task integrity
+- severity: high
+- entity: task
+- method: rule
+- sql_mode: authored
+- status: active
+- placeholder_date: 1900-01-01
+- tags: task, dates, plan-vs-actual
+
+**What is wrong**
+A task's actual finish falls before its planned (target) start — work was recorded as complete
+before the plan said it should even begin.
+
+**Why it matters**
+Either the work was logged against the wrong task, or the plan was written after the fact. Both
+make the schedule a record of neither intention nor outcome.
+
+**How to detect**
+Restrict the scope to tasks where both the actual finish and the target start are present. Flag
+those where the actual finish is earlier than the target start. Severity is the size of the gap
+in days.
+
+**Do NOT flag**
+Tasks missing either date. Rows carrying the placeholder value — that is DQ-D06.
+
+---
+
+## RULE DQ-D20 - Progress recorded but the task has no actual start date
+
+- category: Task integrity
+- severity: medium
+- entity: task
+- method: rule
+- sql_mode: authored
+- status: active
+- tags: task, progress, execution
+
+**What is wrong**
+A task reports progress above zero while carrying no actual start date. Work has demonstrably
+begun, yet nothing records when.
+
+**Why it matters**
+Every duration, productivity and delay figure for the task is computed from its actual start.
+Without one the task is progressing but cannot be measured, and it is invisible to any report
+built on execution dates.
+
+**How to detect**
+Select the current record per logical task — this table keeps history, so the latest record per
+task must be chosen before judging it (see DQ-D11). Flag tasks whose progress is above zero
+while the actual start date is absent. Read the progress scale from NUMERIC HINTS before
+comparing: the column may be a 0-1 fraction rather than a 0-100 percentage.
+
+**Do NOT flag**
+Tasks at zero progress — not started is a legitimate state, not a defect. Tasks whose progress
+is not recorded at all; a missing measure is a different finding from a contradicted one.
+
+---
+
+## RULE DQ-D21 - Actual finish recorded but the task reports no progress
+
+- category: Task integrity
+- severity: medium
+- entity: task
+- method: rule
+- sql_mode: authored
+- status: active
+- placeholder_date: 1900-01-01
+- tags: task, progress, execution
+
+**What is wrong**
+A task carries an actual finish date while its progress is still zero — the opposite
+contradiction to DQ-D20.
+
+**Why it matters**
+A finished task reporting no progress is counted as outstanding in every rollup, so completed
+work is reported as remaining and the overall figure understates what has been achieved.
+
+**How to detect**
+Select the current record per logical task. Flag those with an actual finish date present while
+progress is zero. Read the progress scale from NUMERIC HINTS before comparing.
+
+**Do NOT flag**
+Rows whose actual finish is the known placeholder value — that is DQ-D06. Tasks with no
+progress figure recorded at all.
+
+---
+
+## RULE DQ-D22 - Task marked complete while progress is below full
+
+- category: Task integrity
+- severity: high
+- entity: task
+- method: rule
+- sql_mode: authored
+- status: active
+- tags: task, progress, completion
+
+**What is wrong**
+A task's completion flag is set while its progress has not reached its full value. This is the
+inverse of DQ-D03, which catches full progress on a task not marked complete; this catches the
+flag and the measure disagreeing the other way.
+
+**Why it matters**
+Completion counts and progress rollups then disagree about the same task. One says the work is
+done, the other says it is not, and a report built on either alone is confidently wrong.
+
+**How to detect**
+Select the current record per logical task. Flag tasks marked complete whose progress is below
+its full value. Read the progress scale from NUMERIC HINTS before comparing — full is 1 on a
+0-1 fraction and 100 on a 0-100 percentage, and using the wrong one silently flags or clears
+every task.
+
+**Do NOT flag**
+Tasks with no progress recorded at all — a missing measure cannot contradict the flag, and it
+is a different finding.
+
+---
+
+## RULE DQ-D23 - Negative remaining duration
+
+- category: Value integrity
+- severity: high
+- entity: task
+- method: rule
+- sql_mode: authored
+- status: active
+- tags: task, duration, impossible-value
+
+**What is wrong**
+A task's remaining duration is recorded as a negative number. Time left to complete work cannot
+be less than none.
+
+**Why it matters**
+A negative value does not merely misreport its own task: it SUBTRACTS from any total that sums
+remaining duration, so it understates the outstanding work of every group it belongs to. The
+error spreads silently into figures that look perfectly reasonable.
+
+**How to detect**
+Flag task records whose remaining duration is below zero. No threshold — negative is impossible,
+not merely unusual.
+
+**Do NOT flag**
+Rows where the remaining duration is not recorded. Zero is a legitimate value and is not
+negative.
+
+---
+
+## RULE DQ-D24 - Negative executed hours
+
+- category: Value integrity
+- severity: high
+- entity: task
+- method: rule
+- sql_mode: authored
+- status: active
+- tags: task, hours, impossible-value
+
+**What is wrong**
+A task record holds a negative figure for executed hours. Work performed cannot be less than
+none.
+
+**Why it matters**
+Manpower totals and every productivity ratio computed from hours are reduced by the negative
+value, so the reported effort is lower than the effort actually spent.
+
+**How to detect**
+Flag task records whose executed hours figure is below zero. No threshold.
+
+**Do NOT flag**
+Rows where no hours figure is recorded. Zero hours is a legitimate value — a quantity executed
+against zero hours is DQ-D07's subject, not this one.
+
+---
+
+## RULE DQ-D25 - Negative executed quantity
+
+- category: Value integrity
+- severity: high
+- entity: task
+- method: rule
+- sql_mode: authored
+- status: active
+- tags: task, quantity, impossible-value
+
+**What is wrong**
+A task record holds a negative executed quantity. Work delivered cannot be less than none.
+
+**Why it matters**
+Executed quantity drives progress and productivity. A negative figure reduces the totals it
+feeds, so delivered work is understated wherever it is summed.
+
+**How to detect**
+Flag task records whose executed quantity is below zero. No threshold.
+
+**Do NOT flag**
+Rows where no quantity is recorded. Zero quantity is legitimate — hours against zero quantity
+is DQ-D08's subject.
+
+---
+
+## RULE DQ-D26 - Negative remaining quantity
+
+- category: Value integrity
+- severity: high
+- entity: task
+- method: rule
+- sql_mode: authored
+- status: draft
+- tags: task, quantity, impossible-value
+
+**What is wrong**
+The outstanding quantity on a task is recorded as a negative number.
+
+**Why it matters**
+Outstanding work cannot be less than none, and a negative value subtracts from every total that
+sums remaining quantity — understating the work still to be done.
+
+**How to detect**
+Flag task records whose remaining quantity is below zero.
+
+**Do NOT flag**
+Rows where the figure is not recorded. Zero is legitimate.
+
+> **Draft: the field has not been formally identified.** `well.task_daily` carries several
+> numeric columns that could hold outstanding quantity — `required`, `planned`, `duration`,
+> `remaining_duration` — and business_rules.md §2 does not yet say which one it is. DQ-D09
+> reasons about "outstanding quantity" already, so the concept exists in the business language
+> without a column declared against it.
+>
+> Guessing would produce a probe that runs, returns a confident number, and measures the wrong
+> column — the exact failure this file's rule against inventing an undefined definition exists
+> to prevent. Name the column in business_rules.md §2, then set this rule to active.
+
+
 # GROUP E — Construction and delivery deadlines
 
 ## RULE DQ-E01 - Construction deadline passed and the rig has still not arrived
@@ -1500,7 +1788,7 @@ record twice.
 - entity: row
 - method: rule
 - expands_over: foreign_key
-- status: draft
+- status: active
 
 **What is wrong**
 A child row holds a foreign-key value that has no matching parent. The relationship is
@@ -1529,6 +1817,33 @@ exist", and conflating them hides both.
 - expands_over: duplicate_key
 - status: draft
 
+> **Not being migrated - this family is circular, and the evidence is below.**
+>
+> The feature it expands over is the `MANY ROWS PER x` marker in schema.txt. That marker is
+> DERIVED by detecting duplication. So the check finds duplication in exactly the keys already
+> known to be duplicated, and reports it as a defect. Measured on the run of 2026-09-12:
+>
+> | Probe | Flagged | Share |
+> |---|---|---|
+> | `dbo.ph_report_may_cmr per employee_id` | 667 of 668 | 99.85% |
+> | `dbo.job_progress_plan_snapshot per well_id` | 332 of 355 | 93.52% |
+> | `core.engineering_task_plan per id` | 3,108 of 3,359 | 92.53% |
+> | `dbo.vw_Chart7_Drilldown_Excel per PDO Well ID` | 291 of 414 | 70.29% |
+> | `dbo.schedule_json_data per well_id` | 302 of 733 | 41.20% |
+>
+> A check reporting 99.85% of a table describes that table's shape, not a defect.
+> `core.engineering_task_plan` has NO declared primary key - `id` is simply a column named
+> "id" - so nothing ever said it should be unique.
+>
+> Roughly 4,700 of the ~4,708 records this family flags are noise, and it is the largest single
+> source of false findings in the report. Migrating it would automate the noise.
+>
+> **To replace it properly** the business must name the tables that are genuinely one-row-per-
+> entity, in business_rules.md. A key is unique because the business says so, never because a
+> marker computed from the data says it is not. Two probes here may be real - 4 records on
+> `activity_master_mapping` and 3 on `well.task_daily` - and DQ-D11 already covers conflicting
+> current records for one logical task.
+
 **What is wrong**
 A key that identifies an entity appears on more than one row.
 
@@ -1553,7 +1868,7 @@ rather than widening the condition: the grain is a property of the table, not of
 - entity: row
 - method: rule
 - expands_over: date_pair
-- status: draft
+- status: active
 
 **What is wrong**
 A paired end date falls before its start date.
@@ -1579,6 +1894,23 @@ record, and reporting it here would be wrong.
 - method: rule
 - expands_over: future_date
 - status: draft
+
+> **Blocked on a declaration, and most of it already exists.**
+>
+> This family needs to know which date columns record an OUTCOME rather than an intention. The
+> schema cannot say - both are `date` - and the old structural layer guessed from the column
+> name, which is how `well.task_daily.endDate` came to report 9,198 records as defects while
+> sitting beside an `actual_end` column measured at 0.00% future values.
+>
+> business_rules.md §2 ALREADY answers this for the well milestones: its table carries a
+> **Kind** column marking `rig_on_date`, `rig_off_date`, `pegged_date`, `flaf_issue_date` and
+> `eng_completion_date` as *actual*, and `ex_rig_on_date` / `ex_rig_off_date` as *expected*.
+> That declaration is the authority, and it is what this rule should read.
+>
+> What is missing is the same statement for the task execution dates. Extend §2 to mark
+> `actual_start` and `actual_end` as actual and `target_*` / `committed_*` / `startDate` /
+> `endDate` as planned, and this family can be built from the declaration with nothing guessed.
+> Anything left undeclared stays unchecked and is reported as a gap, never assumed.
 
 **What is wrong**
 A column recording something that has *already happened* holds a date later than today.
@@ -1606,7 +1938,7 @@ left unchecked and reported as a gap in coverage, never assumed to be an actual.
 - entity: row
 - method: rule
 - expands_over: numeric_range
-- status: draft
+- status: active
 
 **What is wrong**
 A value falls outside the range its column is supposed to occupy — most often a percentage
@@ -1632,7 +1964,7 @@ Columns with no measured scale. An unmeasured column has no bounds to be outside
 - entity: row
 - method: rule
 - expands_over: text_numeric
-- status: draft
+- status: active
 
 **What is wrong**
 A column storing a quantity as text holds a value that cannot be read as a number.

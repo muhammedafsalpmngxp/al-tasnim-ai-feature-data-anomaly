@@ -23,6 +23,7 @@ import re
 from app.graph.state import CompileState
 from app.observability import get_logger
 from app.rules.contract import static_problems
+from app.rules.expand import missing_tokens
 
 log = get_logger()
 
@@ -181,6 +182,40 @@ def validator_node(state: CompileState) -> dict:
             )
 
     problems += static_problems(summary_sql, detail_sql, rule_id)
+
+    # A FAMILY query is copied to every matching feature in the schema, so a literal where a
+    # token belonged is wrong for all of them - and it is invisible to every other check here,
+    # because against the ONE feature the author wrote for it is perfectly correct SQL.
+    #
+    # Caught in practice: a text-cast template that hardcoded its own rule id, its entity column
+    # and its target column. It passed validation, ran, and was approved by the reviewer; the
+    # fourteen copies made from it then failed at the database on a column that exists only in
+    # the author's table - and any that had survived would have reported under the author's id.
+    required = tuple(state.get("placeholders") or ())
+    summary_template = state.get("summary_sql_template", "")
+    detail_template = state.get("detail_sql_template", "")
+    if required and (summary_template.strip() or detail_template.strip()):
+        # Checked across the PAIR, not per half. Which half legitimately mentions a given
+        # feature varies - bounds belong in the SUMMARY's condition, the entity column in the
+        # DETAIL's output - so demanding every token in both would reject correct work and push
+        # the author into padding a query with columns it has no use for.
+        feature_tokens = tuple(t for t in required if t != "rule_id")
+        absent = missing_tokens(summary_template + "\n" + detail_template, feature_tokens)
+        if absent:
+            problems.append(
+                "The queries do not use " + ", ".join("{{%s}}" % t for t in absent)
+                + ". This probe is applied to every matching feature in the schema, so each of "
+                "those must appear as the TOKEN rather than the literal value you were shown - "
+                "a literal is correct only for the one feature you wrote against, and wrong for "
+                "every other."
+            )
+        # rule_id is required in the SUMMARY alone: that is the half the contract makes select
+        # it. Hardcoded there, every copy of this query reports under the author's id.
+        if summary_template.strip() and missing_tokens(summary_template, ("rule_id",)):
+            problems.append(
+                "SUMMARY writes its rule id literally instead of using {{rule_id}}. Every "
+                "feature this query is applied to would then report under one id."
+            )
 
     if problems:
         joined = "\n".join(f"- {p}" for p in problems)

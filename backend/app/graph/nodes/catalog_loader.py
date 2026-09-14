@@ -29,6 +29,7 @@ from app.graph.run_state import RunState
 from app.observability import get_logger
 from app.rules import catalog as catalog_store
 from app.rules.generic import generate as generate_generic
+from app.rules.expand import expand_families
 from app.rules.loader import load_rules
 
 log = get_logger()
@@ -37,7 +38,11 @@ log = get_logger()
 def _all_rules_by_id() -> dict:
     """Every rule definition, so the report can show a title and prose beside each finding."""
     rules, errors = load_rules()
-    for problem in errors:
+    # Families are expanded here for the same reason the compiler expands them: a family rule
+    # is a description, and what actually ran was one concrete rule per schema feature. Without
+    # this the report has no title or prose for any of them and falls back to the bare id.
+    rules, notes = expand_families(rules)
+    for problem in errors + notes:
         log.warning("load: %s", problem)
     by_id = {r.rule_id: r for r in rules}
     if settings.generic_probes:

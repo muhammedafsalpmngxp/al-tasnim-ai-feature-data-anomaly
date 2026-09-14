@@ -71,6 +71,29 @@ _DATE_PREFIX_PAIRS: tuple[tuple[str, str], ...] = (("start", "end"), ("start", "
 # {{token}} as the SQL Author is told to write it.
 _TOKEN = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 
+# Supplied to EVERY family, whatever it expands over. The probe contract requires each query to
+# select its own id as a literal, so a template that writes one literally would make all
+# thirty-six members report under the author's id - observed exactly that, with every text-cast
+# clone announcing itself as DQ-G06-001.
+UNIVERSAL_TOKENS: tuple[str, ...] = ("rule_id",)
+
+
+def tokens_for(kind: str) -> tuple[str, ...]:
+    """Every token an authored query for this family must use."""
+    return PLACEHOLDERS.get(kind, ()) + UNIVERSAL_TOKENS
+
+
+def missing_tokens(sql: str, required: tuple[str, ...]) -> list[str]:
+    """Required tokens the author did not use.
+
+    The failure this catches is not a leftover `{{token}}` - that is obvious and fails at the
+    database. It is the opposite: a LITERAL where a token belonged. The author writes against
+    one real feature, so `FROM dbo.mapping_master` looks perfectly correct to every check that
+    reads only that query, and is wrong for the thirty-five it will be copied to.
+    """
+    present = {m.group(1).lower() for m in _TOKEN.finditer(sql or "")}
+    return [t for t in required if t.lower() not in present]
+
 
 @dataclass(frozen=True)
 class Feature:
