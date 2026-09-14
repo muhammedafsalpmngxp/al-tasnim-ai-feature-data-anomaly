@@ -57,7 +57,7 @@ SECRET_COLUMN_MARKERS = (
 # Bumped whenever _render() changes the TEXT it emits for an unchanged database. The cache is
 # keyed on a fingerprint of the live STRUCTURE, so without this a rendering change would keep
 # serving the old cached text forever - the database has not changed, so nothing else notices.
-_RENDER_VERSION = "4-anomaly-compact-plain-numerics"
+_RENDER_VERSION = "5-measured-text-numeric-no-wordlists"
 
 # T-SQL reserved keywords. A column whose NAME is one of these MUST be written [bracketed] or
 # the query fails to parse - and the error is misleading: SQL Server reports "Incorrect syntax
@@ -196,7 +196,7 @@ def _fetch_foreign_keys(cur, visible: set[str]) -> dict[str, list[str]]:
     """Declared FKs, restricted so BOTH endpoints are visible (no dangling references).
 
     These lines are load-bearing twice over in this app: they render into schema.txt for the
-    agents, and app/rules/generic.py turns each one into an orphan-row probe with no LLM at all.
+    agents, and app/rules/expand.py turns each one into its own orphan-row probe.
     """
     cur.execute(
         """
@@ -451,7 +451,7 @@ def _render(
         if table in dup_keys:
             # quote_column() here too, for the same reason as the declarations above: this
             # database has a key literally named "PDO Well ID". Rendered bare it reads as
-            # three words, and app/rules/generic.py - which builds a real probe from this
+            # three words, and app/rules/expand.py - which builds a real probe from this
             # marker - would emit [PDO] and fail on a column that does not exist.
             key = quote_column(dup_keys[table])
             lines.append(
@@ -857,19 +857,29 @@ _RATIO_MARKERS = frozenset(
     ("pct", "percent", "percentage", "progress", "ratio", "share", "weightage", "weight",
      "complete", "completion", "util", "utilisation", "utilization")
 )
-# Tokens meaning "this text column ought to parse as a number". A non-numeric value in one is a
-# data-quality finding in its own right.
-_NUMERIC_TEXT_MARKERS = frozenset(
-    ("norm", "norms", "duration", "qty", "quantity", "amount", "length", "progress", "percent",
-     "count", "days", "hours", "rate", "weight", "value", "number", "no", "num", "size", "total")
-)
-# ...except where another token says the "number" is an identifier, not a quantity. A phone
-# number legitimately holds spaces, '+' and '-', so casting it is meaningless and a probe over
-# it would report ordinary data as broken.
-_NOT_A_QUANTITY = frozenset(
-    ("phone", "mobile", "contact", "fax", "tel", "telephone", "account", "invoice", "po",
-     "serial", "ref", "reference", "doc", "document", "form", "batch", "version")
-)
+# WHETHER A TEXT COLUMN IS REALLY A QUANTITY IS MEASURED, NOT GUESSED FROM ITS NAME.
+#
+# This replaced two English word-lists - one naming tokens that supposedly meant "quantity"
+# (norm, qty, days, hours, value, total...), another naming tokens that supposedly meant
+# "identifier" (phone, invoice, serial, ref...). Both were wrong in both directions on any
+# database that did not happen to use those words, and they failed SILENTLY: a quantity column
+# named something the list did not recognise was never profiled, never probed, and never
+# reported as unchecked. Nothing said so.
+#
+# Every text column is profiled instead, and the SHARE OF VALUES THAT ACTUALLY PARSE decides:
+#
+#   parse rate 0%                    the column holds codes or labels. Not a quantity.
+#   parse rate 100%                  numbers stored as text. Nothing fails, so nothing to report.
+#   parse rate >= _NUMERIC_TEXT_MIN  the column is used as a number and a few values are not -
+#                                    those failures are the finding.
+#   parse rate below that            predominantly free text. A "remarks" column where three
+#                                    values happen to read "42" must not report the other 997
+#                                    as broken.
+#
+# A phone number column is excluded because '+', '-' and spaces genuinely do not parse - the
+# measurement says so directly, with no need to know the word "phone" in any language.
+# Configurable: see ANOMALY_TEXT_NUMERIC_MIN_PARSE in .env.example.
+_NUMERIC_TEXT_MIN_PARSE_RATE = settings.text_numeric_min_parse_rate
 
 _CAMEL_SPLIT = re.compile(r"(?<=[a-z0-9])(?=[A-Z])")
 
@@ -1023,12 +1033,10 @@ def build_numeric_hints(use_cache: bool = True) -> str:
                 continue
 
             numeric = [c for c, dt, *_ in cols if dt.lower() in _NUMERIC_TYPES]
-            textish = [
-                c for c, dt, *_ in cols
-                if dt.lower() in _TEXT_TYPES
-                and (_name_tokens(c) & _NUMERIC_TEXT_MARKERS)
-                and not (_name_tokens(c) & _NOT_A_QUANTITY)
-            ]
+            # Every text column, not a name-matched subset: what a column actually holds is
+            # decided below from the measured parse rate. Two aggregates each, in the pass this
+            # table is already making.
+            textish = [c for c, dt, *_ in cols if dt.lower() in _TEXT_TYPES]
             if not numeric and not textish:
                 continue
 
@@ -1089,14 +1097,17 @@ def build_numeric_hints(use_cache: bool = True) -> str:
                 non_null, bad = row[i : i + 2]
                 i += 2
                 non_null, bad = non_null or 0, bad or 0
-                if bad and bad == non_null:
-                    # EVERY value fails. That is not a data-quality defect - it is a column
-                    # that holds codes, and the name-based guess that it holds a quantity was
-                    # simply wrong. Saying so keeps a cast probe from being generated over it,
-                    # which would otherwise report 100% of the table as anomalous.
+                parse_rate = (non_null - bad) / non_null if non_null else 0.0
+                if bad and parse_rate < _NUMERIC_TEXT_MIN_PARSE_RATE:
+                    # Too few values parse for the failures to be the defect. Either NOTHING
+                    # parses - codes or labels - or the column is predominantly free text with
+                    # a handful of numeric-looking entries. Reporting the majority as broken
+                    # would be the single noisiest thing this profile could produce, so the
+                    # column is named as not-a-quantity and no cast probe is built over it.
                     out.append(
-                        f"  - {c} (text): NONE of {non_null} values parse as a number - this "
-                        f"column holds codes/labels, NOT a quantity. Do not range-check it."
+                        f"  - {c} (text): only {non_null - bad} of {non_null} values parse as a "
+                        f"number ({parse_rate:.0%}) - this column holds codes, labels or free "
+                        f"text, NOT a quantity. Do not range-check or cast-check it."
                     )
                 elif bad:
                     out.append(

@@ -33,10 +33,44 @@ def _get_bool(name: str, default: bool) -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def _get_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 def _csv(name: str, default: str = "") -> tuple[str, ...]:
     """Comma-separated setting, lowercased and blank-stripped."""
     return tuple(s.strip().lower() for s in _get(name, default).split(",") if s.strip())
 
+
+
+_DEFAULT_SEVERITY_WEIGHTS: dict[str, float] = {
+    "critical": 40.0, "high": 20.0, "medium": 8.0, "low": 5.0,
+}
+
+
+def _severity_weights(name: str) -> tuple[tuple[str, float], ...]:
+    """Parse "critical:40,high:20,medium:8,low:5" over the defaults.
+
+    Returned as a tuple of pairs rather than a dict: Settings is a frozen dataclass and a dict
+    default would be shared mutable state across every instance.
+    """
+    weights = dict(_DEFAULT_SEVERITY_WEIGHTS)
+    raw = _get(name, "")
+    for part in raw.split(","):
+        key, _, value = part.partition(":")
+        key = key.strip().lower()
+        if not key:
+            continue
+        try:
+            weights[key] = float(value)
+        except ValueError:
+            # Keep the default for this severity. Silently zeroing it would make every finding
+            # at that severity cost nothing, and the score would look like an improvement.
+            continue
+    return tuple(weights.items())
 
 @dataclass(frozen=True)
 class Settings:
@@ -129,6 +163,21 @@ class Settings:
     schema_prune_above_tables: int = field(
         default_factory=lambda: _get_int("ANOMALY_SCHEMA_PRUNE_ABOVE_TABLES", 60)
     )
+    # How much a finding of each severity moves the headline score. A BUSINESS judgement, so it
+    # is configurable rather than fixed in Python: "critical:40,high:20,medium:8,low:5".
+    # Malformed entries are ignored and the default for that severity stands, because a typo
+    # here must never silently make a whole severity weightless - which would hide findings.
+    # A text column counts as "really a quantity" once at least this share of its values parse
+    # as numbers; below it the column is codes, labels or free text and no cast probe is built.
+    # MEASURED, never guessed from the column name. Measured distribution on AlTasnimBI: every
+    # column is either <= 32% (codes) or >= 95% (numeric), with one at 71% - so the default sits
+    # in that gap. Lower it to include a borderline column, raise it to be stricter.
+    text_numeric_min_parse_rate: float = field(
+        default_factory=lambda: _get_float("ANOMALY_TEXT_NUMERIC_MIN_PARSE", 0.80)
+    )
+    severity_weights: tuple[tuple[str, float], ...] = field(
+        default_factory=lambda: _severity_weights("ANOMALY_SEVERITY_WEIGHTS")
+    )
     auto_compile: bool = field(default_factory=lambda: _get_bool("ANOMALY_AUTO_COMPILE", True))
     # How many outdated probes a detection run may rebuild by itself before it stops and asks.
     # Auto-compile exists for DRIFT - a handful of probes left behind by a column rename. A
@@ -136,9 +185,6 @@ class Settings:
     # calls inside what the operator asked to be a run is not a decision this should make alone.
     auto_compile_max_rules: int = field(
         default_factory=lambda: _get_int("ANOMALY_AUTO_COMPILE_MAX_RULES", 25)
-    )
-    generic_probes: bool = field(
-        default_factory=lambda: _get_bool("ANOMALY_GENERIC_PROBES", True)
     )
 
     # -- Observability -----------------------------------------------------------

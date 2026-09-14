@@ -53,9 +53,17 @@ _NUM_COL_RE = re.compile(
 # loss of the index is exactly the kind of regression this engine exists to catch in other
 # people's data, so eval/test_rules.py now asserts the two formats round-trip.
 _NUM_COMPACT_RE = re.compile(r"^\s+-\s+(\S+):\s+(-?[\d.eE+]+)\.\.(-?[\d.eE+]+)\s*$")
-# "  - col (text): 183 of 642 values do NOT parse ..." / "NONE of 17264 values parse ..."
+# "  - col (text): 183 of 642 values do NOT parse ..."
 _TXT_BAD_RE = re.compile(r"^\s+-\s+(\S+)\s+\(text\):\s+(\d+)\s+of\s+(\d+)\s+values do NOT parse")
-_TXT_NONE_RE = re.compile(r"^\s+-\s+(\S+)\s+\(text\):\s+NONE of\s+(\d+)\s+values parse")
+# "  - col (text): only 3 of 997 values parse as a number (0%) - ... NOT a quantity"
+#
+# ⚠ THIS PATTERN AND THE WRITER IN db/introspect.py MUST CHANGE TOGETHER. The reader silently
+# ignores a line it cannot match, so a reworded verdict does not fail - it makes every affected
+# column vanish from the index, and the probes over them disappear with it. eval/test_rules.py
+# round-trips both forms for exactly this reason.
+_TXT_NONE_RE = re.compile(
+    r"^\s+-\s+(\S+)\s+\(text\):\s+only\s+\d+\s+of\s+(\d+)\s+values parse"
+)
 
 _DATE_TYPES = frozenset(("date", "datetime", "datetime2", "smalldatetime", "datetimeoffset"))
 

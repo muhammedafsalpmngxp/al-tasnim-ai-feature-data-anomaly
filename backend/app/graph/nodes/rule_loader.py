@@ -40,15 +40,10 @@ def rule_loader_node(state: CompileState) -> dict:
         "status": "active",
     }
 
-    # A GENERIC probe is rendered directly from the schema, so its tables are already known
-    # exactly. Grounding could only guess at what is already certain, so it is skipped and the
-    # context is built from the rendered SQL's own parameters instead. This is also what keeps
-    # the generic families genuinely free: no LLM call is made for them anywhere.
-    # An EXPANDED rule is in the same position: the feature it came from names its tables
-    # exactly, so grounding is skipped for it too and the context is built from the same
-    # source. Unlike a generic probe it still has its SQL written and reviewed - only the
-    # "which tables?" question is already answered.
-    if source in ("generic", "expanded"):
+    # An EXPANDED rule comes from a schema feature that names its tables exactly, so grounding
+    # is skipped and the context is built from that feature's own values instead. Only the
+    # "which tables?" question is already answered - the SQL is still written and reviewed.
+    if source == "expanded":
         tables = [
             value for key, value in (state.get("params") or {}).items()
             if key.endswith("table")
@@ -62,8 +57,6 @@ def rule_loader_node(state: CompileState) -> dict:
             grounding_note=(
                 "expanded from a declared schema feature; its tables are known exactly, so no "
                 "grounding was required"
-                if source == "expanded"
-                else "rendered directly from the schema; no grounding required"
             ),
         )
     return out

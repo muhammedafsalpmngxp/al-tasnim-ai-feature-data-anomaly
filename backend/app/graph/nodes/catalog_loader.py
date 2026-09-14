@@ -28,7 +28,6 @@ from app.db import introspect
 from app.graph.run_state import RunState
 from app.observability import get_logger
 from app.rules import catalog as catalog_store
-from app.rules.generic import generate as generate_generic
 from app.rules.expand import expand_families
 from app.rules.loader import load_rules
 
@@ -44,14 +43,7 @@ def _all_rules_by_id() -> dict:
     rules, notes = expand_families(rules)
     for problem in errors + notes:
         log.warning("load: %s", problem)
-    by_id = {r.rule_id: r for r in rules}
-    if settings.generic_probes:
-        try:
-            for rule in generate_generic():
-                by_id.setdefault(rule.rule_id, rule)
-        except Exception as exc:  # noqa: BLE001 - the declared rules must survive this
-            log.warning("probe: generic definitions unavailable (%s)", exc)
-    return by_id
+    return {r.rule_id: r for r in rules}
 
 
 def _recompile(rule_ids: list[str], note: str) -> tuple[dict[str, str], str]:

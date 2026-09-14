@@ -9,10 +9,9 @@ that is the whole job of this module.
 
 WHAT IT DELIBERATELY DOES NOT DO
 --------------------------------
-It does not hold SQL. generic.py, which this replaces, carried six SQL templates rendered from
-domain/generic_probes.md; under the new design the query is written by the SQL Author from the
-rule's prose, once per family, and substituted across the features listed here. Keeping SQL out
-of Python is also an invariant the test suite enforces.
+It does not hold SQL. The six SQL templates this replaced are gone; the query is now written
+by the SQL Author from the rule's prose, once per family, and substituted across the features
+listed here. Keeping SQL out of Python is an invariant the test suite enforces.
 
 It does not guess from column NAMES. That distinction matters more than it sounds: every
 feature below is something the database STATES (a declared foreign key, a primary key, a

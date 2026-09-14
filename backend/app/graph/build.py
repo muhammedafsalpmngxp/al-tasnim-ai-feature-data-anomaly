@@ -20,9 +20,10 @@ Sharing one counter lets a couple of syntax errors early in a rule leave the rev
 rewrites: it rejects, and is overruled in the same breath. That is the worst of both.
 
 THREE WAYS IN, AND THEY ARE THE COST MODEL.
-  generic   rendered from the schema itself. No grounding, no author, NO REVIEWER - straight
-            to the gates that prove it runs. Zero LLM calls, which is what makes two hundred
-            structural probes free.
+  expanded  one member of a structural family. Its tables come from the schema feature it was
+            expanded from, so grounding is skipped - but it is written and reviewed like any
+            other rule, and the query is then reused across the whole family for no further
+            calls. Two to four calls PER FAMILY, not per probe.
   pinned    hand-written SQL. The author is skipped; the reviewer still runs, because a person
             can be wrong about a live schema too. One LLM call.
   seed /    grounded, written and reviewed. Three to four calls.
@@ -65,20 +66,15 @@ def _repeated_attempt(state: CompileState) -> bool:
 
 
 def _route_after_loader(state: CompileState) -> str:
-    # A generic probe's SQL is already final and its tables are already known exactly.
-    # Grounding could only guess at what is certain, and an author could only damage it.
+    # An EXPANDED rule skips grounding: the schema feature it was expanded from already names
+    # its tables exactly, so grounding could only guess at what is certain. Its SQL still has
+    # to be WRITTEN, so it goes straight to the author - and it is reviewed afterwards like any
+    # other authored query, because a model wrote it.
     #
-    # PINNED rules do NOT skip grounding, even though their SQL is final either. The reviewer
-    # has to be shown the tables the query actually reads, and without grounding it would be
-    # reviewing against the whole database - which on a wide schema is the same as reviewing
-    # against nothing.
-    #
-    # An EXPANDED rule skips grounding too, but for the opposite reason to a generic one: its
-    # SQL has still to be written, yet the feature it was expanded from already names its
-    # tables exactly. It goes straight to the author, and unlike a generic probe it is still
-    # reviewed afterwards - a model wrote that query, so something independent must read it.
-    if state.get("source") == "generic":
-        return "validator"
+    # PINNED rules do NOT skip grounding, even though their SQL is final. The reviewer has to be
+    # shown the tables the query actually reads, and without grounding it would be reviewing
+    # against the whole database - which on a wide schema is the same as reviewing against
+    # nothing.
     if state.get("source") == "expanded":
         return "sql_author"
     return "grounding"
@@ -114,10 +110,6 @@ def _route_after_sanity(state: CompileState) -> str:
         if _rewritable(state) and _mechanical_budget_left(state):
             return "sql_author"
         return "catalog_writer"
-    # A generic probe has now proved it runs and satisfies the contract. There is no business
-    # judgement left in it for a reviewer to add.
-    if state.get("source") == "generic":
-        return "catalog_writer"
     return "verifier"
 
 
@@ -138,11 +130,11 @@ def _route_after_verifier(state: CompileState) -> str:
 def _rewritable(state: CompileState) -> bool:
     """Whether an author exists to rewrite this probe at all.
 
-    A generic or pinned probe has no author in its path, so routing one to sql_author on a
-    failure would hand a hand-written or schema-rendered query to a model that was never asked
-    to write it - and silently replace it. Such a probe fails honestly instead.
+    A pinned probe has no author in its path, so routing one to sql_author on a failure would
+    hand a hand-written query to a model that was never asked to write it - and silently
+    replace it. Such a probe fails honestly instead.
     """
-    return state.get("source") != "generic" and state.get("sql_mode") != "pinned"
+    return state.get("sql_mode") != "pinned"
 
 
 def build_compile_graph():

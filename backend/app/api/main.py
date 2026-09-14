@@ -105,7 +105,6 @@ def status() -> dict:
 def rules(source: str | None = Query(default=None)) -> dict:
     """Every rule, with its compiled state. The control surface, as the engine sees it."""
     from app.rules import catalog as catalog_store
-    from app.rules.generic import generate as generate_generic
     from app.rules.expand import expand_families
     from app.rules.loader import load_rules
 
@@ -113,12 +112,6 @@ def rules(source: str | None = Query(default=None)) -> dict:
     declared, notes = expand_families(declared)
     errors += notes
     all_rules = list(declared)
-    if settings.generic_probes:
-        try:
-            known = {r.rule_id for r in all_rules}
-            all_rules += [r for r in generate_generic() if r.rule_id not in known]
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"generic probes unavailable: {exc}")
 
     catalog = catalog_store.load()
     items = []
@@ -155,18 +148,12 @@ def rule_detail(rule_id: str) -> dict:
     than something the reader has to take on trust.
     """
     from app.rules import catalog as catalog_store
-    from app.rules.generic import generate as generate_generic
     from app.rules.expand import expand_families
     from app.rules.loader import load_rules
 
     declared, _ = load_rules()
     declared, _notes = expand_families(declared)
     found = next((r for r in declared if r.rule_id == rule_id), None)
-    if found is None and settings.generic_probes:
-        try:
-            found = next((r for r in generate_generic() if r.rule_id == rule_id), None)
-        except Exception:  # noqa: BLE001
-            found = None
     probe = catalog_store.load().get(rule_id)
     if found is None and probe is None:
         raise HTTPException(status_code=404, detail=f"No rule {rule_id!r}")

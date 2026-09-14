@@ -36,9 +36,10 @@ SQL_MODES: tuple[str, ...] = ("pinned", "seed", "authored")
 
 STATUSES: tuple[str, ...] = ("active", "draft", "disabled")
 
-# Where a rule came from. Declared rules are hand-written; generic rules are rendered from
-# schema.txt by app/rules/generic.py with no LLM involvement at all.
-SOURCES: tuple[str, ...] = ("declared", "generic")
+# Where a rule came from. "declared" is written as itself in data_anomalies.md; "expanded" is
+# one concrete member of a structural family, produced by applying one such rule to every
+# matching feature the schema declares (app/rules/expand.py).
+SOURCES: tuple[str, ...] = ("declared", "expanded")
 
 # The value that means "derive the threshold from the data, do not substitute a literal".
 AUTO = "auto"
@@ -165,8 +166,8 @@ class CompiledProbe:
     detail_sql: str
     # active | failed | not_applicable | disabled
     status: str = "active"
-    # WHERE THIS SQL CAME FROM - "declared" (an agent wrote it) or "generic" (a template in
-    # domain/generic_probes.md rendered against the schema, with no model involved).
+    # WHERE THIS SQL CAME FROM - "declared" (a rule written as itself) or "expanded" (one
+    # member of a structural family). An agent wrote the query either way.
     #
     # Recorded EXPLICITLY rather than inferred from the "GEN-" id prefix. Provenance is the
     # first thing anyone asks of a data-quality finding - "did a model write this check?" - and
@@ -203,8 +204,8 @@ class CompiledProbe:
 
     @property
     def authored_by_agent(self) -> bool:
-        """True when an LLM wrote this SQL. False when a template did."""
-        return self.source != "generic"
+        """True when an LLM wrote this SQL. False only for hand-written pinned SQL."""
+        return self.source != "pinned"
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -232,11 +233,7 @@ class CompiledProbe:
             summary_sql=data.get("summary_sql", ""),
             detail_sql=data.get("detail_sql", ""),
             status=data.get("status", "active"),
-            # Older catalogs predate this field; fall back to the id convention so an existing
-            # cache stays readable instead of silently reporting every probe as agent-written.
-            source=data.get("source") or (
-                "generic" if str(data.get("rule_id", "")).startswith("GEN-") else "declared"
-            ),
+            source=data.get("source") or "declared",
             rule_hash=data.get("rule_hash", ""),
             structure_fingerprint=data.get("structure_fingerprint", ""),
             table_fingerprint=data.get("table_fingerprint", ""),

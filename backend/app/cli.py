@@ -353,10 +353,10 @@ def _compile_dry_run(console, args) -> int:
         fingerprint = ""
 
     catalog = catalog_store.load()
-    # What each sql_mode costs, matching the graph's own routing: generic probes make no call
+    # What each sql_mode costs, matching the graph's own routing: a cloned family member
     # at all, pinned rules are grounded and reviewed, the rest are also authored (and may be
     # authored again if the reviewer sends them back).
-    cost = {"generic": 0, "pinned": 2, "seed": 3, "authored": 4}
+    cost = {"expanded": 0, "pinned": 2, "seed": 3, "authored": 4}
 
     stale: list[tuple[str, str, int]] = []
     current = 0
@@ -371,7 +371,7 @@ def _compile_dry_run(console, args) -> int:
         if not needs:
             current += 1
             continue
-        key = "generic" if rule.source == "generic" else rule.sql_mode
+        key = "expanded" if rule.is_expanded else rule.sql_mode
         stale.append((rule.rule_id, why, cost.get(key, 4)))
 
     table = Table(show_header=True, header_style="bold cyan", title="Would compile")
@@ -561,7 +561,7 @@ def cmd_catalog(args) -> int:
     summary.add_row(
         "[blue]Template[/]", str(len(templated)),
         str(sum(p.llm_calls for p in templated)),
-        "domain/generic_probes.md rendered against schema.txt",
+        "the compiled probes, as stored",
     )
     console.print(summary)
 
@@ -648,7 +648,7 @@ def main() -> None:
         help="also retry rules that failed to compile last time",
     )
     p_compile.add_argument(
-        "--source", choices=("declared", "generic"),
+        "--source", choices=("declared", "expanded"),
         help="compile only the declared rules, or only the generated structural probes",
     )
     p_compile.add_argument(

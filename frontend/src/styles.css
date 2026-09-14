@@ -34,7 +34,14 @@ button {
   padding: 8px 14px; font-size: 13px; font-weight: 600; cursor: pointer;
 }
 button:hover:not(:disabled) { filter: brightness(1.15); }
+button:active:not(:disabled) { transform: translateY(1px); }
 button:disabled { opacity: .5; cursor: not-allowed; }
+/* Keyboard focus must stay visible. `outline: none` on a button is the single most common
+   accessibility regression in a dashboard, and a compile or a run is not something to trigger
+   by accident because the focused control was invisible. */
+button:focus-visible, input:focus-visible {
+  outline: 2px solid var(--navy); outline-offset: 2px;
+}
 button.secondary { background: #fff; color: var(--navy); border: 1px solid var(--navy); }
 button.link {
   background: none; color: var(--navy); text-decoration: underline;
@@ -51,6 +58,9 @@ nav button.active { color: var(--navy); border-bottom-color: var(--navy); }
 .card {
   background: #fff; border: 1px solid var(--line); border-radius: 10px;
   padding: 16px 18px; margin-bottom: 16px;
+  /* Barely-there lift. Enough to separate a card from the page without the drop-shadow look
+     that makes a dense report feel cluttered. */
+  box-shadow: 0 1px 2px rgba(16, 24, 40, .04);
 }
 .card h2 { margin: 0 0 12px; font-size: 15px; color: var(--navy); }
 .card h3 { margin: 16px 0 6px; font-size: 13px; color: var(--navy); }
@@ -123,7 +133,11 @@ pre.prose { font-family: inherit; font-size: 13px; background: #fbfbfd; }
   margin: 0.35rem 0;
 }
 .summary-bullet::before {
-  content: "2";
+  /* Written as a CSS unicode escape, not a literal bullet. The literal was corrupted by
+     an encoding round-trip into an invisible control character followed by the digit
+     "2", so every summary line rendered as "2The data shows...". An escape is plain
+     ASCII in the file and cannot be mangled again by whatever touches it next. */
+  content: "\2022";
   position: absolute;
   left: 0.25rem;
   opacity: 0.65;

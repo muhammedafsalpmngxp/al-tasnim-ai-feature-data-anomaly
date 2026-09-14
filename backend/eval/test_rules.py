@@ -223,7 +223,8 @@ def test_numeric_hints_round_trip() -> None:
         "  - a_fraction: min 0, max 1, avg 0.26, stdev 0.43, nulls <1% | FRACTION_1 (0-1) - x100",
         "  - a_percentage: min 0, max 100, avg 50, stdev 52.2, nulls >99% | PERCENT_100 (0-100)",
         "  - some_text (text): 183 of 642 values do NOT parse as a number - TRY_CAST required",
-        "  - code_text (text): NONE of 17264 values parse as a number - holds codes/labels",
+        "  - code_text (text): only 0 of 17264 values parse as a number (0%) - this column "
+        "holds codes, labels or free text, NOT a quantity. Do not range-check or cast-check it.",
     ])
     schema = "\n".join([
         "TABLE demo.table_one",
@@ -596,23 +597,53 @@ def test_verifier_prompt_offers_the_not_applicable_verdict() -> None:
           "the verifier is not warned that a zero scope is never a clean result")
 
 
-def test_generic_templates_parse() -> None:
-    """The generic templates must keep their {{placeholders}} - they are filled from the
-    schema at generation time, not from rule metadata."""
-    path = os.path.join(_BACKEND, "domain", "generic_probes.md")
-    check(os.path.exists(path), "domain/generic_probes.md is missing")
-    if not os.path.exists(path):
-        return
-    with open(path, encoding="utf-8") as fh:
-        text = fh.read()
-    families = re.findall(r"^##\s+TEMPLATE\s+(\S+)", text, re.MULTILINE)
-    check(bool(families), "generic_probes.md declares no '## TEMPLATE <id>' sections")
-    for fam in families:
-        block = text.split(f"## TEMPLATE {fam}")[1].split("\n## ")[0]
-        check("applies_to:" in block, f"{fam}: no 'applies_to:' line - nothing to iterate over")
-        check("```sql summary" in block, f"{fam}: no ```sql summary block")
-        check("```sql detail" in block, f"{fam}: no ```sql detail block")
-        check("{{rule_id}}" in block, f"{fam}: does not use {{{{rule_id}}}}")
+def test_no_rule_carries_sql() -> None:
+    """The invariant that replaced domain/generic_probes.md.
+
+    Every anomaly is now described in business language in data_anomalies.md and the SQL is
+    written by an agent against the live schema. SQL typed into a rule would be correct only
+    against the schema as it stood the day it was written - exactly the guarantee that decays,
+    and the reason the structural templates were retired.
+
+    The ## PATTERNS section is deliberately exempt: it holds worked SHAPES shown to the author,
+    names no table or column, and is not a rule.
+    """
+    from app.rules.loader import load_rules
+
+    check(
+        not os.path.exists(os.path.join(_BACKEND, "domain", "generic_probes.md")),
+        "domain/generic_probes.md is back - structural SQL belongs in a rule's prose now",
+    )
+    check(
+        not os.path.exists(os.path.join(_APP, "rules", "generic.py")),
+        "app/rules/generic.py is back - enumeration lives in app/rules/expand.py, without SQL",
+    )
+
+    rules, _errors = load_rules()
+    for rule in rules:
+        check(
+            not rule.has_sql,
+            f"{rule.rule_id} carries SQL. Describe the anomaly in words and let the agent "
+            f"write the query against the live schema.",
+        )
+
+
+def test_families_expand_without_sql() -> None:
+    """A family rule must produce one concrete rule per schema feature, and carry no SQL.
+
+    This is what replaced the 143 template-rendered probes, so a silent failure here is a
+    silent loss of most of the engine's coverage.
+    """
+    from app.rules.expand import PLACEHOLDERS, tokens_for
+    from app.rules.loader import EXPANDS_OVER
+
+    for kind in EXPANDS_OVER:
+        check(kind in PLACEHOLDERS, f"{kind} is a declarable feature with no placeholders")
+        check(
+            "rule_id" in tokens_for(kind),
+            f"{kind} does not require {{{{rule_id}}}} - every member would report under the "
+            f"id of whichever one happened to be authored",
+        )
 
 
 def test_staleness_is_judged_per_probe() -> None:
@@ -721,7 +752,8 @@ def main() -> int:
         ("eval bands catch regressions", test_eval_bands_catch_regressions),
         ("zero-scope probe never stored active", test_zero_scope_probe_is_never_stored_active),
         ("verifier can say not applicable", test_verifier_prompt_offers_the_not_applicable_verdict),
-        ("generic templates parse", test_generic_templates_parse),
+        ("no rule carries SQL", test_no_rule_carries_sql),
+        ("families expand without SQL", test_families_expand_without_sql),
         ("staleness is judged per probe", test_staleness_is_judged_per_probe),
         ("a stale catalog is never silently executed", test_a_stale_catalog_is_never_silently_executed),
     ]

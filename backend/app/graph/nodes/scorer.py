@@ -44,26 +44,41 @@ from __future__ import annotations
 
 from app.graph.run_state import RunState
 from app.observability import get_logger
+from app.config import settings
 from app.rules.spec import SEVERITIES, SEVERITY_RANK
 
 log = get_logger()
 
 # How much one rule's anomaly share costs the score, per severity. Ratios matter more than the
-# absolute values: a critical finding weighs eight times a low one.
-SEVERITY_WEIGHT: dict[str, float] = {
-    "critical": 40.0,
-    "high": 20.0,
-    "medium": 8.0,
-    "low": 5.0,
-}
-_DEFAULT_WEIGHT = 8.0
+# absolute values: by default a critical finding weighs eight times a low one.
+#
+# CONFIGURABLE, because it is a BUSINESS judgement and not an engineering one. How much a
+# critical finding should move the headline number is a decision for whoever owns the report,
+# and it was the last such decision still fixed in Python - every other one lives in
+# domain/*.md or .env. An organisation that treats any critical defect as unacceptable can set
+# ANOMALY_SEVERITY_WEIGHTS=critical:100,high:20,medium:8,low:1 without touching code.
+#
+# The defaults stand when the setting is absent, so behaviour is unchanged until someone
+# deliberately changes it.
+SEVERITY_WEIGHT: dict[str, float] = dict(settings.severity_weights)
+# Used for a severity the weights do not mention, so an unrecognised value still scores rather
+# than silently counting as zero - which would make a finding free.
+_DEFAULT_WEIGHT = SEVERITY_WEIGHT.get("medium", 8.0)
 
+# The weights are READ from the configured values, never restated as a literal. This sentence
+# is printed in the report beside the number, so a hardcoded "critical 40" would quietly become
+# a lie the moment anyone set ANOMALY_SEVERITY_WEIGHTS - and a published derivation that does
+# not match the arithmetic is worse than none, because it is believed.
 SCORE_BASIS = (
     "Score = 100 x (1 - the severity-weighted average share of examined records that were "
     "anomalous), over every check that examined at least one record. Severity weights: "
-    "critical 40, high 20, medium 8, low 5. Checks that examined no records are excluded "
-    "entirely and reported separately as coverage gaps. The score is a trend indicator - read "
-    "it alongside the findings table, which carries the severity of individual problems."
+    + ", ".join(
+        f"{name} {weight:g}"
+        for name, weight in sorted(SEVERITY_WEIGHT.items(), key=lambda kv: -kv[1])
+    )
+    + ". Checks that examined no records are excluded entirely and reported separately as "
+    "coverage gaps. The score is a trend indicator - read it alongside the findings table, "
+    "which carries the severity of individual problems."
 )
 
 

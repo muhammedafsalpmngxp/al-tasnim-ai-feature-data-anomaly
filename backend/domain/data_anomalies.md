@@ -58,22 +58,26 @@ A threshold that is *definitional* may be a literal: the 60-day and 90-day deadl
 approved business rules, and an `epsilon` allowing for floating-point noise when two figures
 should be exactly equal is a numeric-precision allowance, not a business judgement.
 
-## Already covered deterministically — do NOT write rules for these
+## Structural rules, and not writing the same check twice
 
-The structural layer generates these from the schema itself, with no model involved. Writing a
-rule here that repeats one would double-report the same record:
+Six rules in GROUP G below are **structural**: each is written once and applied to every
+matching feature the schema declares - one probe per foreign key, per date pair, per measured
+numeric column. Writing an ordinary rule that repeats one of them double-reports the same
+record under two ids, which inflates both the flagged-record count and the number of checks
+reporting findings.
 
-| Condition | Covered by |
+| Condition | Already covered by |
 |---|---|
-| An end date earlier than its paired start date (rig-on/rig-off, start/end, start/finish) | `GEN-DATE` |
-| A foreign key pointing at a row that does not exist — invalid cluster, rig, station, well type, status | `GEN-FK` |
-| A progress or percentage value outside its measured range | `GEN-RANGE` |
-| Repeated rows for a key that should identify one entity | `GEN-DUP` |
-| A date recording something that already happened, set in the future | `GEN-FUT` |
-| A numeric quantity stored as text that will not parse | `GEN-CAST` |
+| An end date earlier than its paired start date | `DQ-G03` |
+| A foreign key pointing at a row that does not exist | `DQ-G01` |
+| A numeric value outside its measured range | `DQ-G05` |
+| A quantity stored as text that will not parse | `DQ-G06` |
+| An actual milestone date set in the future | `DQ-A12` |
 
-The rules below are the ones that need **business knowledge** — a deadline, a lifecycle order, a
-completion definition, a rollup.
+`DQ-D01` and `DQ-D02` were disabled for exactly this reason - see the notes on them.
+
+Everything else here needs **business knowledge**: a deadline, a lifecycle order, a completion
+definition, a rollup. That is the dividing line.
 
 ---
 
@@ -443,6 +447,54 @@ Examine every well. Flag the well when the cluster reference is absent.
 A cluster value that is present but invalid — covered by `GEN-FK`.
 
 ---
+
+## RULE DQ-A12 - Actual milestone date recorded in the future
+
+- category: Milestone dates
+- severity: medium
+- entity: well
+- method: rule
+- sql_mode: authored
+- status: active
+- placeholder_date: 1900-01-01
+- tags: milestone, dates, impossible-value
+
+**What is wrong**
+A well milestone date that records something which has **already happened** holds a date later
+than today.
+
+**Why it matters**
+Usually a typo in the year. It makes completed work look outstanding, or pushes a milestone
+years into the future, and every deadline computed from that date inherits the error silently.
+
+**How to detect**
+Use ONLY the well date columns that business_rules §2 marks with kind **actual** — the actual
+rig-on date, the actual rig-off date, the pegging sheet date, the FLAF date and the hook-up
+completion date. Flag a well where any of those is later than the database's own current date,
+so the check uses the same clock the data was written against. Report which date is at fault.
+
+**Do NOT flag**
+Any column §2 marks as **expected** — those are the planned dates, and being in the future is
+precisely what they are for. Any date column §2 does not classify at all: whether it records an
+outcome or an intention has not been established, and assuming it is an actual is how a
+schedule column comes to be reported as thousands of defects. Rows carrying the known
+placeholder value — that is DQ-D06.
+
+> **Deliberately narrower than the structural check it replaces.** The old `GEN-FUT` family
+> decided which columns were actuals from a hardcoded list of English words in Python, and got
+> it wrong at scale: `well.task_daily.endDate` was read as an actual and reported 9,198 records
+> as defects while sitting beside an `actual_end` column measured at 0.00% future values.
+>
+> This rule instead uses the only authority that actually states the answer — the **Kind**
+> column in business_rules §2. That covers five well dates today.
+>
+> Roughly a dozen findings on OTHER well date columns are not covered as a result:
+> `eng_finish_date`, `survey_report_date`, `wellpad_handover_date`, `location_po_recvd_date`,
+> `loc_start_date` and `f_l_po_recd_date` each held one to seven future values. Their names
+> suggest they record outcomes, but §2 does not say so, and this engine does not decide that
+> for itself. **Add them to the §2 table with kind `actual` and they are covered immediately,**
+> with no change to this rule or to any code.
+
 
 # GROUP B — Pegging sheet, the 60-day rule
 

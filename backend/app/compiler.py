@@ -27,12 +27,12 @@ from app.llm import get_usage_report, start_usage_tracking
 from app.observability import get_logger
 from app.rules import catalog as catalog_store
 from app.rules.expand import (
+    coverage_summary,
     expand_families,
     substitute,
     tokens_for,
     unfilled_tokens,
 )
-from app.rules.generic import coverage_summary, generate as generate_generic
 from app.rules.loader import load_patterns, load_rules
 from app.rules.schema_index import load_index
 from app.rules.spec import AnomalyRule, CompiledProbe
@@ -79,16 +79,6 @@ def _all_rules() -> tuple[list[AnomalyRule], list[str]]:
     # of probes that no rule accounts for.
     rules, notes = expand_families(rules)
     errors += notes
-    if settings.generic_probes:
-        try:
-            declared = {r.rule_id for r in rules}
-            rules += [r for r in generate_generic() if r.rule_id not in declared]
-        except FileNotFoundError as exc:
-            errors.append(
-                f"generic probes could not be generated: {exc}. Run: python -m app.cli introspect"
-            )
-        except Exception as exc:  # noqa: BLE001 - never lose the declared rules over these
-            errors.append(f"generic probes could not be generated: {exc}")
     return rules, errors
 
 
@@ -131,9 +121,9 @@ def _seed_state(
         "value_hints": values,
         "numeric_hints": numbers,
         "patterns": patterns,
-        # A generic probe is never shown the coverage list: it IS the coverage, and telling it
-        # not to re-express itself is both meaningless and a waste of tokens.
-        "coverage": coverage if rule.source != "generic" else "",
+        # A member of a structural family is never shown the coverage list: it IS the coverage,
+        # and telling it not to re-express itself is meaningless and a waste of tokens.
+        "coverage": "" if rule.is_expanded else coverage,
         # Defaults, so a node reading one of these before it is set never sees a missing key.
         "schema_block": schema,
         "hint_block": "",
@@ -230,11 +220,8 @@ def compile_rules(
     `only` restricts the run to specific rule ids; `force` recompiles regardless of staleness.
     `progress` is called as progress(done, total, rule_id) for a CLI bar or an SSE stream.
 
-    `source` restricts to "declared" or "generic", which separates the two kinds of work by
-    what actually invalidates them. A generic probe is rendered from the schema and owes
-    nothing to the domain markdown, so it can be compiled - for zero LLM calls - while the
-    business rules are still being written. Compiling the two together would mean recompiling
-    all of them every time a sentence of prose changed.
+    `source` restricts to "declared" or "expanded", which separates a rule written about one
+    specific thing from a structural family applied across the whole schema.
     """
     import time
 
@@ -291,9 +278,11 @@ def compile_rules(
     patterns = load_patterns()
 
     catalog = catalog_store.load()
-    coverage = ""
-    if settings.generic_probes:
-        coverage = coverage_summary([r for r in rules if r.source == "generic"])
+    # What the structural families already cover, so an authored rule does not restate one and
+    # have the same record reported twice under two ids.
+    coverage = coverage_summary(
+        sorted({r.expands_over for r in rules if r.is_expanded and r.expands_over})
+    )
 
     # Only prune on a FULL compile. On ANY filtered run - by id or by source - the other rules
     # were never considered, so pruning against this shortened list would delete working probes
@@ -305,10 +294,10 @@ def compile_rules(
     graph = build_compile_graph()
     total = len(runnable)
     log.info(
-        "compile: %d runnable rule(s) - %d declared, %d generic",
+        "compile: %d runnable rule(s) - %d declared, %d expanded from a family",
         total,
-        sum(1 for r in runnable if r.source == "declared"),
-        sum(1 for r in runnable if r.source == "generic"),
+        sum(1 for r in runnable if not r.is_expanded),
+        sum(1 for r in runnable if r.is_expanded),
     )
 
     # ONE AUTHORED QUERY PER FAMILY, not per feature. A family's members differ only in which
@@ -395,9 +384,10 @@ def compile_rules(
                 if why:
                     log.info("compile: %s needs rebuilding - %s", rule.rule_id, why)
 
-        # Checked BETWEEN rules so every rule is either finished or untouched. A generic probe
-        # costs no calls, so it is never blocked by a budget it cannot spend.
-        needs_llm = rule.source != "generic"
+        # Checked BETWEEN rules so every rule is either finished or untouched. A family member
+        # that only clones an already-authored template spends nothing, so it is never blocked
+        # by a budget it cannot use.
+        needs_llm = not rule.is_expanded or rule.rule_id in authors
         if needs_llm and report.llm_calls >= settings.max_compile_calls:
             report.stopped_early = (
                 f"the compile budget of {settings.max_compile_calls} LLM calls was reached; "
