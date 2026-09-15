@@ -342,3 +342,42 @@ async def run_endpoint(
         })
 
     return await _stream_job(work, "run")
+
+
+# ── The built UI ────────────────────────────────────────────────────────────────
+#
+# Serving the frontend from the API is what makes a production deployment ONE process on ONE
+# origin. It is not a convenience:
+#
+#   * CORS stops existing. In development Vite proxies /api, so the browser sees one origin
+#     and the question never arises. Split across two servers in production it does arise, and
+#     the usual answer - CORS_ORIGINS=* - hands every site on the internet a logged-in caller's
+#     browser as a proxy to this API.
+#   * Node is not needed on the server. `npm run build` runs on a build machine; what ships is
+#     a directory of static files.
+#   * The API key never has to reach a separate web server's configuration.
+#
+# Mounted LAST, on purpose. Every /api route above is already registered, so this catch-all
+# cannot shadow one. If the directory is absent - a backend-only or CLI-only deployment, or a
+# checkout where the UI was never built - nothing is mounted and the API serves as before.
+_UI_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))), "..", "frontend", "dist")
+_UI_DIR = os.path.normpath(_UI_DIR)
+
+if os.path.isdir(_UI_DIR) and os.path.isfile(os.path.join(_UI_DIR, "index.html")):
+    from fastapi.staticfiles import StaticFiles
+
+    # html=True serves index.html at "/" - which is the whole UI. Its tabs are React state,
+    # not URL routes, so there are no deep links to fall back for.
+    #
+    # If the UI is ever given real routes (react-router, or pushState on the tabs), THIS MOUNT
+    # MUST CHANGE: Starlette answers an unknown path with 404 and does not fall back to
+    # index.html, so /runs would 404 on reload while working perfectly when clicked. Handle it
+    # then with an explicit catch-all returning index.html, registered after every /api route.
+    app.mount("/", StaticFiles(directory=_UI_DIR, html=True), name="ui")
+    log.info("api: serving the built UI from %s", _UI_DIR)
+else:
+    log.info(
+        "api: no built UI at %s - serving the API only. Build it with: "
+        "cd frontend && npm install && npm run build", _UI_DIR,
+    )

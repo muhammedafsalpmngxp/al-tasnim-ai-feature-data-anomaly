@@ -300,11 +300,37 @@ after changing it, or every request comes back 401.
 > does **not** set an empty key: python-dotenv has nothing to terminate the value on and reads
 > the comment text itself as the key, so every request then fails with 401.
 
-For a production build:
+### 3. Production
+
+In production there is no Vite and no second server. Build the UI once:
 
 ```bash
-cd frontend && npm run build
+cd frontend && npm install && npm run build
 ```
+
+Then start the backend alone:
+
+```bash
+cd backend && python serve.py
+```
+
+It detects `frontend/dist` and serves the UI and the API together on **http://localhost:8100** —
+one process, one origin. Nothing proxies, so CORS never applies and `CORS_ORIGINS` can stay
+closed. Node is needed only on the machine that runs `npm run build`, never on the server.
+
+Rebuild the UI whenever the frontend changes; the backend picks up the new `dist` on restart.
+
+Set these in `backend/.env` before exposing it beyond localhost:
+
+| Setting | Production value | Why |
+|---|---|---|
+| `API_KEY` | a long random string | blank disables authentication entirely, and `/api/compile` spends money |
+| `CORS_ORIGINS` | leave unset | same origin now, so no cross-origin access is needed at all |
+| `API_WORKERS` | `1` | more is **refused at startup**: compiles are serialised by a lock inside one process, and separate workers would let two compiles write the catalog at once |
+| `API_RELOAD` | `false` | a reload mid-compile discards the run |
+
+With an `API_KEY` set, put the same value in `frontend/.env` as `VITE_API_KEY` **before**
+building — Vite bakes it into the bundle at build time, so changing it later means rebuilding.
 
 ### What the UI does
 
@@ -366,8 +392,7 @@ Detail queries are ordered worst-first, so a cap still shows the rows that matte
 |---|---|
 | `business_rules.md` | authoritative business definitions, grain, join quirks |
 | `few_shots.md` | worked question → T-SQL patterns |
-| `data_anomalies.md` | **anomaly definitions, each with its own SUMMARY and DETAIL SQL** |
-| `generic_probes.md` | structural SQL templates (`{{schema}}.{{table}}`) for orphan FKs, duplicates, date order, ranges |
+| `data_anomalies.md` | **anomaly definitions in business prose - no SQL. The agent writes the SQL** |
 
 ### Where SQL is allowed to live
 
@@ -461,8 +486,8 @@ frontend/                 React 18 + TypeScript + Vite + ECharts
 | Phase | Scope | State |
 |---|---|---|
 | 1 | Config, logging, LLM client, DB layer, introspection, CLI | **done** |
-| 2 | `rules/` package, `data_anomalies.md`, `generic_probes.md`, self-checks | **done** |
-| 3 | Generic zero-LLM probe generator (`rules/generic.py`) | **done** |
+| 2 | `rules/` package, `data_anomalies.md`, self-checks | **done** |
+| 3 | Structural rule families (`rules/expand.py`) - one prose rule cloned over every matching schema feature, zero extra LLM calls | **done** |
 | 4 | Compile graph + catalog | **done** |
 | 5 | Run graph + Excel | **done** |
 | 6 | Word + summarizer | **done** |

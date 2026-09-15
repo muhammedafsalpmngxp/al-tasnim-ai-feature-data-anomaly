@@ -24,7 +24,8 @@ rich==15.0.0                # colour agent trace + CLI tables
 # ── HTTP API ────────────────────────────────────────────────────────────────────
 fastapi==0.141.1
 uvicorn[standard]==0.52.1
-pydantic==2.13.4            # imported directly in app/api/schemas.py, so declared explicitly
+pydantic==2.13.4            # imported directly for the structured LLM outputs in
+                            # app/graph/nodes/, so declared explicitly rather than inherited
                             # rather than relied on as a fastapi transitive dependency
 
 # ── Report generation ───────────────────────────────────────────────────────────
