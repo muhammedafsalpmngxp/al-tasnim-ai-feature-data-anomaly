@@ -124,7 +124,11 @@ def catalog_loader_node(state: RunState) -> dict:
     # probe never touches is not a reason to distrust - or recompile - its SQL.
     outdated: dict[str, str] = {}
     for probe in selected:
-        if probe.status != "active":
+        # Staleness is only worth deciding for a probe that would otherwise run. A probe blocked
+        # by its own status or by a switched-off rule is not going to execute either way, and
+        # counting it here would push `outdated` past ANOMALY_AUTO_COMPILE_MAX_RULES and stop
+        # the whole run over checks nobody asked for.
+        if catalog_store.runnable_reason(probe, rules.get(probe.rule_id)):
             continue
         moved, why = catalog_store.structure_moved(probe, fingerprint, signatures)
         if moved:
@@ -171,14 +175,24 @@ def catalog_loader_node(state: RunState) -> dict:
     not_running: list[dict[str, str]] = []
 
     for probe in selected:
-        if probe.status == "active" and probe.rule_id not in outdated:
+        # The rule's status is consulted as well as the probe's - see catalog.runnable_reason.
+        # Checking only the probe meant a rule switched off in the markdown kept running.
+        blocked = catalog_store.runnable_reason(probe, rules.get(probe.rule_id))
+        if not blocked and probe.rule_id not in outdated:
             probes.append(probe)
             continue
+        rule = rules.get(probe.rule_id)
+        if probe.rule_id in outdated:
+            status = "stale"
+        elif rule is not None and not rule.runnable:
+            status = rule.status
+        else:
+            status = probe.status
         not_running.append({
             "rule_id": probe.rule_id,
-            "title": getattr(rules.get(probe.rule_id), "title", ""),
-            "status": "stale" if probe.rule_id in outdated else probe.status,
-            "reason": outdated.get(probe.rule_id) or probe.error or "",
+            "title": getattr(rule, "title", ""),
+            "status": status,
+            "reason": outdated.get(probe.rule_id) or blocked,
         })
 
     # Sorted so a run's log and its report list rules in the same, stable order every time.

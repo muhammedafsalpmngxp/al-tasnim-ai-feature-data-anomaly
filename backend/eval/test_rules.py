@@ -169,10 +169,10 @@ def test_render_version_does_not_invalidate_catalog() -> None:
         node.name: ast.get_source_segment(open(path, encoding="utf-8").read(), node)
         for node in ast.walk(tree)
         if isinstance(node, ast.FunctionDef)
-        and node.name in ("_structure_signature", "_live_fingerprint")
+        and node.name in ("_structure_signature", "_live_fingerprint", "table_signatures")
     }
-    check(len(bodies) == 2, f"expected both fingerprint functions, found {sorted(bodies)}")
-    if len(bodies) != 2:
+    check(len(bodies) == 3, f"expected the three fingerprint functions, found {sorted(bodies)}")
+    if len(bodies) < 2:
         return
     structure_src = bodies["_structure_signature"]
     live_src = bodies["_live_fingerprint"]
@@ -186,6 +186,22 @@ def test_render_version_does_not_invalidate_catalog() -> None:
         "_structure_signature folds in _RENDER_VERSION, so every rendering tweak invalidates "
         "the whole compiled catalog and demands a full LLM recompile.",
     )
+    # The per-table signatures are what the PER-PROBE staleness check uses, so the same rule
+    # applies there - and removing it from the global fingerprint alone left the bug reachable
+    # through that door, with the extra hazard that the answer then depended on which process
+    # asked.
+    sig_src = bodies.get("table_signatures", "")
+    check(bool(sig_src), "table_signatures not found in introspect.py")
+    sig_code = [
+        line for line in sig_src.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    check(
+        not any("_RENDER_VERSION" in line for line in sig_code),
+        "table_signatures folds in _RENDER_VERSION, so a presentation tweak marks every probe "
+        "stale - and a server started before the edit disagrees with a CLI run started after it.",
+    )
+
     check(
         "_RENDER_VERSION" in live_src,
         "_live_fingerprint must fold in _RENDER_VERSION - schema.txt and the hint files ARE "
@@ -198,6 +214,230 @@ def test_render_version_does_not_invalidate_catalog() -> None:
             f"_structure_signature no longer folds in {signal}; a probe could keep running "
             f"against a table that setting now hides, or against a different database.",
         )
+
+
+def test_switched_off_rules_never_run() -> None:
+    """A rule set to `disabled` or `draft` must not produce findings. Two layers.
+
+    THIS IS THE BUG THIS TEST WAS WRITTEN FOR. DQ-D01 and DQ-D02 were marked `disabled`
+    precisely because they double-report with a structural family, and both still ran - only
+    the PROBE's status was ever consulted, never the RULE's. The flagged-record count and the
+    score therefore carried duplicates, which for a data-quality tool is the worst defect
+    available: its own numbers were wrong.
+
+    Checked at the layer that decides, so it holds however the caller reaches it.
+    """
+    from app.rules.catalog import runnable_reason
+    from app.rules.spec import AnomalyRule, CompiledProbe
+
+    def probe(status: str = "active") -> CompiledProbe:
+        return CompiledProbe(rule_id="X-1", summary_sql="s", detail_sql="d", status=status)
+
+    def rule(status: str) -> AnomalyRule:
+        return AnomalyRule(rule_id="X-1", title="T", status=status)
+
+    check(runnable_reason(probe(), rule("active")) == "",
+          "an active rule with a compiled probe must be allowed to run")
+
+    for status in ("disabled", "draft"):
+        reason = runnable_reason(probe(), rule(status))
+        check(bool(reason), f"a {status} rule's probe was allowed to run")
+        check(status in reason,
+              f"the reason for not running a {status} rule must name its status, so the report "
+              f"can say why; got {reason!r}")
+
+    check(bool(runnable_reason(probe("failed"), rule("active"))),
+          "a failed probe must not run even when its rule is active")
+    check(bool(runnable_reason(probe("not_applicable"), rule("active"))),
+          "a not_applicable probe must not run even when its rule is active")
+    check(runnable_reason(probe(), None) == "",
+          "a probe whose rule was deleted falls back to its own status")
+
+
+def test_pruning_uses_runnable_ids_only() -> None:
+    """Switching a rule off must eventually REMOVE its probe, not merely block it each run."""
+    import ast
+
+    path = os.path.join(_APP, "compiler.py")
+    source = open(path, encoding="utf-8").read()
+    calls = [
+        ast.get_source_segment(source, node)
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "prune_removed"
+    ]
+    check(bool(calls), "no prune_removed call found in compiler.py")
+    for call in calls:
+        check(
+            "for r in runnable" in (call or ""),
+            "prune_removed is passed every rule id, including disabled and draft ones, so a "
+            "switched-off rule keeps its compiled probe in the catalog for ever. Pass the "
+            f"runnable ids instead. Found: {call}",
+        )
+
+
+def test_expansion_skips_empty_tables() -> None:
+    """A family must not generate a probe over a table with no rows.
+
+    Such a probe cannot find anything and does not fail - it reports a clean result, or a zero
+    scope that then has to be explained away. Ten were generated against one empty table here.
+
+    An UNKNOWN row count is deliberately kept: unknown is not empty, and skipping a real check
+    on a guess is the more expensive mistake.
+    """
+    from app.rules.expand import Feature, _drop_empty_tables
+    from app.rules.schema_index import load_index
+
+    schema = "\n".join([
+        "TABLE demo.populated  -- 1,234 rows",
+        "  - id int NOT NULL PK",
+        "  - other_id int",
+        "",
+        "TABLE demo.empty_one  -- EMPTY: 0 rows. Nothing can be found here.",
+        "  - id int NOT NULL PK",
+        "",
+        "TABLE demo.unknown_size",
+        "  - id int NOT NULL PK",
+        "",
+    ])
+    index = load_index(schema_text=schema, numeric_text="")
+
+    check(index.get("demo.populated").row_count == 1234,
+          "a row count on the TABLE line must be read back by the index")
+    check(index.get("demo.empty_one").row_count == 0,
+          "an EMPTY marker must be read back as zero rows, or the filter below cannot fire")
+    check(index.get("demo.unknown_size").row_count is None,
+          "a table with no stated count must read as unknown, never as zero")
+
+    features = [
+        Feature(values={"table": "demo.populated"}, label="kept"),
+        Feature(values={"table": "demo.empty_one"}, label="dropped"),
+        Feature(values={"table": "demo.unknown_size"}, label="kept-unknown"),
+        Feature(values={"child_table": "demo.empty_one",
+                        "parent_table": "demo.populated"}, label="dropped-child"),
+        Feature(values={"child_table": "demo.populated",
+                        "parent_table": "demo.empty_one"}, label="dropped-parent"),
+    ]
+    kept, dropped = _drop_empty_tables(features, index)
+    kept_labels = {f.label for f in kept}
+
+    check(kept_labels == {"kept", "kept-unknown"},
+          f"wrong features survived the empty-table filter: {sorted(kept_labels)}")
+    check(len(dropped) == 3, f"expected 3 dropped features, got {len(dropped)}")
+    check(all(t == "demo.empty_one" for t, _ in dropped),
+          "the dropped features must name the empty table, so the skip is explainable")
+
+
+def test_schema_block_states_row_counts() -> None:
+    """The row count must reach the Author and the Verifier, not just Grounding.
+
+    It lived only in the index built for Grounding, so once Grounding named an empty table
+    nothing downstream could catch it. The renderer now states it on the TABLE line and the
+    prompts tell both agents to read it - assert all three, because any one alone is useless.
+    """
+    import ast
+
+    path = os.path.join(_APP, "db", "introspect.py")
+    source = open(path, encoding="utf-8").read()
+    render = next(
+        (ast.get_source_segment(source, n) for n in ast.walk(ast.parse(source))
+         if isinstance(n, ast.FunctionDef) and n.name == "_render"),
+        "",
+    )
+    check(bool(render), "_render not found in introspect.py")
+    check("EMPTY" in render and "rows" in render,
+          "_render must mark empty tables and state row counts on the TABLE line")
+
+    from app.graph import prompts
+
+    check("EMPTY" in prompts.GROUNDING_SYSTEM,
+          "GROUNDING_SYSTEM must tell the model never to scope a rule on an empty table")
+    check("EMPTY" in prompts.ANOMALY_SQL_AUTHOR_SYSTEM,
+          "the SQL Author checklist must include the scope-size check, so a grounding mistake "
+          "is still caught before it reaches the database")
+    check("NOT APPLICABLE" in prompts.RULE_VERIFIER_SYSTEM.upper(),
+          "RULE_VERIFIER_SYSTEM must separate 'the table is empty' (not applicable) from "
+          "'the predicate matches nothing' (reject), or it burns rewrites on unfixable probes")
+
+
+def test_family_retries_another_member_before_giving_up() -> None:
+    """One rejected representative must not write off its whole family.
+
+    THE INCIDENT: a compile recorded 54 failures, of which only FOUR were distinct problems.
+    DQ-G01-001 was rejected and took 35 siblings with it; DQ-G05-001 was inapplicable on one
+    column and took 15 more, on columns that were perfectly measurable. The report then read as
+    though the database had 54 faults.
+
+    A family is one sentence of business prose applied to many schema features. The features
+    differ - different tables, different columns - so the next member is a genuinely DIFFERENT
+    query, not a retry of the rejected one. That is why it is worth another call, and why an
+    ordinary retry budget is the wrong instrument.
+
+    Bounded by ANOMALY_FAMILY_AUTHOR_ATTEMPTS, because a family this database cannot express at
+    all must not cost one call per feature to discover that.
+    """
+    import ast
+
+    path = os.path.join(_APP, "compiler.py")
+    source = open(path, encoding="utf-8").read()
+    tree = ast.parse(source)
+
+    body = next(
+        (ast.get_source_segment(source, n) for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "compile_rules"),
+        "",
+    )
+    check(bool(body), "compile_rules not found in compiler.py")
+
+    check(
+        "family_author_attempts" in body,
+        "the compile loop never consults ANOMALY_FAMILY_AUTHOR_ATTEMPTS, so a family whose "
+        "chosen author fails still writes off every one of its members",
+    )
+    check(
+        "family_attempts" in body,
+        "no per-family attempt counter - either the family gets one try (the original bug) or "
+        "it gets one call per feature (the opposite, and expensive)",
+    )
+    check(
+        "authors[rule.family_id] = rule.rule_id" in body,
+        "nothing promotes another member to author, so a failed representative is terminal",
+    )
+
+    from app.config import settings
+
+    check(
+        settings.family_author_attempts >= 1,
+        f"family_author_attempts must be at least 1, got {settings.family_author_attempts}",
+    )
+    check(
+        settings.family_author_attempts <= 10,
+        "family_author_attempts is high enough that an inexpressible family would cost a call "
+        f"per feature to rule out; got {settings.family_author_attempts}",
+    )
+
+
+def test_compile_progress_is_reportable() -> None:
+    """A compile runs for tens of minutes, so its progress has to be observable.
+
+    Not cosmetic. The last full compile took 2,305 seconds with no output any interface could
+    show, which is indistinguishable from a hang - and the honest response to a hang is to kill
+    it, losing the whole run.
+    """
+    import ast
+
+    path = os.path.join(_APP, "compiler.py")
+    source = open(path, encoding="utf-8").read()
+    body = next(
+        (ast.get_source_segment(source, n) for n in ast.walk(ast.parse(source))
+         if isinstance(n, ast.FunctionDef) and n.name == "compile_rules"),
+        "",
+    )
+    check("progress" in body, "compile_rules exposes no progress callback")
+    check(
+        "progress(index - 1, total, rule.rule_id)" in body,
+        "the progress callback must report position, total and the rule being worked on - a "
+        "bare percentage cannot tell an operator WHICH rule is slow",
+    )
 
 
 def test_numeric_hints_round_trip() -> None:
@@ -741,6 +981,12 @@ def main() -> int:
     tests = [
         ("every module parses and imports", test_every_module_parses),
         ("no business SQL in Python", test_no_business_sql),
+        ("switched-off rules never run", test_switched_off_rules_never_run),
+        ("pruning uses runnable ids only", test_pruning_uses_runnable_ids_only),
+        ("expansion skips empty tables", test_expansion_skips_empty_tables),
+        ("schema block states row counts", test_schema_block_states_row_counts),
+        ("family retries another member", test_family_retries_another_member_before_giving_up),
+        ("compile progress is reportable", test_compile_progress_is_reportable),
         ("numeric hints round-trip", test_numeric_hints_round_trip),
         ("render version does not invalidate the catalog",
          test_render_version_does_not_invalidate_catalog),

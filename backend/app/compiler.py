@@ -190,8 +190,9 @@ def _instantiate(
     if not template or not template[0].strip() or not template[1].strip():
         return _failed_probe(
             rule, fingerprint,
-            "the query for this rule family could not be authored, so this member of it was "
-            "never built",
+            "no member of this rule family could be authored - the family was tried on "
+            f"{settings.family_author_attempts} different feature(s) and each attempt was "
+            "rejected or found inapplicable, so this member was never built",
         )
 
     values = {**rule.params, "rule_id": rule.rule_id}
@@ -339,7 +340,11 @@ def compile_rules(
     # merely because they were not asked for. Compiling only the generic probes would otherwise
     # wipe every declared one, which is the most expensive thing this function could do.
     if not only and not source:
-        report.removed = catalog_store.prune_removed(catalog, {r.rule_id for r in rules})
+        # RUNNABLE ids, not every id in the file. A rule switched to `disabled` or `draft` still
+        # has an id, so pruning against all of them left its compiled probe in the catalog for
+        # ever - and it went on running, because nothing downstream consulted the rule's status.
+        # Pruning here is what makes switching a rule off in the markdown actually take effect.
+        report.removed = catalog_store.prune_removed(catalog, {r.rule_id for r in runnable})
 
     graph = build_compile_graph()
     total = len(runnable)
@@ -381,12 +386,24 @@ def compile_rules(
 
     authors: dict[str, str] = {}        # family_id -> the member that will be authored
     templates: dict[str, tuple[str, str]] = {}
+    # How many members of each family have been sent to the author. A family gets more than one
+    # attempt because its members differ - see the promotion branch in the loop below - but not
+    # an unlimited number, or a rule this database cannot express at all would cost one call per
+    # feature to discover that.
+    family_attempts: dict[str, int] = {}
+    previous_author: dict[str, str] = {}
     for rule in runnable:
         if not rule.is_expanded:
             continue
         current = authors.get(rule.family_id)
         if current is None or _rows_behind(rule) > _rows_behind(by_id[current]):
             authors[rule.family_id] = rule.rule_id
+
+    # The first author counts as attempt one, so ANOMALY_FAMILY_AUTHOR_ATTEMPTS bounds the
+    # TOTAL number of members sent to the model for a family, not the promotions after it.
+    for family, first in authors.items():
+        family_attempts[family] = 1
+        previous_author[family] = first
 
     # Every author compiles BEFORE any member that will clone from it. Choosing the author by
     # data volume means it is no longer the first of its family, and a member reached earlier
@@ -415,12 +432,47 @@ def compile_rules(
         # A member of a family being re-authored this run: wait for its template, then clone.
         if rule.is_expanded and rule.family_id in authors:
             if authors[rule.family_id] != rule.rule_id:
-                probe = _instantiate(rule, templates.get(rule.family_id), fingerprint, signatures)
-                catalog.probes[rule.rule_id] = probe
-                (report.compiled if probe.status == "active" else report.failed).append(
-                    rule.rule_id
-                )
-                continue
+                # THE DESIGNATED AUTHOR MAY HAVE FAILED. If it did there is no template, and
+                # cloning is impossible - but that is a fact about ONE feature, not about the
+                # family. Writing the family off here cost 50 probes in a single compile: one
+                # rejected query took 35 siblings with it, and one column lacking a measured
+                # scale took another 15 on columns that had one.
+                #
+                # So promote THIS member to author instead and let it try. Each feature names
+                # different tables and columns, so the next attempt is a genuinely different
+                # query, not a retry of the same one - which is why this is worth a call and an
+                # ordinary retry would not be.
+                #
+                # Bounded by ANOMALY_FAMILY_AUTHOR_ATTEMPTS: a family that is broken in
+                # PRINCIPLE - the rule cannot be expressed against this database at all - must
+                # not spend one call per feature discovering that 36 times.
+                if rule.family_id not in templates:
+                    tried = family_attempts.get(rule.family_id, 0)
+                    if tried < settings.family_author_attempts:
+                        family_attempts[rule.family_id] = tried + 1
+                        authors[rule.family_id] = rule.rule_id
+                        log.info(
+                            "compile: %s could not be authored - promoting %s to author for "
+                            "this family (attempt %d of %d)",
+                            previous_author.get(rule.family_id, rule.family_id),
+                            rule.rule_id, tried + 1, settings.family_author_attempts,
+                        )
+                        previous_author[rule.family_id] = rule.rule_id
+                        # Fall through to the graph: this member is now the author.
+                    else:
+                        probe = _instantiate(rule, None, fingerprint, signatures)
+                        catalog.probes[rule.rule_id] = probe
+                        report.failed.append(rule.rule_id)
+                        continue
+                else:
+                    probe = _instantiate(
+                        rule, templates.get(rule.family_id), fingerprint, signatures
+                    )
+                    catalog.probes[rule.rule_id] = probe
+                    (report.compiled if probe.status == "active" else report.failed).append(
+                        rule.rule_id
+                    )
+                    continue
             # else: this IS the member being authored - fall through to the graph below.
         else:
             existing = catalog.get(rule.rule_id)

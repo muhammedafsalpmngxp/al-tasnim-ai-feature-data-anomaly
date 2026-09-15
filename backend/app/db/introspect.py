@@ -57,7 +57,7 @@ SECRET_COLUMN_MARKERS = (
 # Bumped whenever _render() changes the TEXT it emits for an unchanged database. The cache is
 # keyed on a fingerprint of the live STRUCTURE, so without this a rendering change would keep
 # serving the old cached text forever - the database has not changed, so nothing else notices.
-_RENDER_VERSION = "5-measured-text-numeric-no-wordlists"
+_RENDER_VERSION = "5-anomaly-row-counts-on-table-line"
 
 # T-SQL reserved keywords. A column whose NAME is one of these MUST be written [bracketed] or
 # the query fails to parse - and the error is misleading: SQL Server reports "Incorrect syntax
@@ -435,11 +435,29 @@ def _render(
     pks: dict[str, set[str]],
     fks: dict[str, list[str]],
     dup_keys: dict[str, str] | None = None,
+    sizes: dict[str, int] | None = None,
 ) -> str:
     dup_keys = dup_keys or {}
+    sizes = sizes or {}
     lines: list[str] = []
     for table, cols in tables.items():
-        lines.append(f"TABLE {table}")
+        # HOW MANY ROWS, on the TABLE line itself.
+        #
+        # This used to exist only in the index built for Grounding, so once Grounding named an
+        # empty table the SQL Author and the Verifier saw it in the schema block with nothing to
+        # say it held no rows - and neither could catch the mistake. A probe scoped on an empty
+        # table does not fail; it reports a clean result, which is the most misleading outcome
+        # this engine can produce.
+        #
+        # A table whose count could not be read carries no marker at all: unknown is not empty,
+        # and claiming otherwise would suppress real checks.
+        count = sizes.get(table)
+        if count == 0:
+            lines.append(f"TABLE {table}  -- EMPTY: 0 rows. Nothing can be found here.")
+        elif count:
+            lines.append(f"TABLE {table}  -- {count:,} rows")
+        else:
+            lines.append(f"TABLE {table}")
         tpk = pks.get(table, set())
         for col, dtype, maxlen, nullable in cols:
             typ = dtype + (f"({maxlen})" if maxlen and maxlen > 0 else "")
@@ -595,11 +613,21 @@ def table_signatures(cur=None) -> dict[str, str]:
     # per-table hash rather than only in the global one: hiding a table or changing the render
     # version can change what a probe may legitimately read, and a purely per-table comparison
     # would otherwise never notice.
+    # ⚠ _RENDER_VERSION IS DELIBERATELY ABSENT, for the same reason it was removed from
+    # _structure_signature: it describes how a schema is PRINTED into a prompt, and no way of
+    # printing a schema can make stored SQL wrong.
+    #
+    # Removing it from the global fingerprint alone was not enough, because THIS is the hash the
+    # per-probe staleness check actually uses. Every probe still read as stale after a
+    # presentation tweak - the same 25-minute recompile, reached through a different door - and
+    # worse, it made the answer depend on WHICH PROCESS asked: a long-running API server holds
+    # the constant it imported at startup, so a server started before an edit and a CLI run
+    # started after it computed different signatures for an unchanged database, and every probe
+    # compiled by one looked stale to the other.
     prefix = "|".join((
         "schemas=" + ",".join(sorted(settings.allowed_schemas)),
         "excluded=" + ",".join(sorted(settings.excluded_tables)),
         "excluded_cols=" + ",".join(sorted(settings.excluded_columns)),
-        "render=" + _RENDER_VERSION,
         f"db={settings.db_server}:{settings.db_port}/{settings.db_name}",
     ))
 
@@ -731,7 +759,7 @@ def build_schema_text(use_cache: bool = True) -> str:
         except Exception:  # noqa: BLE001 - fall back to counting per table
             sizes = {}
         dup_keys = _detect_duplicate_keys(cur, tables, pks, sizes)
-        text = _render(tables, pks, fks, dup_keys)
+        text = _render(tables, pks, fks, dup_keys, sizes)
         fingerprint = _live_fingerprint(cur)
     finally:
         conn.close()

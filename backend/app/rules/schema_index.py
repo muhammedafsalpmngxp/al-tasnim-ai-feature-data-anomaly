@@ -25,7 +25,13 @@ _SCHEMA_PATH = os.path.join(_CACHE_DIR, "schema.txt")
 _NUMERIC_PATH = os.path.join(_CACHE_DIR, "numeric_hints.txt")
 
 # "TABLE schema.table"
-_TABLE_RE = re.compile(r"^TABLE\s+(\S+)\s*$")
+# "TABLE schema.table", optionally followed by "  -- 21,566 rows" or "  -- EMPTY: 0 rows. ..."
+# written by introspect._render(). Anchoring to end-of-line without allowing the comment is what
+# broke this reader the last time the writer gained a field, so the trailing text is captured
+# rather than merely tolerated - a count on the TABLE line is the authority even when the table
+# has no numeric columns and therefore no entry in numeric_hints.txt at all.
+_TABLE_RE = re.compile(r"^TABLE\s+(\S+)\s*(?:--\s*(.*?))?\s*$")
+_TABLE_ROWS_RE = re.compile(r"([\d,]+)\s+rows")
 # "  - col type[(n)][ NOT NULL][ PK]" - the name may be [bracketed] when it needs quoting.
 _COLUMN_RE = re.compile(
     r"^\s+-\s+(\[[^\]]+\]|\S+)\s+([A-Za-z_]+)(?:\(([^)]*)\))?(\s+NOT NULL)?(\s+PK)?\s*$"
@@ -230,6 +236,13 @@ def _parse_schema(text: str) -> dict[str, Table]:
         m = _TABLE_RE.match(line)
         if m:
             current = Table(name=m.group(1))
+            note = m.group(2) or ""
+            rows = _TABLE_ROWS_RE.search(note)
+            if rows:
+                # The TABLE line is the authority on row count. numeric_hints.txt only lists
+                # tables that HAVE numeric columns, so a table of pure text would otherwise
+                # read as "count unknown" and escape the empty-table filter in expand.py.
+                current.row_count = int(rows.group(1).replace(",", ""))
             tables[current.name] = current
             continue
         if current is None:

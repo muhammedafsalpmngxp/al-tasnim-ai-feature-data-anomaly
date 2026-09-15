@@ -144,6 +144,49 @@ def _date_pairs(table: Table) -> list[tuple[str, str]]:
     return pairs
 
 
+# Placeholder names that hold a TABLE. Listed rather than guessed so a new feature kind that
+# introduces another table placeholder has to declare it here, instead of silently escaping the
+# empty-table filter below.
+_TABLE_PLACEHOLDERS: tuple[str, ...] = ("table", "child_table", "parent_table")
+
+
+def _drop_empty_tables(
+    features: list[Feature], index: SchemaIndex
+) -> tuple[list[Feature], list[tuple[str, str]]]:
+    """Remove features whose table holds no rows. Returns (kept, [(table, label), ...]).
+
+    A probe over an empty table cannot find anything, and - worse - it does not fail. It reports
+    a clean result, or a zero scope that then has to be explained away as a coverage gap. Either
+    way it is noise dressed as a finding, and on this database ten probes were generated against
+    one empty table alone.
+
+    Row counts are MEASURED (schema_index reads them from the introspected artefacts), so no
+    table name appears here and nothing is hardcoded: point the engine at another database and
+    whichever tables are empty there are the ones skipped.
+
+    A table with an UNKNOWN row count is kept. Unknown is not the same as empty - the table may
+    simply have been too large to profile - and skipping a check on a guess is the more
+    expensive mistake.
+    """
+    kept: list[Feature] = []
+    dropped: list[tuple[str, str]] = []
+    for feature in features:
+        empty_table = ""
+        for key in _TABLE_PLACEHOLDERS:
+            name = feature.values.get(key)
+            if not name:
+                continue
+            table = index.get(name)
+            if table is not None and table.row_count == 0:
+                empty_table = name
+                break
+        if empty_table:
+            dropped.append((empty_table, feature.label))
+        else:
+            kept.append(feature)
+    return kept, dropped
+
+
 def features_for(kind: str, index: SchemaIndex | None = None) -> list[Feature]:
     """Every place in this schema where a family rule of `kind` applies."""
     if kind not in PLACEHOLDERS:
@@ -246,6 +289,14 @@ def features_for(kind: str, index: SchemaIndex | None = None) -> list[Feature]:
                     label=f"{table.name}.{column} ({stat.text_bad}/{stat.text_total} unparseable)",
                 ))
 
+    out, empty = _drop_empty_tables(out, index)
+    if empty:
+        # Logged, never silent. A skipped feature is a check that is NOT being made, and the one
+        # thing this engine must never do is quietly narrow its own coverage.
+        log.info(
+            "expand: %-14s skipped %d feature(s) on table(s) with no rows: %s",
+            kind, len(empty), ", ".join(sorted({t for t, _ in empty})),
+        )
     log.info("expand: %-14s %3d feature(s)", kind, len(out))
     return out
 

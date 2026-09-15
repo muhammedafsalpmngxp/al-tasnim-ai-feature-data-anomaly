@@ -157,6 +157,15 @@ class Settings:
     # then rejects and is immediately overruled, which is the worst of both behaviours.
     max_sql_retries: int = field(default_factory=lambda: _get_int("MAX_SQL_RETRIES", 2))
     verify_retries: int = field(default_factory=lambda: _get_int("VERIFY_RETRIES", 1))
+    # How many members of one structural family may be sent to the SQL Author before the family
+    # is written off. More than one because each member names DIFFERENT tables and columns, so a
+    # second attempt is a genuinely different query rather than a retry of a rejected one - and
+    # a single rejected representative used to take every sibling with it (50 probes lost in one
+    # compile). Bounded, because a family this database cannot express at all must not cost one
+    # call per feature to discover that.
+    family_author_attempts: int = field(
+        default_factory=lambda: max(1, _get_int("ANOMALY_FAMILY_AUTHOR_ATTEMPTS", 3))
+    )
     max_compile_calls: int = field(
         default_factory=lambda: _get_int("ANOMALY_MAX_COMPILE_CALLS", 200)
     )

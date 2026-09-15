@@ -17,7 +17,18 @@ from __future__ import annotations
 import datetime
 import struct
 
-import pyodbc
+# pyodbc is imported INSIDE the functions that connect, not at module scope - the same rule the
+# report builders already follow for python-docx and openpyxl.
+#
+# It is a compiled extension needing a wheel for the exact Python version, and importing it here
+# made it a hard requirement for importing app.db.introspect - which also holds pure functions
+# (missing_tables, probe_fingerprint, the fingerprint helpers) that touch no database at all.
+# The effect was that a self-check exercising those functions could not run without a database
+# driver installed, so it was reported as a FAILURE in any environment lacking one. A test that
+# cannot run is a test nobody trusts.
+#
+# Everything that genuinely needs the driver still fails immediately and with a clear message
+# the first time it is called.
 
 from app.config import settings
 from app.observability import get_logger
@@ -54,6 +65,8 @@ _DRIVER_CANDIDATES = [
 
 
 def _pick_driver() -> str:
+    import pyodbc
+
     if settings.db_driver:
         return settings.db_driver
     installed = {d.strip() for d in pyodbc.drivers()}
@@ -94,6 +107,8 @@ def get_connection(timeout: int | None = None, read_uncommitted: bool | None = N
     Converters are registered per-connection (not via module-level pyodbc.add_output_converter)
     because every call opens a brand-new connection - there is no pool to configure once.
     """
+    import pyodbc
+
     secs = settings.query_timeout if timeout is None else timeout
     conn = pyodbc.connect(_connection_string(), autocommit=True, timeout=secs)
     conn.timeout = secs

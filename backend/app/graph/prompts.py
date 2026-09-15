@@ -200,6 +200,20 @@ Decide:
 4. `notes` - one or two sentences telling the SQL author how this rule's business language maps
    onto those tables, especially where the wording and the naming differ.
 
+⚠ ROW COUNTS. The index states how many rows each table holds, and marks the empty ones.
+
+- NEVER name an EMPTY table as the rule's scope source. A probe scoped on an empty table does
+  not fail - it reports a clean result, which is the most misleading outcome possible, or a
+  zero scope that has to be explained away afterwards.
+- Where two tables have near-identical names and similar columns, name the POPULATED one. A
+  database routinely keeps an abandoned or not-yet-loaded copy beside the real table, and the
+  names give no hint which is which. The row count does.
+- Name an empty table only when the rule is specifically ABOUT that table being empty, and say
+  so in `notes`.
+- If every table that could express this rule is empty, that is `applicable: false` - name the
+  empty table in `reason`. A coverage gap reported honestly is worth far more than a probe that
+  reports nothing and looks healthy.
+
 Respond with ONLY this JSON, no prose and no markdown:
 {"tables": ["schema.table", ...], "applicable": true|false, "reason": "", "notes": ""}
 """.strip()
@@ -228,7 +242,12 @@ Think silently through this checklist, then write the queries:
      one exists you must aggregate or de-duplicate, or each entity is counted several times and
      anomaly_count will exceed scope_total, which is an impossible result.
   4) SCALE - check the measured hints for every number you compare.
-  5) CONTRACT - confirm both queries carry every required alias before you finish.
+  5) SCOPE SIZE - the SCHEMA block states how many rows each table holds and marks the EMPTY
+     ones. Never drive a scope from a table marked EMPTY: the probe will not fail, it will
+     report a clean result. Where two tables have near-identical names, read the counts and use
+     the populated one. This check is yours to make even when the tables were chosen for you -
+     a grounding mistake reaches the database unless you catch it here.
+  6) CONTRACT - confirm both queries carry every required alias before you finish.
 
 {PROBE_CONTRACT}
 
@@ -272,8 +291,22 @@ decision, or wait.
   correctly, is an approval.
 - FEW OR ZERO ANOMALIES IS NOT A DEFECT. A probe that runs correctly and finds nothing wrong is
   a probe doing its job. Reject the QUERY, never the data.
-  The ONE exception: scope_total = 0 means nothing was EXAMINED, which is a broken probe - a
-  join on the wrong column, or a filter matching no value that exists. That is always a defect.
+  The ONE exception: scope_total = 0 means nothing was EXAMINED. That is never a clean result -
+  but it has TWO causes, and they need OPPOSITE verdicts. Decide which one you are looking at:
+
+  (a) THE TABLE IS EMPTY. The SCHEMA block states each table's row count and marks the empty
+      ones. If the probe's scope table holds no rows, no query could have examined anything,
+      and no rewrite will change that. Answer NOT APPLICABLE and name the empty table in the
+      reason. This is a coverage gap for the report and a job for whoever loads that table -
+      it is not a defect in the SQL, and rejecting it only burns rewrites on an unfixable
+      problem.
+
+  (b) THE TABLE HAS ROWS BUT THE PREDICATE MATCHES NONE. A join on the wrong column, a filter
+      on a value that does not exist, a scope condition that contradicts itself. That IS a
+      defect in the SQL. REJECT, and say concretely which join or filter to change.
+
+  Read the row counts before deciding. Answering (b) when the truth is (a) sends the author to
+  rewrite a query that was already correct.
 
 WHAT TO CHECK, using the schema and hints you are given - do not guess:
 1. EXISTENCE - every table and column referenced is in the SCHEMA block. Never name one that

@@ -23,21 +23,57 @@ function Sev({ value }: { value: string }) {
 // Both operations stream. A compile can take twenty minutes and a run several minutes, and a
 // button that simply goes grey for that long is indistinguishable from one that has crashed.
 
+// Elapsed seconds since `since`, ticking once a second. Returns 0 when nothing is running.
+//
+// A compile takes tens of minutes. Without a clock the only evidence it is alive is a line of
+// text that changes every ~20 seconds, which is not distinguishable from a hang for long enough
+// that people kill the job - and killing it loses the whole run.
+function useElapsed(since: number | null): number {
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (since === null) return
+    const id = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [since])
+  return since === null ? 0 : Math.max(0, Math.floor((now - since) / 1000))
+}
+
+function formatDuration(seconds: number): string {
+  if (seconds < 60) return `${seconds}s`
+  const m = Math.floor(seconds / 60)
+  const s = seconds % 60
+  if (m < 60) return `${m}m ${String(s).padStart(2, '0')}s`
+  return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`
+}
+
 function Actions({ onDone, busy }: { onDone: () => void; busy: boolean }) {
   const [active, setActive] = useState<'' | 'compile' | 'run'>('')
   const [progress, setProgress] = useState('')
   const [error, setError] = useState('')
+  // done/total drive the bar; startedAt drives the clock. Kept as numbers rather than parsed
+  // back out of the label, so the bar cannot disagree with the text beside it.
+  const [done, setDone] = useState(0)
+  const [total, setTotal] = useState(0)
+  const [startedAt, setStartedAt] = useState<number | null>(null)
+  const elapsed = useElapsed(startedAt)
 
   const go = (job: 'compile' | 'run', path: string) => {
     setActive(job)
     setError('')
     setProgress('starting…')
+    setDone(0)
+    setTotal(0)
+    setStartedAt(Date.now())
     stream(path, {
       onProgress: (d) => {
+        const at = Number(job === 'compile' ? d.done : d.step) || 0
+        const of = Number(d.total) || 0
+        setDone(at)
+        setTotal(of)
         if (job === 'compile') {
-          setProgress(`${d.done} of ${d.total}${d.rule_id ? ` — ${d.rule_id}` : ''}`)
+          setProgress(`${at} of ${of}${d.rule_id ? ` — ${d.rule_id}` : ''}`)
         } else {
-          setProgress(`stage ${d.step} of ${d.total}${d.stage ? ` — ${d.stage}` : ''}`)
+          setProgress(`stage ${at} of ${of}${d.stage ? ` — ${d.stage}` : ''}`)
         }
       },
       onResult: (d) => {
@@ -60,23 +96,68 @@ function Actions({ onDone, busy }: { onDone: () => void; busy: boolean }) {
       onError: setError,
       onEnd: () => {
         setActive('')
+        setStartedAt(null)
         onDone()
       },
     })
   }
 
   const disabled = !!active || busy
+  const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0
+  // Projected from the rate actually observed, not from an assumed cost per rule: rules differ
+  // enormously (a cloned family member costs no model call at all), so a fixed estimate would
+  // be wrong in both directions. Shown only once there is enough evidence to mean anything.
+  const remaining =
+    active === 'compile' && done >= 3 && total > done && elapsed > 0
+      ? Math.round((elapsed / done) * (total - done))
+      : 0
+
   return (
     <div className="actions">
-      <button disabled={disabled} onClick={() => go('run', '/api/run')}>
-        {active === 'run' ? 'Running…' : 'Run detection'}
-      </button>
-      <button className="secondary" disabled={disabled} onClick={() => go('compile', '/api/compile')}>
-        {active === 'compile' ? 'Compiling…' : 'Compile rules'}
-      </button>
-      {progress && <span className="muted">{progress}</span>}
-      {busy && !active && <span className="muted">another operation is in progress</span>}
-      {error && <span className="error">{error}</span>}
+      <div className="actions-row">
+        <button disabled={disabled} onClick={() => go('run', '/api/run')}>
+          {active === 'run' ? 'Running…' : 'Run detection'}
+        </button>
+        <button
+          className="secondary"
+          disabled={disabled}
+          onClick={() => go('compile', '/api/compile')}
+        >
+          {active === 'compile' ? 'Compiling…' : 'Compile rules'}
+        </button>
+        {busy && !active && <span className="muted">another operation is in progress</span>}
+        {error && <span className="error">{error}</span>}
+      </div>
+
+      {active && (
+        <div className="job" role="status" aria-live="polite">
+          <div
+            className="job-bar"
+            role="progressbar"
+            aria-valuenow={pct}
+            aria-valuemin={0}
+            aria-valuemax={100}
+          >
+            {/* Indeterminate until the first progress event: a bar sitting at 0% for twenty
+                seconds reads as stuck, which is the impression this whole element exists to
+                avoid. */}
+            <div
+              className={total > 0 ? 'job-fill' : 'job-fill indeterminate'}
+              style={total > 0 ? { width: `${pct}%` } : undefined}
+            />
+          </div>
+          <div className="job-line">
+            <span>
+              {total > 0 && <strong>{pct}%</strong>} {progress}
+            </span>
+            <span className="muted">
+              {formatDuration(elapsed)} elapsed
+              {remaining > 0 && ` · about ${formatDuration(remaining)} left`}
+            </span>
+          </div>
+        </div>
+      )}
+      {!active && progress && <span className="muted">{progress}</span>}
     </div>
   )
 }

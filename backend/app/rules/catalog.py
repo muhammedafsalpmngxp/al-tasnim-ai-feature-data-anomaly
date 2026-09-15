@@ -211,11 +211,38 @@ def is_stale(
     return False, ""
 
 
+def runnable_reason(probe: CompiledProbe, rule: AnomalyRule | None) -> str:
+    """"" when this probe may run, otherwise WHY it may not - in words for the report.
+
+    TWO STATUSES DECIDE THIS, NOT ONE. The probe's own status says whether its SQL compiled;
+    the RULE's status says whether the business still wants the check. Only the first was ever
+    consulted, so turning a rule off in the markdown did nothing at all: DQ-D01 and DQ-D02 were
+    marked `disabled` precisely because they double-report with a structural family, and both
+    still ran - inflating the flagged-record count and the score with duplicates.
+
+    That is the worst failure this tool can have. A data-quality report is worth exactly what
+    its numbers are worth, and a check the operator believes is off must actually be off.
+
+    Returning a REASON rather than a boolean is deliberate: a check that is not running has to
+    appear in the report saying why, or the document overstates its own coverage.
+    """
+    if rule is not None and not rule.runnable:
+        return f"the rule is {rule.status} in the rule file"
+    if probe.status != "active":
+        return probe.error or f"the probe is {probe.status}"
+    return ""
+
+
 def prune_removed(catalog: Catalog, rule_ids: set[str]) -> list[str]:
     """Drop probes whose rule no longer exists, returning what was removed.
 
     A rule deleted from the markdown, or a generic probe whose schema feature is gone, must not
     keep running: it would report findings against a definition nobody can look up any more.
+
+    ⚠ Pass the ids of rules that are RUNNABLE, not every id the file mentions. A rule switched
+    to `disabled` or `draft` still has an id, so passing all of them keeps its compiled probe in
+    the catalog for ever - and `runnable_reason` above then has to keep catching it on every
+    single run.
     """
     gone = [rule_id for rule_id in catalog.probes if rule_id not in rule_ids]
     for rule_id in gone:
