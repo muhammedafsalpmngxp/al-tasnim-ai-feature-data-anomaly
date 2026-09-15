@@ -337,7 +337,16 @@ def build(state, path: str | None = None) -> str:
             )
             for item in gaps:
                 rule_id, title = (item if isinstance(item, (list, tuple)) else (item, ""))[:2]
-                doc.add_paragraph(f"{rule_id} - {title}", style="List Bullet")
+                # The scorer reports gaps as bare ids. An id alone tells a business reader
+                # nothing about WHAT went unchecked, which is the entire point of this
+                # section, so the title is recovered from the rules the report already holds.
+                if not title:
+                    rule = rules.get(rule_id)
+                    title = getattr(rule, "title", "") if rule else ""
+                p = doc.add_paragraph(style="List Bullet")
+                p.add_run(rule_id).bold = True
+                if title:
+                    p.add_run(f" - {title}")
         if failed:
             doc.add_heading("Failed while running", level=2)
             for result in failed:

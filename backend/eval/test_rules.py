@@ -359,6 +359,100 @@ def test_schema_block_states_row_counts() -> None:
           "'the predicate matches nothing' (reject), or it burns rewrites on unfixable probes")
 
 
+def test_family_clones_must_prove_they_execute() -> None:
+    """A cloned probe is never stored active on the strength of textual substitution alone.
+
+    THE INCIDENT: a foreign-key template selected the child entity key and the child foreign
+    key separately. On one of thirty-six features they were the same column, so the clone
+    selected it twice and SQL Server rejected the statement. Both static guards passed - no
+    unfilled token, no foreign column - and the probe was filed `active`. It failed in an
+    unattended run instead, as an ODBC error nobody could attribute to a rule.
+
+    The executor's docstring already states the principle for authored probes: a query that is
+    never executed is never checked. Clones are the majority of the catalog, so they are where
+    it matters most.
+    """
+    import ast
+
+    path = os.path.join(_APP, "compiler.py")
+    source = open(path, encoding="utf-8").read()
+    tree = ast.parse(source)
+
+    check(
+        any(isinstance(n, ast.FunctionDef) and n.name == "_smoke_test" for n in ast.walk(tree)),
+        "compiler._smoke_test is gone - nothing executes a cloned query before storing it",
+    )
+
+    body = next(
+        (ast.get_source_segment(source, n) for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "compile_rules"),
+        "",
+    )
+    check(
+        "_smoke_test(probe)" in body,
+        "the clone path never calls _smoke_test, so a query that cannot run is stored active "
+        "and fails later in an unattended run",
+    )
+    check(
+        body.index("_smoke_test(probe)") < body.index(
+            'report.compiled if probe.status == "active"'
+        ),
+        "the smoke test must run BEFORE the probe's status decides where it is recorded, or a "
+        "clone that cannot execute is still counted as compiled",
+    )
+
+
+def test_every_reader_of_schema_txt_survives_a_comment_on_the_table_line() -> None:
+    """Whatever _render() writes after a table name, every reader must still see the table.
+
+    THE INCIDENT: adding "  -- 10,302 rows" to the TABLE line broke context.split_blocks(),
+    whose pattern was anchored to end-of-line. Nothing raised. The pruner simply saw 5 tables
+    instead of 75, fell under ANOMALY_SCHEMA_PRUNE_ABOVE_TABLES, and returned the FULL schema
+    on every author and verifier call - roughly 18,000 tokens each, for a whole compile.
+
+    A silent loss of an optimisation is worse than a crash: the run still succeeds, the report
+    is still right, and the only symptom is the bill. So this asserts the two readers agree
+    with each other on REAL rendered text, not on a regex spelling.
+    """
+    from app.graph import context
+    from app.rules import schema_index
+
+    rendered = (
+        "TABLE dbo.plain\n"
+        "  - id  int NOT NULL  PK\n"
+        "\n"
+        "TABLE dbo.counted  -- 10,302 rows\n"
+        "  - id  int NOT NULL  PK\n"
+        "\n"
+        "TABLE dbo.blank  -- EMPTY: 0 rows. Nothing can be found here.\n"
+        "  - id  int NOT NULL  PK\n"
+    )
+    expected = {"dbo.plain", "dbo.counted", "dbo.blank"}
+
+    blocks = set(context.split_blocks(rendered))
+    check(
+        blocks == expected,
+        f"context.split_blocks() lost tables to the comment on the TABLE line: got {sorted(blocks)}",
+    )
+
+    indexed = set(schema_index.load_index(rendered, "").tables)
+    check(
+        indexed == expected,
+        f"schema_index.load_index() lost tables to the comment: got {sorted(indexed)}",
+    )
+    check(
+        blocks == indexed,
+        "the pruner and the schema index disagree about which tables exist - one of them is "
+        "reading a form of the TABLE line the other does not write",
+    )
+
+    listed = context.table_index(rendered).splitlines()
+    check(
+        len(listed) == len(expected),
+        f"the grounding index dropped tables: {len(listed)} line(s) for {len(expected)} tables",
+    )
+
+
 def test_family_retries_another_member_before_giving_up() -> None:
     """One rejected representative must not write off its whole family.
 
@@ -985,6 +1079,11 @@ def main() -> int:
         ("pruning uses runnable ids only", test_pruning_uses_runnable_ids_only),
         ("expansion skips empty tables", test_expansion_skips_empty_tables),
         ("schema block states row counts", test_schema_block_states_row_counts),
+        ("family clones must prove they execute", test_family_clones_must_prove_they_execute),
+        (
+            "every schema.txt reader survives a comment on the TABLE line",
+            test_every_reader_of_schema_txt_survives_a_comment_on_the_table_line,
+        ),
         ("family retries another member", test_family_retries_another_member_before_giving_up),
         ("compile progress is reportable", test_compile_progress_is_reportable),
         ("numeric hints round-trip", test_numeric_hints_round_trip),

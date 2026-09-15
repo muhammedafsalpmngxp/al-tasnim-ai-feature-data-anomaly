@@ -34,7 +34,14 @@ from app.observability import get_logger
 log = get_logger()
 
 # "TABLE schema.table" - the block delimiter in schema.txt (see introspect._render()).
-_TABLE_RE = re.compile(r"^TABLE\s+(\S+)\s*$", re.MULTILINE)
+#
+# THE TRAILING ANYTHING IS LOAD-BEARING. introspect._render() appends a comment to this line
+# ("TABLE dbo.foo  -- 10,302 rows"), and an end-anchored pattern silently stopped matching it.
+# Nothing failed: split_blocks() simply returned the handful of tables whose row count was
+# unknown, len(blocks) fell under the prune threshold, and prune_schema() returned the FULL
+# schema on every author and verifier call. A prune that quietly stops pruning costs money on
+# every call and is invisible in every log, so this regex must tolerate anything after the name.
+_TABLE_RE = re.compile(r"^TABLE\s+(\S+)[^\n]*$", re.MULTILINE)
 # "  FK: child_col -> schema.table.parent_col"
 _FK_RE = re.compile(r"^\s+FK:\s+\S+\s*->\s*(\S+)\.\w+\s*$", re.MULTILINE)
 # A value-hints line: "- schema.table (col, col): value; value"

@@ -244,6 +244,37 @@ def _instantiate(
     )
 
 
+def _smoke_test(probe: CompiledProbe) -> str:
+    """Run a cloned probe's two queries once. Returns the database's complaint, or "".
+
+    WHY A CLONE STILL HAS TO TOUCH THE DATABASE. The executor's own contract says it: a query
+    that is never executed is never checked. Authored probes are executed during compilation
+    for exactly that reason - and family clones, which are the overwhelming majority of the
+    catalog, were the one path that skipped it.
+
+    THE INCIDENT: a foreign-key template selected the child's entity key and the child's
+    foreign key as two separate columns. On thirty-five features those were two different
+    columns. On the thirty-sixth they were the SAME column, so the substituted query selected
+    it twice, and SQL Server rejected the whole statement. The static guards could not see it:
+    no token was left unfilled, and no foreign column was named. It was stored `active`, and
+    surfaced weeks later as a cryptic ODBC error in an unattended run - the precise failure
+    mode this engine exists to prevent.
+
+    This costs no model call. It is one aggregate and one capped sample against a read-only
+    connection, which is what the probe would do on its next run anyway. A clone that cannot
+    execute is recorded as FAILED, with the database's own message, and appears in the report
+    as a check that is not running rather than as a check that silently found nothing.
+    """
+    from app.graph.nodes.executor import executor_node
+
+    result = executor_node({
+        "rule_id": probe.rule_id,
+        "summary_sql": probe.summary_sql,
+        "detail_sql": probe.detail_sql,
+    })
+    return str(result.get("exec_error") or "")
+
+
 def _failed_probe(rule: AnomalyRule, fingerprint: str, error: str) -> CompiledProbe:
     """Record a rule that never reached the graph, so it is still visible as not running."""
     return CompiledProbe(
@@ -468,6 +499,16 @@ def compile_rules(
                     probe = _instantiate(
                         rule, templates.get(rule.family_id), fingerprint, signatures
                     )
+                    # Substitution being textually clean does not make the result valid SQL.
+                    # See _smoke_test: the clone proves it runs, or it is not stored active.
+                    if probe.status == "active":
+                        exec_error = _smoke_test(probe)
+                        if exec_error:
+                            probe = _failed_probe(
+                                rule, fingerprint,
+                                "the family's query does not run against this feature - the "
+                                f"database reported: {exec_error}",
+                            )
                     catalog.probes[rule.rule_id] = probe
                     (report.compiled if probe.status == "active" else report.failed).append(
                         rule.rule_id
