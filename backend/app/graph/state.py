@@ -29,6 +29,7 @@ class CompileState(TypedDict, total=False):
     title: str
     body: str                     # the prose: what is wrong / why / how to detect / do NOT flag
     category: str
+    tags: tuple[str, ...]           # the rule's own topic labels
     severity: str
     entity: str
     method: str                   # rule | statistical | rollup

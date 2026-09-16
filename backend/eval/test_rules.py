@@ -359,6 +359,85 @@ def test_schema_block_states_row_counts() -> None:
           "'the predicate matches nothing' (reject), or it burns rewrites on unfixable probes")
 
 
+def test_reference_prune_never_starves_a_rule() -> None:
+    """Cutting the reference material must not remove what a rule is ABOUT.
+
+    business_rules.md is cut per rule, because a rule about milestone dates does not need the
+    task-to-work-breakdown mapping. That saving is only legitimate while three things hold, and
+    all three have already been got wrong once:
+
+      1. A SECTION NAMING ONE OF THE RULE'S OWN TAGS IS ALWAYS KEPT. Word-frequency overlap is
+         diluted by long prose: when the weightage rollup rule was rewritten into plain business
+         language its overlap with the section DEFINING weightage fell to 3%, and that section
+         would have been dropped from the one rule that cannot be written without it.
+      2. THE AUTHOR AND THE VERIFIER SEE THE SAME TEXT. The reviewer judges the SQL against the
+         rules; showing it a definition the author never saw makes it reject correct work.
+      3. A WORKED EXAMPLE IS CUT ONLY WHERE few_shots.md ITSELF SAYS IT MAY BE. That file is
+         never scored: scoring it against business language dropped "Scope is what you EXAMINED"
+         for 55 of 60 rules, because it teaches probe craft in the engine's vocabulary while the
+         rules are written in the business's. Each example declares `applies:` instead, and a
+         universal one must survive even the emptiest condition set.
+    """
+    from app.graph import prompts
+    from app.graph.context import prune_reference, split_sections
+    from app.rules.loader import load_rules
+
+    rules, _errors = load_rules()
+    check(bool(rules), "no rules to check the prune against")
+
+    big = [
+        (h, b) for h, b in split_sections(prompts.BUSINESS_RULES)
+        if h and len(b) > settings_keep_below()
+    ]
+    check(bool(big), "no prunable sections - the prune cannot be exercised by this test")
+
+    for rule in rules:
+        text = " ".join([rule.title, rule.category, rule.entity, rule.method, rule.body])
+        tags = tuple(rule.tags or ())
+        pruned = prune_reference(prompts.BUSINESS_RULES, text, tags, "test")
+
+        # (1) every section naming one of this rule's declared tags survives
+        for heading, body in big:
+            named = any(
+                tag.strip().lower() in (heading + "\n" + body).lower()
+                for tag in tags if len(tag.strip()) > 2
+            )
+            if named:
+                check(
+                    body in pruned,
+                    f"{rule.rule_id} declares tag(s) {tags} and the section '{heading[:40]}' "
+                    f"names one of them, but the prune dropped it",
+                )
+
+        # (2) the reviewer reads exactly what the author read
+        check(
+            prompts.author_system(text, tags).count(pruned.strip()[:400])
+            == prompts.verifier_system(text, tags).count(pruned.strip()[:400])
+            == 1,
+            f"{rule.rule_id}: the author and the verifier are shown different business rules",
+        )
+
+        # (3) a worked example is cut only where the FILE says it may be, and a universal one
+        #     survives even the emptiest possible condition set
+        minimal = prompts.author_system(text, tags, {"always"})
+        for heading, body in split_sections(prompts.FEW_SHOTS):
+            if not heading:
+                continue
+            declared = re.search(r"^\s*[-*]\s*applies\s*:\s*(\S+)", body, re.I | re.M)
+            if declared is None or declared.group(1).strip().lower() == "always":
+                check(
+                    body.strip()[:200] in minimal,
+                    f"{rule.rule_id}: the worked example '{heading[:45]}' is universal "
+                    f"(applies: always, or undeclared) but was cut anyway",
+                )
+
+
+def settings_keep_below() -> int:
+    from app.config import settings
+
+    return settings.reference_keep_below
+
+
 def test_family_clones_must_prove_they_execute() -> None:
     """A cloned probe is never stored active on the strength of textual substitution alone.
 
@@ -618,12 +697,16 @@ def test_numeric_hints_round_trip() -> None:
 # ── 2. Rule parsing ────────────────────────────────────────────────────────────
 
 def test_rules_parse() -> None:
-    from app.rules.loader import load_patterns, load_rules
+    from app.graph.prompts import PROBE_PATTERNS
+    from app.rules.loader import load_rules
 
     rules, errors = load_rules()
     check(not errors, "domain rule files failed to parse: " + "; ".join(errors))
     check(bool(rules), "no rules were parsed from domain/data_anomalies.md")
-    check(bool(load_patterns()), "domain/data_anomalies.md has no ## PATTERNS section")
+    # The probe shapes moved out of the markdown and into prompts.py, so that the file a
+    # business owner edits holds business language only. Assert they still reach the author.
+    check(bool(PROBE_PATTERNS.strip()), "PROBE_PATTERNS is empty - the SQL Author is shown "
+          "no probe shape at all")
 
     ids = [r.rule_id for r in rules]
     check(len(ids) == len(set(ids)), f"duplicate rule ids: {ids}")
@@ -939,8 +1022,8 @@ def test_no_rule_carries_sql() -> None:
     against the schema as it stood the day it was written - exactly the guarantee that decays,
     and the reason the structural templates were retired.
 
-    The ## PATTERNS section is deliberately exempt: it holds worked SHAPES shown to the author,
-    names no table or column, and is not a rule.
+    The probe SHAPES are exempt and no longer live here at all: they are in prompts.py as
+    PROBE_PATTERNS, name no table or column, and are not rules.
     """
     from app.rules.loader import load_rules
 
@@ -1080,6 +1163,7 @@ def main() -> int:
         ("expansion skips empty tables", test_expansion_skips_empty_tables),
         ("schema block states row counts", test_schema_block_states_row_counts),
         ("family clones must prove they execute", test_family_clones_must_prove_they_execute),
+        ("reference prune never starves a rule", test_reference_prune_never_starves_a_rule),
         (
             "every schema.txt reader survives a comment on the TABLE line",
             test_every_reader_of_schema_txt_survives_a_comment_on_the_table_line,

@@ -54,6 +54,57 @@ def _with_limits(text: str) -> str:
 BUSINESS_RULES = _load_domain_file("business_rules.md")
 FEW_SHOTS = _load_domain_file("few_shots.md")
 
+# The slot the business rules occupy in the two large prompts, so the same prompt can be built
+# either whole or with the reference material cut down to one rule. A sentinel rather than an
+# f-string field because these prompts are also assembled at import time, when there is no rule.
+_BR_SLOT = "<<<BUSINESS_RULES>>>"
+_FS_SLOT = "<<<FEW_SHOTS>>>"
+
+
+def _for_rule(
+    template: str,
+    rule_text: str,
+    tags: tuple[str, ...],
+    conditions: set[str] | None = None,
+) -> str:
+    """Fill the two reference slots with only what this rule needs.
+
+    TWO FILES, TWO INSTRUMENTS, BECAUSE THEY HOLD DIFFERENT KINDS OF THING.
+
+    Cutting both the same way looks obvious and is wrong; the measurement said so before this
+    shipped:
+
+      * business_rules.md states DOMAIN FACTS - a deadline, a mapping chain, a weighting. Each
+        fact belongs to a topic, so a rule about milestone dates provably does not need the
+        task-to-work-breakdown mapping. Topical selection is exactly right here, and it removes
+        about a sixth of the file per rule with no rule losing a section it needs.
+
+      * few_shots.md teaches PROBE CRAFT - what a scope is, why a threshold may not be invented,
+        how to prove a finding in the row. These are written in the engine's vocabulary rather
+        than the business's, so scoring them the same way dropped "Scope is what you EXAMINED,
+        not what you flagged" for 55 of 60 rules and "A threshold must come from the data" for
+        55 - the two lessons that prevent the most common and the most expensive failures this
+        engine has.
+
+        So that file is not scored at all. Each example DECLARES when it applies (`applies:`
+        under its heading) and `conditions` says which of those hold for this rule, decided from
+        the schema and hints the author is about to read. A declaration cannot drift the way a
+        word-frequency match did.
+
+    A saving that removes the lesson a rule was about to need is not a saving.
+    """
+    from app.graph.context import prune_examples, prune_reference
+
+    out = template.replace(
+        _BR_SLOT, prune_reference(BUSINESS_RULES, rule_text, tags, "business_rules")
+    )
+    # No conditions supplied means the caller cannot know them - the verifier, which does not
+    # write SQL and is never shown the examples at all. Sending them whole is the safe default.
+    out = out.replace(
+        _FS_SLOT, prune_examples(FEW_SHOTS, conditions) if conditions else FEW_SHOTS
+    )
+    return _with_limits(out)
+
 
 # ── The probe contract ─────────────────────────────────────────────────────────
 # Mirrored by app/rules/contract.py. Change one and you must change the other.
@@ -95,6 +146,119 @@ BOTH:
   - no {{placeholders}} left: the query is stored ready to run
   - SUMMARY and DETAIL must apply the SAME condition at the SAME grain. They are compared
     against each other after execution, and a disagreement is reported as a defect.
+""".strip()
+
+
+# ── Probe shapes ───────────────────────────────────────────────────────────────
+#
+# WHY THESE LIVE IN PYTHON AND NOT IN domain/data_anomalies.md.
+#
+# They were in the markdown, on the reasoning that SQL belongs in domain/. That was the wrong
+# line to draw. data_anomalies.md is written and edited by people who describe the BUSINESS
+# problem - it is the one file a non-technical owner is expected to open - and a hundred lines
+# of T-SQL at the top of it is both intimidating and, worse, editable by someone with no way to
+# know that changing it silently degrades every probe the engine writes.
+#
+# These shapes are also not domain knowledge. They are a property of THIS ENGINE's contract:
+# every probe is a summary/detail pair with fixed aliases, which is enforced by
+# app/rules/contract.py. They change when the engine changes, never when the business changes.
+#
+# NOT ONE TABLE OR COLUMN NAME APPEARS HERE, and none ever may. Every identifier is a
+# <placeholder> the author fills from the SCHEMA block. That is what keeps this file portable
+# to a different database - the same property the rest of the engine maintains.
+
+PROBE_PATTERNS = """
+Shapes to follow. These are structural templates, NOT a schema reference: the SCHEMA block is
+the only authority on what tables and columns exist.
+
+PATTERN A - the contract. Every probe is a pair. SUMMARY returns exactly one row and is always
+cheap; DETAIL returns the offending records and runs only when SUMMARY reports a non-zero count.
+
+    -- SUMMARY: aggregate over the SCOPE, never over the anomalies. Filtering down to the
+    -- anomalies first makes scope_total equal anomaly_count and the percentage meaningless.
+    WITH scoped AS (
+        SELECT <entity key>,
+               CASE WHEN <the anomalous condition> THEN 1 ELSE 0 END AS is_anomaly,
+               <a numeric measure of how bad it is>                  AS sev
+        FROM <table>
+        WHERE <what puts a record IN SCOPE - not what makes it anomalous>
+    )
+    SELECT '<RULE-ID>'                                                 AS rule_id,
+           COUNT(*)                                                    AS scope_total,
+           SUM(is_anomaly)                                             AS anomaly_count,
+           CAST(100.0 * SUM(is_anomaly) / NULLIF(COUNT(*),0) AS decimal(9,4)) AS anomaly_pct,
+           MAX(CASE WHEN is_anomaly = 1 THEN sev END)                  AS worst_severity_val
+    FROM scoped;
+
+DETAIL must return entity_key, entity_label, severity_value, at least one evidence_* column
+proving the finding, and explain_text, ordered severity_value DESC. Never add TOP - the
+executor caps it, and a hand-added limit makes the count and the rows disagree.
+
+PATTERN B - statistical, self-calibrating. Both tails, with a minimum-sample guard, because
+declaring an outlier on six observations is noise.
+
+    WITH observed AS (
+        SELECT <key>, CAST(<measure> AS float) AS measure
+        FROM <table> WHERE <measure> IS NOT NULL
+    ),
+    stats AS (
+        SELECT AVG(measure) AS mean_val, STDEV(measure) AS sd_val, COUNT(*) AS n_obs
+        FROM observed
+    )
+    SELECT o.*, ABS(o.measure - s.mean_val) AS deviation
+    FROM observed o CROSS JOIN stats s
+    WHERE s.n_obs >= <minimum sample> AND s.sd_val > 0
+      AND ABS(o.measure - s.mean_val) > <multiple derived from the data> * s.sd_val;
+
+PATTERN C - parent/child rollup.
+
+    WITH rolled AS (
+        SELECT <parent key>,
+               COUNT(*)                                              AS children,
+               SUM(CASE WHEN <child complete> THEN 1 ELSE 0 END)     AS children_done,
+               SUM(<weight> * <progress>) / NULLIF(SUM(<weight>), 0) AS computed_progress
+        FROM <child table> GROUP BY <parent key>
+    )
+    SELECT r.*, p.<stored progress>, ABS(r.computed_progress - p.<stored progress>) AS gap
+    FROM rolled r JOIN <parent table> p ON p.<key> = r.<parent key>;
+
+Read the scale in the NUMERIC HINTS block before comparing two progress figures. One side may be a 0-1
+fraction and the other a 0-100 percentage, and the comparison is meaningless until they match.
+""".strip()
+
+
+# ── How an anomaly description is to be read ───────────────────────────────────
+#
+# This was the "How this file works" preamble at the top of data_anomalies.md, shown to the
+# model on every call as part of nothing in particular. It is instruction to the AGENT, not
+# content for the business owner, so it belongs here - where it is version-controlled with the
+# code that depends on it and cannot be edited away by someone adding a rule.
+
+ANOMALY_FILE_CONTRACT = """
+HOW TO READ THE ANOMALY DESCRIPTION.
+
+Each anomaly is stated in business language, on purpose. It says WHAT is wrong and WHY it
+matters; it does not say which tables or columns to use, and it must not be expected to. You
+resolve the business terms against the SCHEMA block, the measured hints and the BUSINESS RULES.
+
+  - "What is wrong" is the condition to detect.
+  - "Why it matters" is the consequence. Use it to judge what evidence a reader needs.
+  - "How to detect" is the logic in words - which business concepts to compare, and how.
+  - "Do NOT flag" is the exclusion list. Treat it as binding: it exists because that case is
+    either legitimate, or already reported by a different check, and reporting one record under
+    two checks inflates every total in the report.
+
+A value stated in the anomaly's own metadata - a deadline in days, a placeholder date, a
+minimum sample - is STATED BY THE BUSINESS, not invented, and you may use it as a literal.
+A constant with no stated source is an invention and will be rejected.
+
+Where the anomaly says the threshold must be self-calibrating, derive it from the data itself
+(AVG, STDEV, PERCENTILE_CONT over the observed population). Never substitute a number of your
+own choosing, however reasonable it looks.
+
+If the description depends on a business definition that the BUSINESS RULES do not state, do
+NOT guess it. Say the rule cannot be written and why. A check that runs and measures the wrong
+thing is worse than one that visibly does not run.
 """.strip()
 
 
@@ -221,7 +385,7 @@ Respond with ONLY this JSON, no prose and no markdown:
 
 # ── SQL Author ─────────────────────────────────────────────────────────────────
 
-ANOMALY_SQL_AUTHOR_SYSTEM = f"""
+ANOMALY_SQL_AUTHOR_TEMPLATE = f"""
 {PLATFORM_PREAMBLE}
 
 ROLE: You are the Anomaly SQL Author - an expert Microsoft SQL Server developer who turns a
@@ -255,9 +419,9 @@ Think silently through this checklist, then write the queries:
 
 {MEASUREMENT_RULES}
 
-{BUSINESS_RULES}
+{_BR_SLOT}
 
-{FEW_SHOTS}
+{_FS_SLOT}
 
 OUTPUT FORMAT - exactly two fenced blocks, tagged, in this order, and nothing else:
 
@@ -269,7 +433,26 @@ OUTPUT FORMAT - exactly two fenced blocks, tagged, in this order, and nothing el
 -- the offending records, worst first
 ```
 """.strip()
-ANOMALY_SQL_AUTHOR_SYSTEM = _with_limits(ANOMALY_SQL_AUTHOR_SYSTEM)
+# The unpruned prompt: what an author is shown when reference pruning is switched off, and
+# what the self-checks assert against.
+ANOMALY_SQL_AUTHOR_SYSTEM = _with_limits(
+    ANOMALY_SQL_AUTHOR_TEMPLATE.replace(_BR_SLOT, BUSINESS_RULES).replace(
+        _FS_SLOT, FEW_SHOTS
+    )
+)
+
+
+def author_system(
+    rule_text: str,
+    tags: tuple[str, ...] = (),
+    conditions: set[str] | None = None,
+) -> str:
+    """The author's system prompt, carrying only what this rule needs.
+
+    `conditions` comes from context.example_conditions() - the traps this particular
+    rule could actually fall into, read off the schema and hints it is about to be shown.
+    """
+    return _for_rule(ANOMALY_SQL_AUTHOR_TEMPLATE, rule_text, tags, conditions)
 
 
 # ── Rule Verifier ──────────────────────────────────────────────────────────────
@@ -355,9 +538,21 @@ Respond with ONLY this JSON on a single line, no prose:
 # cannot know that a table is a snapshot needing de-duplication, or that a rule's "Do NOT flag"
 # section refers to a numbered business rule it was never shown - and it would then reject a
 # correct probe for honouring an exclusion it could not see.
-if BUSINESS_RULES:
-    RULE_VERIFIER_SYSTEM = RULE_VERIFIER_SYSTEM + "\n\n" + BUSINESS_RULES
-RULE_VERIFIER_SYSTEM = _with_limits(RULE_VERIFIER_SYSTEM)
+RULE_VERIFIER_TEMPLATE = RULE_VERIFIER_SYSTEM + "\n\n" + _BR_SLOT
+# The unpruned prompt, for when reference pruning is off and for the self-checks.
+RULE_VERIFIER_SYSTEM = _with_limits(RULE_VERIFIER_TEMPLATE.replace(_BR_SLOT, BUSINESS_RULES))
+
+
+def verifier_system(rule_text: str, tags: tuple[str, ...] = ()) -> str:
+    """The verifier's system prompt, carrying only the business rules this rule needs.
+
+    THE VERIFIER MUST BE PRUNED THE SAME WAY THE AUTHOR IS, and by the same function. It judges
+    whether the SQL matches the rule, so showing it a definition the author never saw would have
+    it reject correct work for failing to honour something it was never asked for - and the
+    reverse, showing the author more than the reviewer, lets a real mistake through. The two
+    reading from one function is what keeps them looking at the same thing.
+    """
+    return _for_rule(RULE_VERIFIER_TEMPLATE, rule_text, tags)
 
 
 # ── Findings Summarizer ────────────────────────────────────────────────────────

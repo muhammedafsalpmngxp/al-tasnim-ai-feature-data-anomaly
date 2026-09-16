@@ -274,3 +274,229 @@ def build_context(
     numbers = slice_numeric_hints(numeric_hints, tables)
     hint_block = "\n\n".join(p for p in (values, numbers) if p.strip())
     return schema_block, hint_block, tables
+
+
+# ── Reference material: business_rules.md and few_shots.md ─────────────────────
+#
+# THE SECOND-LARGEST COST IN A COMPILE, AND UNTIL NOW THE ONLY UNPRUNED ONE.
+#
+# The schema is cut hard for each rule (77 tables -> 9 on a recent compile, 32,554 -> 3,977
+# chars). The two reference files were not cut at all: every one of ~24,000 characters went
+# into EVERY author call and, for the business rules, every verifier call as well - about
+# 8,000 tokens per author call regardless of what the rule was about. A rule about a missing
+# milestone date carried the full task-code-to-WBS mapping chain; a rule about a work breakdown
+# carried the milestone deadlines.
+#
+# WHY THIS IS SAFE, AND WHERE THE LINE IS DRAWN.
+#
+# Pruning reference material is riskier than pruning a schema. A missing table produces a query
+# that fails loudly; a missing DEFINITION produces a query that runs and measures the wrong
+# thing. So the bar here is deliberately higher than it is above:
+#
+#   * SMALL SECTIONS ARE NEVER DROPPED. Dropping a 300-character policy statement saves
+#     essentially nothing and can cost a whole probe. Only the large topical sections are
+#     candidates at all, and they are the only ones worth cutting anyway.
+#   * A section is kept unless it is CLEARLY unrelated to the rule, measured by how much of the
+#     rule's own vocabulary it speaks to. Ties and near-misses keep the section.
+#   * If the result is not meaningfully smaller, the FULL text is returned - the same rule the
+#     schema prune follows. A marginal saving is never worth a missing definition.
+#   * Everything dropped is logged by heading, so any suspect probe can be traced back to what
+#     its author was and was not shown.
+#
+# Nothing here knows what a business rule says. It reads the headings in the file at runtime.
+
+# Words that carry no topic. Deliberately generic English only - adding a domain word here
+# would be exactly the hardcoding this engine exists without.
+_STOPWORDS = frozenset("""
+a an the and or but if then than that this these those there here it its is are was were be
+been being to of in on at by for from with without into over under again more most other some
+such only own same so no nor not too very can will just should now which who whom what when
+where why how all any both each few own too s t don ll re ve y ain aren couldn didn doesn hadn
+hasn haven isn ma mightn mustn needn shan shouldn wasn weren won wouldn as has have had do does
+did doing about against between during before after above below up down out off through
+one two three must never always also may might would could per rather instead whether
+rule rules check checks flag flagged data record records row rows value values
+""".split())
+
+_HEADING_RE = re.compile(r"^#{1,6}\s+(.*?)\s*$", re.MULTILINE)
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,}")
+
+
+def _terms(text: str) -> set[str]:
+    """Topic words in a piece of text, with snake_case split into its parts.
+
+    `ex_rig_on_date` contributes rig and date, so a rule speaking of "the expected rig-on date"
+    in plain business language still matches a section written in column names. That matters
+    more since the anomaly descriptions were rewritten into business language - the two sides
+    no longer share a technical vocabulary, and matching on whole identifiers alone would find
+    almost nothing and prune almost everything.
+    """
+    out: set[str] = set()
+    for word in _WORD_RE.findall(text.lower()):
+        for part in word.split("_"):
+            if len(part) > 2 and part not in _STOPWORDS:
+                out.add(part)
+    return out
+
+
+def split_sections(text: str) -> list[tuple[str, str]]:
+    """[(heading, whole section including its heading)], with any preamble under heading ""."""
+    out: list[tuple[str, str]] = []
+    marks = list(_HEADING_RE.finditer(text or ""))
+    if not marks:
+        return [("", text or "")]
+    if marks[0].start() > 0:
+        out.append(("", text[: marks[0].start()]))
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        out.append((m.group(1), text[m.start():end]))
+    return out
+
+
+def prune_reference(
+    text: str, rule_text: str, keywords: tuple[str, ...] = (), label: str = "reference"
+) -> str:
+    """Cut a reference file down to the sections this one rule plausibly needs.
+
+    `rule_text` is everything known about the rule - title, category, entity, method and full
+    prose - so the match is made against the rule as a whole.
+
+    `keywords` is the rule's OWN CLASSIFICATION: its tags, category and entity. A section
+    mentioning any of them is kept outright, whatever the overall overlap says.
+
+    THAT OVERRIDE IS NOT BELT-AND-BRACES; IT IS LOAD-BEARING, and it was added because the
+    measurement below got a real rule wrong. Overlap is diluted by the length of the rule's
+    prose, so a rule whose subject is named in two words but described in three hundred scores
+    low on the very section that defines its subject. Observed on the weightage rollup rule:
+    once its description was rewritten into plain business language the word "weightage"
+    survived only in its tags, overlap fell to 3%, and the section defining weightage would
+    have been dropped from the one rule that cannot be written without it.
+
+    Tags are a deliberate statement of what a rule is ABOUT, made by whoever wrote it. That is a
+    better signal than word frequency and it is the right thing to trust here.
+    """
+    if not settings.reference_prune or not (text or "").strip():
+        return text
+
+    sections = split_sections(text)
+    if len(sections) < 4:
+        # Too few sections to prune meaningfully, and the risk per section is correspondingly
+        # higher. Nothing to gain.
+        return text
+
+    wanted = _terms(rule_text)
+    if not wanted:
+        return text
+
+    # The rule's own classification, split the same way section text is, so a tag of "wbs" or
+    # "weightage" matches however the reference file happens to spell it.
+    subject = _terms(" ".join(keywords))
+
+    kept: list[str] = []
+    dropped: list[str] = []
+    for heading, body in sections:
+        if not heading or len(body) <= settings.reference_keep_below:
+            kept.append(body)
+            continue
+        section_terms = _terms(heading + "\n" + body)
+        if subject & section_terms:
+            # This section names something the rule declares itself to be about. Keep it
+            # regardless of overlap - see the docstring.
+            kept.append(body)
+            continue
+        # How much of THIS RULE's vocabulary the section speaks to. Normalising by the rule
+        # rather than by the section is deliberate: a long section is not penalised for being
+        # long, and a rule is not starved because its description happens to be short.
+        overlap = len(section_terms & wanted) / len(wanted)
+        if overlap >= settings.reference_min_overlap:
+            kept.append(body)
+        else:
+            dropped.append(f"{heading} ({overlap:.0%})")
+
+    if not dropped:
+        return text
+
+    out = "".join(kept).strip()
+    # The same safety rule the schema prune follows: a marginal saving is never worth the risk
+    # of having cut something the rule needed.
+    if len(out) > len(text) * _MIN_SAVING_RATIO:
+        return text
+
+    log.info(
+        "prune: %s %d -> %d chars, dropped %s",
+        label, len(text), len(out), "; ".join(dropped),
+    )
+    return out
+
+
+# ── Worked examples: which ones this rule could actually learn from ────────────
+
+_APPLIES_RE = re.compile(r"^\s*[-*]\s*applies\s*:\s*(\S+)\s*$", re.IGNORECASE | re.MULTILINE)
+# "nulls 62%" in a numeric hint line. A column nobody would call substantially empty is not
+# evidence for the lesson about joining through one, so the bar is well above incidental nulls.
+_NULL_PCT_RE = re.compile(r"nulls\s+(\d+)%")
+_SUBSTANTIALLY_EMPTY = 40
+
+
+def example_conditions(
+    schema_block: str, hint_block: str, method: str = "", tolerance: str = ""
+) -> set[str]:
+    """Which worked-example conditions hold for the rule about to be written.
+
+    Every condition is decided from something ALREADY MEASURED and already in the prompt - the
+    schema block the author will read, the hints it will read, and what the rule declared about
+    itself. Nothing is inferred from a name and nothing is asked of a model.
+    """
+    facts = {"always"}
+    if "MANY ROWS PER " in (schema_block or ""):
+        facts.add("grain")
+    if (hint_block or "").strip():
+        # The hint block exists only when a numeric column in scope carries measured
+        # statistics - which is exactly when a proportion can be misread for its scale.
+        facts.add("scale")
+    if any(int(m.group(1)) >= _SUBSTANTIALLY_EMPTY for m in _NULL_PCT_RE.finditer(hint_block or "")):
+        facts.add("nulls")
+    if (method or "").strip().lower() == "statistical" or (tolerance or "").strip():
+        facts.add("threshold")
+    return facts
+
+
+def prune_examples(text: str, conditions: set[str]) -> str:
+    """Keep the worked examples whose declared `applies:` condition holds for this rule.
+
+    WHY THIS IS DECLARED IN THE FILE AND NOT MEASURED HERE. The first attempt at cutting this
+    file scored each example's words against the rule's words, the way the business rules are
+    cut. It removed "Scope is what you EXAMINED, not what you flagged" from 55 of 60 rules and
+    "A threshold must come from the data" from 55 - the two lessons that prevent the most common
+    and the most expensive failures this engine has.
+
+    The cause is structural, not a bad threshold: these examples teach probe craft in the
+    ENGINE's vocabulary, while the anomalies are described in the BUSINESS's. The two will never
+    match well, and they match even less now that the anomaly file has been rewritten into plain
+    language. So the file declares its own applicability and this function only reads it.
+
+    An example with no recognised declaration is KEPT. The failure this whole path must avoid is
+    silently withholding a lesson, so anything unclear resolves to sending it.
+    """
+    if not settings.reference_prune or not (text or "").strip():
+        return text
+
+    sections = split_sections(text)
+    kept: list[str] = []
+    dropped: list[str] = []
+    for heading, body in sections:
+        m = _APPLIES_RE.search(body)
+        applies = m.group(1).strip().lower() if m else "always"
+        if not heading or applies in conditions:
+            kept.append(body)
+        else:
+            dropped.append(f"{heading} (needs {applies})")
+
+    if not dropped:
+        return text
+    out = "".join(kept).strip()
+    log.info(
+        "prune: worked examples %d -> %d chars, dropped %s",
+        len(text), len(out), "; ".join(dropped),
+    )
+    return out

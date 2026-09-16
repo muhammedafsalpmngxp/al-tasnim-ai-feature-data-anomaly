@@ -46,7 +46,15 @@ function formatDuration(seconds: number): string {
   return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`
 }
 
-function Actions({ onDone, busy }: { onDone: () => void; busy: boolean }) {
+function Actions({
+  onDone,
+  busy,
+  failed,
+}: {
+  onDone: () => void
+  busy: boolean
+  failed: number
+}) {
   const [active, setActive] = useState<'' | 'compile' | 'run'>('')
   const [progress, setProgress] = useState('')
   const [error, setError] = useState('')
@@ -125,6 +133,32 @@ function Actions({ onDone, busy }: { onDone: () => void; busy: boolean }) {
         >
           {active === 'compile' ? 'Compiling…' : 'Compile rules'}
         </button>
+        {/*
+          Shown only when something is actually failed, and labelled with the count.
+
+          A rule that failed to compile is NOT retried by an ordinary compile, on purpose: it
+          failed for a real semantic reason (the verifier rejected its SQL), so retrying it
+          every time would spend the full authoring cost on every compile to fail again.
+
+          But that left the only way to retry it on the command line, which for an operator who
+          works in this UI means it may as well not exist. A separate button keeps the default
+          cheap while making the deliberate, occasional retry a click - the count is on the
+          label because retrying five rules costs about five authoring cycles, and that is worth
+          seeing before pressing it.
+        */}
+        {failed > 0 && (
+          <button
+            className="secondary"
+            disabled={disabled}
+            title={
+              `${failed} rule(s) failed to compile and are not retried by an ordinary compile. ` +
+              `This re-attempts them from scratch, which costs roughly ${failed} authoring cycle(s).`
+            }
+            onClick={() => go('compile', '/api/compile?retry_failed=true')}
+          >
+            {active === 'compile' ? 'Retrying…' : `Retry ${failed} failed`}
+          </button>
+        )}
         {busy && !active && <span className="muted">another operation is in progress</span>}
         {error && <span className="error">{error}</span>}
       </div>
@@ -458,7 +492,11 @@ export default function App() {
             </p>
           )}
         </div>
-        <Actions onDone={refresh} busy={!!status?.busy} />
+        <Actions
+          onDone={refresh}
+          busy={!!status?.busy}
+          failed={status?.catalog.failed ?? 0}
+        />
       </header>
 
       {error && <p className="error banner">{error}</p>}

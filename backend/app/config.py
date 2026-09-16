@@ -172,6 +172,28 @@ class Settings:
     schema_prune_above_tables: int = field(
         default_factory=lambda: _get_int("ANOMALY_SCHEMA_PRUNE_ABOVE_TABLES", 60)
     )
+    # Cut business_rules.md and few_shots.md down to the sections one rule plausibly needs.
+    # They were the only unpruned material left: ~24,000 characters on EVERY author call and,
+    # for the business rules, every verifier call, whatever the rule was about.
+    #
+    # Set to false to send both files whole. Worth doing if a probe is rejected for a reason
+    # that looks like missing context - it is the first thing to rule out, and costs only money.
+    reference_prune: bool = field(
+        default_factory=lambda: _get_bool("ANOMALY_REFERENCE_PRUNE", True)
+    )
+    # Sections at or below this size are NEVER dropped. Dropping a short policy statement saves
+    # nothing and can cost a whole probe, so only the large topical sections are candidates.
+    # Raise it to be safer, lower it to cut more.
+    reference_keep_below: int = field(
+        default_factory=lambda: _get_int("ANOMALY_REFERENCE_KEEP_BELOW", 900)
+    )
+    # A large section is kept unless it speaks to less than this share of the rule's own
+    # vocabulary. Deliberately low: the cost of keeping an unneeded section is a few hundred
+    # tokens, while the cost of dropping a needed definition is a probe that measures the wrong
+    # thing. Ties and near-misses keep the section.
+    reference_min_overlap: float = field(
+        default_factory=lambda: _get_float("ANOMALY_REFERENCE_MIN_OVERLAP", 0.10)
+    )
     # How much a finding of each severity moves the headline score. A BUSINESS judgement, so it
     # is configurable rather than fixed in Python: "critical:40,high:20,medium:8,low:5".
     # Malformed entries are ignored and the default for that severity stands, because a typo

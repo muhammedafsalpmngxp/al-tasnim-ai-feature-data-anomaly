@@ -7,9 +7,17 @@ resolve every identifier against the schema you were given.
 
 Each example exists to show one trap that is easy to fall into and expensive to get wrong.
 
+Each declares `- applies:` under its heading, which decides when it is sent: `always`, or one
+of `scale` (a number in scope has measured statistics), `grain` (something in scope keeps more
+than one record per thing), `threshold` (the rule is statistical or self-calibrating), `nulls`
+(a column in scope is substantially empty). Anything else is treated as `always`. When in
+doubt write `always` — see app/graph/context.py for why this is declared rather than guessed.
+
 ---
 
 ## 1. Scope is what you EXAMINED, not what you flagged
+
+- applies: always
 
 Anomaly: "a record that has reached a milestone but is missing the date that proves it".
 
@@ -37,6 +45,8 @@ whether two findings out of five or two out of fifty thousand were found.
 ---
 
 ## 2. A missing value past its deadline IS the finding — never filter it out
+
+- applies: always
 
 Anomaly: "a milestone document was not issued by its deadline, where the deadline is a fixed
 number of days before a planned date".
@@ -80,6 +90,8 @@ the document was never issued at all. A NULL past its deadline is a miss, not an
 
 ## 3. Read the measured SCALE before comparing a proportion
 
+- applies: scale
+
 Anomaly: "a task reports full completion but is not marked complete".
 
 NUMERIC HINTS states the scale of every numeric column. A progress column may be a 0-1 fraction
@@ -100,6 +112,8 @@ recorded value above full still counts as complete.
 ---
 
 ## 4. Collapse history to one current record before judging an entity
+
+- applies: grain
 
 Anomaly: "a record's current state is self-contradictory", in a table that keeps one row per
 update.
@@ -133,6 +147,8 @@ real entities — and the headline figure in the report is simply wrong.
 ---
 
 ## 5. A threshold must come from the data or from the rule — never from nowhere
+
+- applies: threshold
 
 Anomaly: "a measured value is far outside what is normal for its population".
 
@@ -177,6 +193,8 @@ must be derived from the data as above, or taken from a value the rule itself de
 
 ## 6. Keep unmatched records visible when absence is the finding
 
+- applies: always
+
 Anomaly: "a record cannot be resolved through its mapping".
 
 ```sql
@@ -202,6 +220,8 @@ Put such a condition in the `ON` clause instead.
 
 ## 7. A column that is mostly NULL cannot be joined as though it were populated
 
+- applies: nulls
+
 Anomaly: "a record of a particular classification is in the wrong lifecycle state".
 
 NUMERIC HINTS reports a null rate for every column. When a classification column is, say, 71%
@@ -222,6 +242,8 @@ the lookup table later must not silently start being treated as qualifying.
 
 ## 8. Divide safely, and never let a NULL become a zero
 
+- applies: always
+
 ```sql
 -- a probe runs unattended, so a divide-by-zero is a failed rule, not a visible error
 SUM(<weight> * <value>) / NULLIF(SUM(<weight>), 0)   AS weighted_average
@@ -234,6 +256,8 @@ progress figure is not zero progress, and a missing date is not the epoch.
 ---
 
 ## 9. Prove the finding in the row itself
+
+- applies: always
 
 Every DETAIL row must let a reader verify the finding without re-running anything.
 

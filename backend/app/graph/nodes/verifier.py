@@ -31,7 +31,7 @@ from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.graph.nodes._common import numbered, probe_sql, rows_to_table, rule_brief, summary_line
-from app.graph.prompts import RULE_VERIFIER_SYSTEM
+from app.graph.prompts import verifier_system
 from app.graph.state import CompileState
 from app.llm import chat, chat_structured
 from app.observability import get_logger
@@ -151,9 +151,16 @@ def verifier_node(state: CompileState) -> dict:
     # The text path below is kept as a fallback, not as the normal route: a provider that
     # cannot do structured output (an older local model) still gets reviewed exactly as before.
     data: dict | None = None
+    # The reference material is cut to THIS rule, so the prompt carries the business
+    # definitions it needs and not the whole file. See prompts._for_rule().
+    rule_text = " ".join(str(state.get(k) or "") for k in
+                         ("title", "category", "entity", "method", "body"))
+    tags = tuple(state.get("tags") or ())
+    system = verifier_system(rule_text, tags)
+
     try:
         verdict = chat_structured(
-            RULE_VERIFIER_SYSTEM, user, VerifierVerdict, temperature=0.0
+            system, user, VerifierVerdict, temperature=0.0
         )
         if verdict is not None:
             data = verdict.model_dump()
@@ -168,7 +175,7 @@ def verifier_node(state: CompileState) -> dict:
 
     if data is None:
         try:
-            raw = chat(RULE_VERIFIER_SYSTEM, user, temperature=0.0)
+            raw = chat(system, user, temperature=0.0)
         except Exception as exc:  # noqa: BLE001
             # A provider failure is not evidence the probe is good. Fail closed, exactly as an
             # unreadable verdict does - but say plainly that the review did not happen.

@@ -15,8 +15,9 @@ two queries the feedback refers to, and it frequently re-emits the same one.
 """
 from __future__ import annotations
 
+from app.graph.context import example_conditions
 from app.graph.nodes._common import numbered, rule_brief
-from app.graph.prompts import ANOMALY_SQL_AUTHOR_SYSTEM
+from app.graph.prompts import author_system
 from app.graph.state import CompileState
 from app.rules.expand import substitute
 from app.llm import chat
@@ -150,7 +151,25 @@ def sql_author_node(state: CompileState) -> dict:
     parts.extend(_feedback_sections(state))
     parts.append("Write the two queries now, as the two tagged blocks described above.")
 
-    raw = chat(ANOMALY_SQL_AUTHOR_SYSTEM, "\n\n".join(p for p in parts if p), temperature=0.0)
+    # The reference material is cut to THIS rule, so the prompt carries the business
+    # definitions it needs and not the whole file. See prompts._for_rule().
+    rule_text = " ".join(str(state.get(k) or "") for k in
+                         ("title", "category", "entity", "method", "body"))
+    tags = tuple(state.get("tags") or ())
+    # Which worked examples this rule could actually learn from, decided from the same schema
+    # and hints it is about to read - not from what the rule's prose happens to say.
+    conditions = example_conditions(
+        state.get("schema_block") or "",
+        state.get("hint_block") or "",
+        str(state.get("method") or ""),
+        str(state.get("tolerance") or ""),
+    )
+
+    raw = chat(
+        author_system(rule_text, tags, conditions),
+        "\n\n".join(p for p in parts if p),
+        temperature=0.0,
+    )
     blocks = extract_sql_blocks(raw)
     summary_sql = blocks.get("summary", "")
     detail_sql = blocks.get("detail", "")

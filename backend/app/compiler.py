@@ -34,7 +34,8 @@ from app.rules.expand import (
     tokens_for,
     unfilled_tokens,
 )
-from app.rules.loader import load_patterns, load_rules
+from app.graph.prompts import PROBE_PATTERNS
+from app.rules.loader import load_rules
 from app.rules.schema_index import load_index
 from app.rules.spec import AnomalyRule, CompiledProbe
 
@@ -101,6 +102,10 @@ def _seed_state(
         "title": rule.title,
         "body": rule.body,
         "category": rule.category,
+        # Carried so the reference prune can read what the rule declares itself to be
+        # ABOUT. Tags are a deliberate classification and a better signal than word
+        # frequency over the prose - see context.prune_reference().
+        "tags": tuple(rule.tags or ()),
         "severity": rule.severity,
         "entity": rule.entity,
         "method": rule.method,
@@ -357,7 +362,10 @@ def compile_rules(
     schema = introspect.build_schema_text()
     values = introspect.build_value_hints()
     numbers = introspect.build_numeric_hints()
-    patterns = load_patterns()
+    # The probe SHAPES are a property of THIS ENGINE's contract, not of the business, so they
+    # live beside the contract in prompts.py rather than at the top of the file a business
+    # owner opens to describe an anomaly.
+    patterns = PROBE_PATTERNS
 
     catalog = catalog_store.load()
     # What the structural families already cover, so an authored rule does not restate one and

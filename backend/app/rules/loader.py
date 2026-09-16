@@ -99,25 +99,11 @@ def _domain_files() -> list[str]:
     return paths
 
 
-def load_patterns() -> str:
-    """The ## PATTERNS section - worked probe templates shown to the SQL Author.
-
-    Lives in the markdown rather than in prompts.py because it is SQL, and all SQL belongs in
-    domain/. Returns "" when absent, so the section is simply omitted from the prompt rather
-    than injecting an empty heading.
-    """
-    main = os.path.join(_DOMAIN_DIR, _MAIN_FILE)
-    if not os.path.exists(main):
-        return ""
-    with open(main, encoding="utf-8") as fh:
-        text = fh.read()
-    m = re.search(r"^##\s+PATTERNS\s*$", text, re.MULTILINE)
-    if not m:
-        return ""
-    rest = text[m.end():]
-    # Ends at the first rule heading, or at the next top-level "## " section.
-    stop = re.search(r"^##\s+", rest, re.MULTILINE)
-    return (rest[: stop.start()] if stop else rest).strip()
+# NOTE: the probe SHAPES that used to be parsed out of a "## PATTERNS" section here now live in
+# app/graph/prompts.py as PROBE_PATTERNS. They describe THIS ENGINE's summary/detail contract,
+# not the business - they change when the engine changes, never when a rule does - and keeping a
+# hundred lines of T-SQL at the top of the one file a business owner opens made that file both
+# intimidating and accidentally breakable. Nothing parses a PATTERNS section any more.
 
 
 def _split_meta_body(block: str) -> tuple[dict[str, str], str]:
