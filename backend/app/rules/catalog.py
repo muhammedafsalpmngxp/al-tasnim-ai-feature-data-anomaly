@@ -257,3 +257,34 @@ def prune_removed(catalog: Catalog, rule_ids: set[str]) -> list[str]:
 
 def path() -> str:
     return _CATALOG_PATH
+
+
+def duplicate_probes(catalog: Catalog) -> list[tuple[str, ...]]:
+    """Groups of DECLARED probes that measure the same thing. Empty when all are distinct.
+
+    WHY ONLY DECLARED PROBES. A structural family is one rule applied to every matching schema
+    feature, so its members share a shape BY CONSTRUCTION - and the feature list they expand
+    over is already deduplicated upstream, so two members cannot target the same thing. Include
+    them and the check reports nine groups of false duplicates, which is how a useful warning
+    gets switched off. A duplicate that matters is one a PERSON wrote twice.
+
+    THE CASE THIS EXISTS FOR, observed live: a rule meaning "pegging exists but no deadline can
+    be computed" lost its scope filter during a recompile and became identical to "the expected
+    rig-on date is missing" - same table, same predicate, same (absent) scope. Both reported the
+    same 61 wells in one report, under two ids, and every total that summed them was wrong by
+    those 61.
+
+    REPORTED, NEVER DISABLED. Two rules converging usually means one has drifted from its
+    intent, but which one is a judgement about what the business wanted - and silently switching
+    a check off is exactly the surprise this engine exists to avoid.
+    """
+    from app.rules.contract import probe_signature
+
+    groups: dict[str, list[str]] = {}
+    for probe in catalog.probes.values():
+        if probe.status != "active" or probe.source == "expanded":
+            continue
+        signature = probe_signature(probe.summary_sql)
+        if signature:
+            groups.setdefault(signature, []).append(probe.rule_id)
+    return [tuple(sorted(ids)) for ids in groups.values() if len(ids) > 1]

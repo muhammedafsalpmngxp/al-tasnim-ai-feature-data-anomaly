@@ -30,8 +30,12 @@ from app.rules.contract import (
     check_detail,
     check_summary,
     columns_of,
+    dedup_problems,
     detail_advice,
+    grain_concerns,
+    grain_problems,
     sanity_concerns,
+    saturation_problems,
     summary_values,
 )
 
@@ -47,6 +51,22 @@ def sanity_gate_node(state: CompileState) -> dict:
     # ── HARD: the contract, checked against what the driver actually handed back ──
     problems = check_summary(summary_columns, state.get("summary_row_count", 0))
     problems += check_detail(detail_columns)
+    # Grain is HARD, not advisory. It was advisory in effect - nothing checked it at all - and a
+    # report went out counting history rows: 43,534 findings for 10,860 distinct tasks. The
+    # evidence is already in hand (the sample rows the executor fetched), the judgement needs no
+    # model, and a wrong grain makes every number downstream wrong. See contract.grain_problems.
+    problems += grain_problems(
+        detail_columns,
+        detail_rows,
+        bool(state.get("detail_truncated")),
+        state.get("schema_block", ""),
+    )
+    _values = summary_values(summary_columns, state.get("summary_row", []) or [])
+    problems += saturation_problems(_values)
+    # A de-duplication that reduces nothing: the probe examined every stored row of a table the
+    # schema marks as holding many rows per entity. Tests the OUTCOME, not the mechanism - see
+    # contract.dedup_problems.
+    problems += dedup_problems(_values, state.get("schema_block", ""))
     if problems:
         joined = "\n".join(f"- {p}" for p in problems)
         log.warning("contract failed [%s]: %d problem(s)", rule_id, len(problems))
@@ -61,6 +81,9 @@ def sanity_gate_node(state: CompileState) -> dict:
     # short. Passing a truncated count would manufacture a disagreement on every large rule.
     detail_count = None if state.get("detail_truncated") else len(detail_rows)
     concerns = sanity_concerns(values, detail_count)
+    # Repetition the schema does not explain: reported, not refused, because a hundred records
+    # pointing at one missing parent legitimately look alike and only the reviewer can tell.
+    concerns += grain_concerns(detail_columns, detail_rows)
     concerns += check_probe(
         state.get("summary_sql", ""),
         state.get("detail_sql", ""),

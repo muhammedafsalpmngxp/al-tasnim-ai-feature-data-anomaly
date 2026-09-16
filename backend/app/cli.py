@@ -322,6 +322,16 @@ def cmd_compile(args) -> int:
     for rule_id in report.failed:
         probe = catalog.get(rule_id)
         console.print(f"  [red]x[/] {rule_id} FAILED: {(probe.error if probe else '')[:200]}")
+    # Printed prominently, not tucked into the table: two rules measuring the same thing is a
+    # correctness problem in the REPORT (the same records counted twice), not a compile statistic.
+    for group in report.duplicates:
+        console.print(
+            f"[yellow]Duplicate check:[/] {' and '.join(group)} measure the same thing - same "
+            f"tables, same condition, same scope. They will report the SAME records under "
+            f"different ids, so every total that sums them is overstated. Narrow whichever has "
+            f"drifted from its intent."
+        )
+
     if report.stopped_early:
         console.print(f"[yellow]Stopped early:[/] {report.stopped_early}")
     for problem in errors:

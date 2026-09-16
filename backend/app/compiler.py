@@ -57,6 +57,9 @@ class CompileReport:
     failed: list[str] = field(default_factory=list)
     not_applicable: list[str] = field(default_factory=list)
     removed: list[str] = field(default_factory=list)
+    # Declared rules that ended up measuring the same thing. Reported, never disabled: which
+    # one has drifted from its intent is a judgement about the business, not the engine.
+    duplicates: list[tuple[str, ...]] = field(default_factory=list)
     llm_calls: int = 0
     seconds: float = 0.0
     stopped_early: str = ""
@@ -589,6 +592,17 @@ def compile_rules(
 
     if progress is not None:
         progress(total, total, "")
+
+    # Checked HERE because this is the only place that sees every probe at once. The Verifier
+    # reviews one rule in isolation and cannot know another has converged on the same query.
+    report.duplicates = catalog_store.duplicate_probes(catalog)
+    for group in report.duplicates:
+        log.warning(
+            "catalog: %s measure the same thing - same tables, same condition, same scope. "
+            "They will report the SAME records under different ids, inflating every total "
+            "that sums them. Narrow whichever has drifted from its intent.",
+            " and ".join(group),
+        )
 
     catalog.structure_fingerprint = fingerprint
     catalog.compiled_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")

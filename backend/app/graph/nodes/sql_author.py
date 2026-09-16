@@ -48,10 +48,28 @@ def _feedback_sections(state: CompileState) -> list[str]:
             f"DETAIL:\n{state.get('detail_sql', '')}"
         )
 
+    # EVERY OUTSTANDING OBJECTION, NOT JUST THE LATEST ONE.
+    #
+    # This was an if/elif chain, so exactly one message ever reached the author - and the state
+    # above goes to deliberate trouble to KEEP verify_feedback alive across attempts for a
+    # reason the chain then defeated. A rule rejected on MEANING, rewritten, and then tripping
+    # a mechanical check was shown only the mechanical error: it fixed that, quietly reinstated
+    # whatever the reviewer had refused, and was rejected again on the next review. Two attempts
+    # spent alternating between two objections, neither ever satisfied, and the rule recorded as
+    # failed with budget exhausted.
+    #
+    # Adding two hard checks in front of the reviewer (grain, saturation) made that collision
+    # common rather than occasional, because both fire AFTER the reviewer has already spoken.
+    #
+    # Ordered mechanical-first: a query that cannot run cannot be reviewed, so that is what the
+    # author must fix first - but the reviewer's instruction stays on the page beneath it,
+    # where it cannot be forgotten while doing so.
+    mechanical = False
     if state.get("validation_error"):
         out.append(
             previous + "\n\nIT WAS REJECTED BEFORE IT RAN:\n" + state["validation_error"]
         )
+        mechanical = True
     elif state.get("exec_error"):
         out.append(
             previous + "\n\nIT FAILED WHEN RUN. The database reported:\n"
@@ -59,14 +77,26 @@ def _feedback_sections(state: CompileState) -> list[str]:
             + "\nFix it - check the table and column names, the joins and the types against "
               "the SCHEMA block above."
         )
+        mechanical = True
     elif state.get("contract_error"):
         out.append(
             previous + "\n\nIT RAN, BUT WHAT IT RETURNED CANNOT BE USED:\n"
             + state["contract_error"]
         )
-    elif state.get("verify_feedback"):
+        mechanical = True
+
+    if state.get("verify_feedback"):
+        # Without a mechanical error this IS the rejection, and carries the previous attempt
+        # with it. Alongside one, it is the objection that still stands underneath.
+        head = (
+            "AN INDEPENDENT REVIEWER ALSO REJECTED THIS RULE EARLIER, AND THAT OBJECTION STILL "
+            "STANDS. Satisfy it AS WELL as the problem above - a rewrite that fixes only the "
+            "problem above will be rejected again for this:\n"
+            if mechanical
+            else previous + "\n\nAN INDEPENDENT REVIEWER REJECTED IT.\nWHAT TO FIX:\n"
+        )
         out.append(
-            previous + "\n\nAN INDEPENDENT REVIEWER REJECTED IT.\nWHAT TO FIX:\n"
+            head
             + state["verify_feedback"]
             + "\n\nWrite a MATERIALLY DIFFERENT probe that addresses this. Do not resubmit the "
               "same queries - they would return the same data and be rejected again. If you "

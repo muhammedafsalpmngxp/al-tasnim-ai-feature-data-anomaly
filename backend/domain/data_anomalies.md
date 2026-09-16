@@ -153,7 +153,7 @@ Wells missing either date — those are separate checks above.
 
 ---
 
-## RULE DQ-A06 - Drilling finished before the rig was due to arrive
+## RULE DQ-A06 - Rig came off the well before it was due to arrive
 
 - category: Milestone dates
 - severity: high
@@ -161,10 +161,11 @@ Wells missing either date — those are separate checks above.
 - method: rule
 - sql_mode: authored
 - status: active
-- tags: milestone, rig, lifecycle
+- tags: milestone, rig, rig-off, lifecycle
 
 **What is wrong**
-Drilling is recorded as complete before the rig was even due on the well.
+The actual **rig-off** date — the date drilling finished and the rig left — falls before the
+expected **rig-on** date, so the rig is recorded as leaving before it was due to arrive.
 
 **Why it matters**
 This is very unlikely to be a real sequence and much more likely a mistyped year, or a date
@@ -172,8 +173,8 @@ written into the wrong place. Left alone it makes the well appear finished far a
 distorts every completion statistic it feeds.
 
 **How to detect**
-Look at wells where both the actual drilling finish and the planned arrival are known. Flag
-those where drilling finished before the rig was due.
+Look at wells where both the actual rig-off date and the expected rig-on date are known. Flag
+those where rig-off falls before the expected rig-on.
 
 **Do NOT flag**
 A well that is genuinely ahead of schedule by a normal margin. This check is about the
@@ -521,15 +522,16 @@ Wells whose deadline has not yet arrived and whose approval is still outstanding
 - tags: flaf, deadline, PDO
 
 **What is wrong**
-The flowline approval was issued after the date the rig was due.
+The **FLAF** — the flowline approval the client issues — was dated after the expected rig-on
+date, instead of the 90 days before it that the deadline requires.
 
 **Why it matters**
 The input required three months before the rig arrived instead came after it was due. Kept
 separate so this extreme case is visible on its own.
 
 **How to detect**
-Look at wells where both the approval and the expected rig-on date are known. Flag those where
-the approval came after the rig was due. Severity is the days between.
+Look at wells where both the FLAF issue date and the expected rig-on date are known. Flag those
+where the FLAF was issued after the expected rig-on date. Severity is the days between.
 
 **Do NOT flag**
 Wells merely past the 90-day deadline but still before the rig was due.
@@ -1090,7 +1092,8 @@ Employees legitimately not assigned to any crew.
 - tags: task, dates, plan-vs-actual
 
 **What is wrong**
-Work began after the date it was supposed to have been completed.
+A task's **actual start** is later than its **target finish** — work began after the date the
+plan said it should already have been completed.
 
 **Why it matters**
 The task was never going to meet its plan, and the schedule showed no warning of it. Both dates
@@ -1098,8 +1101,9 @@ are individually valid, so nothing catches this unless the plan and the outcome 
 against each other.
 
 **How to detect**
-Look at tasks where both the actual start and the planned finish are known. Flag those where
-work began after the planned finish. Severity is the size of the overrun in days.
+Look at tasks where both the actual start date and the target finish date are recorded. Flag
+those where the actual start falls after the target finish. Take the most recent record for
+each task before judging it. Severity is the size of the overrun in days.
 
 **Do NOT flag**
 Tasks missing either date, or where either is the known placeholder value.

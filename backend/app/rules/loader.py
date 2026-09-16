@@ -60,8 +60,15 @@ _SPLIT_DIR = "anomalies"
 # "## RULE DQ-001 - Title", accepting an em dash, en dash or hyphen as the separator. Business
 # users paste from Word, which silently converts "-" to an em dash; rejecting that would be a
 # baffling failure with no visible cause.
+#
+# A DASH MUST HAVE A SPACE BEFORE IT; A COLON NEED NOT. That asymmetry is deliberate, because
+# ids contain dashes themselves. With a fully optional space, "## RULE DQ-D27 Negative crew
+# size" - a heading whose separator was simply forgotten - matched happily, splitting on the id's
+# OWN hyphen to give id "DQ" and title "D27 Negative crew size". The rule then compiled, ran, and
+# was filed in the catalog and the report under a name nobody could find. Requiring the space
+# makes that heading fail outright, where _malformed_headings() reports it on its line number.
 _RULE_HEADING = re.compile(
-    r"^##\s+RULE\s+([A-Za-z0-9][A-Za-z0-9._-]*)\s*[—–:-]\s*(.+?)\s*$", re.MULTILINE
+    r"^##\s+RULE\s+([A-Za-z0-9][A-Za-z0-9._-]*?)\s*(?::|\s+[—–-])\s*(.+?)\s*$", re.MULTILINE
 )
 # "- key: value" or "* key: value"
 _META_LINE = re.compile(r"^\s*[-*]\s*([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*?)\s*$")
@@ -287,6 +294,7 @@ def load_rules() -> tuple[list[AnomalyRule], list[str]]:
             continue
 
         matches = list(_RULE_HEADING.finditer(text))
+        errors.extend(_malformed_headings(text, path, {m.group(1).strip() for m in matches}))
         if not matches:
             log.info("load: %s contains no '## RULE <id> - <title>' headings", os.path.basename(path))
             continue
@@ -319,3 +327,65 @@ def load_rules() -> tuple[list[AnomalyRule], list[str]]:
         len(rules), len(_domain_files()), active, len(rules) - active, len(errors),
     )
     return rules, errors
+
+
+# Any "## RULE ..." line, however malformed. The strict pattern above decides what PARSES; this
+# one decides what was INTENDED, and the difference between them is what gets reported.
+_RULE_ATTEMPT = re.compile(r"^##\s+RULE\b.*$", re.MULTILINE)
+# A trailing number in an id, so the next free one can be suggested: DQ-D26 -> ("DQ-D", 26).
+_ID_TAIL = re.compile(r"^(.*?)(\d+)$")
+
+
+def _next_free_id(existing: set[str]) -> str:
+    """The next unused id in the largest existing family, for the error message.
+
+    Suggested, never assigned. The catalog is KEYED on the id: an auto-assigned one would shift
+    whenever rules were reordered or deleted, orphaning every probe compiled against the old
+    value and silently forcing a full recompile. Better that a person chooses it once and it
+    never moves.
+    """
+    groups: dict[str, int] = {}
+    for rule_id in existing:
+        m = _ID_TAIL.match(rule_id)
+        if m:
+            groups[m.group(1)] = max(groups.get(m.group(1), 0), int(m.group(2)))
+    if not groups:
+        return ""
+    prefix = max(groups, key=lambda p: sum(1 for r in existing if r.startswith(p)))
+    width = max(
+        (len(m.group(2)) for r in existing if (m := _ID_TAIL.match(r)) and r.startswith(prefix)),
+        default=2,
+    )
+    return f"{prefix}{groups[prefix] + 1:0{width}d}"
+
+
+def _malformed_headings(text: str, path: str, parsed: set[str]) -> list[str]:
+    """Report every '## RULE' line the strict pattern did NOT accept.
+
+    THE SILENT MISS THIS PREVENTS. A heading without an id - "## RULE Negative crew size" -
+    matched nothing, so the rule was skipped with no error, no warning and no mention in the
+    summary count. Someone writes an anomaly, saves, compiles, and nothing happens: they now
+    believe a check is running that does not exist. The CLI's own documentation calls that the
+    worst failure mode a data-quality tool has, and the loader had it.
+
+    A near-miss is reported rather than guessed at, because guessing is worse than stopping:
+    "## RULE DQ-D27 Negative crew size" (no separator) DOES parse, as id "DQ" with the title
+    "D27 Negative crew size". Silently filing a rule under the wrong id is how a probe ends up
+    compiled against a rule nobody can find.
+    """
+    out: list[str] = []
+    for m in _RULE_ATTEMPT.finditer(text or ""):
+        line = m.group(0).strip()
+        if _RULE_HEADING.match(line):
+            continue
+        line_no = text.count("\n", 0, m.start()) + 1
+        suggestion = _next_free_id(parsed)
+        out.append(
+            f"{os.path.basename(path)}:{line_no}: {line[:70]!r} is not a usable rule heading, "
+            f"so this rule WOULD BE SILENTLY IGNORED. Write it as: "
+            f"## RULE <id> - <title>"
+            + (f"   (for example: ## RULE {suggestion} - ...)" if suggestion else "")
+            + ". The id is how the engine tracks this check across runs and names it in the "
+            "report, so it must be written explicitly and must never change afterwards."
+        )
+    return out

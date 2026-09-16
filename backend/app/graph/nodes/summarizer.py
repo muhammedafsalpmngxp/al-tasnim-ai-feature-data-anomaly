@@ -124,6 +124,26 @@ def summarizer_node(state: RunState) -> dict:
             "counts above are the truth):\n" + examples
         )
 
+    # A check that flagged its ENTIRE scope has no working denominator, so its count is not
+    # comparable with any other check's. The section for that finding already carries the
+    # caveat; the summary did not, and quoted the number as plain fact - "6,435 tasks cannot be
+    # traced to an activity" - where 6,435 was also everything the check looked at. A reader of
+    # the summary alone was given a figure nobody had qualified.
+    saturated = [
+        row for row in ranked
+        if row.get("scope_total") and row["anomaly_count"] == row["scope_total"]
+    ]
+    if saturated:
+        named = ", ".join(f"{r['title']} ({r['anomaly_count']:,})" for r in saturated[:5])
+        parts.append(
+            f"TREAT THESE COUNTS AS UNCONFIRMED: {len(saturated)} check(s) flagged every "
+            f"record they examined - {named}. Where a check's scope equals its findings there "
+            "is no denominator, so the count measures the size of the population it selected "
+            "rather than how much of anything is wrong. If you mention any of these, say the "
+            "figure needs confirming; never present it beside a measured percentage as though "
+            "the two were the same kind of number."
+        )
+
     # Coverage gaps are stated separately and in these words, because they are the one thing a
     # reader is most likely to misread as good news.
     if empty_scope:

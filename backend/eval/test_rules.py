@@ -359,6 +359,425 @@ def test_schema_block_states_row_counts() -> None:
           "'the predicate matches nothing' (reject), or it burns rewrites on unfixable probes")
 
 
+def test_a_dedup_that_reduces_nothing_is_refused() -> None:
+    """A probe claiming a per-entity grain must actually have one.
+
+    THE INCIDENT: a probe wrote a textbook de-duplication -
+
+        ROW_NUMBER() OVER (PARTITION BY t.id ORDER BY t.updated_at DESC) ... WHERE row_num = 1
+
+    - which reduced nothing, because `t.id` is the row's OWN key: every partition held one row.
+    Its scope came back as 110,181 against a table of 110,184 rows holding ~35,749 things. The
+    Verifier read the shape and approved it ("correctly selects one latest row per task"), and
+    the sample rows happened to be distinct so the grain check passed too. Three rules on one
+    table counted things while three counted updates, and no percentage was comparable.
+
+    This tests the OUTCOME rather than the mechanism on purpose: checking HOW a probe
+    de-duplicates can always be satisfied by writing something that looks right.
+    """
+    from app.rules.contract import dedup_problems
+
+    repeated = (
+        "TABLE well.task_daily  -- 110,184 rows\n"
+        "  - [id]  int NOT NULL  PK\n"
+        "  MANY ROWS PER task_code - de-duplicate (COUNT(DISTINCT ...))\n"
+        "\nTABLE ref.uom  -- 12 rows\n  - [id]  int NOT NULL  PK\n"
+    )
+    for scope in (110181, 110184):
+        check(
+            bool(dedup_problems({"scope_total": scope}, repeated)),
+            f"a scope of {scope:,} against a 110,184-row table marked MANY ROWS PER is accepted "
+            f"- the de-duplication reduced nothing and every percentage is against the wrong "
+            f"denominator",
+        )
+    for scope in (35749, 32461):
+        check(
+            not dedup_problems({"scope_total": scope}, repeated),
+            f"a genuinely de-duplicated scope of {scope:,} is refused",
+        )
+
+    # A table the schema does NOT mark as repeated: one row IS one thing, so a scope equal to
+    # the row count is correct and must never be refused.
+    one_per_thing = "TABLE well.well_master  -- 841 rows\n  - [well_id]  int NOT NULL  PK\n"
+    check(
+        not dedup_problems({"scope_total": 841}, one_per_thing),
+        "a probe examining every row of a table that holds one row per entity is refused - that "
+        "is what a correct well-level check looks like",
+    )
+    check(
+        not dedup_problems({"scope_total": 0}, repeated),
+        "an empty scope is handled by the scope_total=0 check, not by this one",
+    )
+    check(
+        not dedup_problems({"scope_total": 110181}, ""),
+        "judged without a schema block - there is nothing to compare the scope against",
+    )
+
+
+def test_a_malformed_rule_heading_is_never_silently_ignored() -> None:
+    """Writing an anomaly and having nothing happen is the worst outcome this file allows.
+
+    A heading without an id - "## RULE Negative crew size" - matched nothing, so the rule was
+    skipped with no error, no warning, and no mention in the count. Someone adds a check, saves,
+    compiles, and believes it is running when it does not exist. The CLI's own help calls that
+    the worst failure mode a data-quality tool has.
+
+    A near-miss is REPORTED, never guessed at, because guessing is worse: before this,
+    "## RULE DQ-D27 Negative crew size" (separator forgotten) parsed happily by splitting on the
+    id's own hyphen, giving id "DQ" and title "D27 Negative crew size" - a rule filed under a
+    name nobody could find.
+    """
+    from app.rules.loader import _RULE_HEADING, _malformed_headings, _next_free_id
+
+    valid = [
+        "## RULE DQ-D27 - Negative crew size",
+        "## RULE DQ-D27 — Negative crew size",     # em dash, as Word produces
+        "## RULE DQ-D27 – Negative crew size",     # en dash
+        "## RULE DQ-D27: Negative crew size",
+        "## RULE DQ-D27 : Negative crew size",
+    ]
+    for line in valid:
+        m = _RULE_HEADING.match(line)
+        check(bool(m), f"a valid heading is rejected: {line!r}")
+        if m:
+            check(
+                m.group(1) == "DQ-D27" and m.group(2) == "Negative crew size",
+                f"heading parsed to the wrong id/title: {line!r} -> {m.groups() if m else ()}",
+            )
+
+    for line in ("## RULE DQ-D27 Negative crew size", "## RULE Negative crew size"):
+        check(
+            not _RULE_HEADING.match(line),
+            f"{line!r} parses, so a rule is filed under a wrong or missing id",
+        )
+        reported = _malformed_headings(line, "data_anomalies.md", {"DQ-D25", "DQ-D26"})
+        check(
+            bool(reported),
+            f"{line!r} is neither parsed NOR reported - the rule vanishes silently",
+        )
+        check(
+            "SILENTLY IGNORED" in reported[0] and "## RULE <id> - <title>" in reported[0],
+            "the error does not say what happened or how to fix it",
+        )
+
+    check(
+        _next_free_id({"DQ-A01", "DQ-D25", "DQ-D26", "DQ-B04"}) == "DQ-D27",
+        "the suggested next id is wrong - it must continue the largest existing family",
+    )
+    check(_next_free_id(set()) == "", "an empty catalog must suggest nothing rather than guess")
+
+    # And the real file must still be clean.
+    from app.rules.loader import load_rules
+
+    _rules, errors = load_rules()
+    check(not errors, "domain/data_anomalies.md now reports heading errors: " + "; ".join(errors))
+
+
+def test_two_rules_measuring_the_same_thing_are_reported() -> None:
+    """Nothing but the catalog-as-a-whole can notice that two rules have converged.
+
+    THE INCIDENT: a rule meaning "pegging exists but no deadline can be computed" lost its scope
+    filter during a recompile and became equivalent to "the expected rig-on date is missing" -
+    same table, same condition, same (absent) scope. Both reported the same 61 wells in one
+    report, under two ids, and every total that summed them was overstated by those 61.
+
+    The Verifier cannot catch this: it reviews ONE rule and has never seen the other.
+
+    The signature must include the SCOPE, and that is not a detail. Two rules legitimately share
+    a condition while examining different populations - "the expected rig-on date is missing"
+    and "the rig arrived but none was ever planned" flag the same absent date, the second only
+    among wells where the rig arrived. Comparing conditions alone called those duplicates too.
+    """
+    from app.rules.contract import probe_signature
+
+    def summary(table: str, flag: str, scope: str = "") -> str:
+        where = f"    WHERE {scope}\n" if scope else ""
+        return (
+            "WITH scoped AS (\n"
+            f"    SELECT w.id, CASE WHEN {flag} THEN 1 ELSE 0 END AS is_anomaly\n"
+            f"    FROM {table} AS w\n" + where + ")\n"
+            "SELECT 'DQ-X' AS rule_id, COUNT(*) AS scope_total,\n"
+            "       SUM(is_anomaly) AS anomaly_count FROM scoped;"
+        )
+
+    same_a = summary("well.well_master", "w.ex_rig_on_date IS NULL")
+    # Same measurement, different aliases, different formatting, different id literal.
+    same_b = (
+        summary("well.well_master", "wm.ex_rig_on_date IS NULL")
+        .replace("'DQ-X'", "'DQ-Y'").replace(" AS w\n", " AS wm\n").replace("w.id", "wm.id")
+    )
+    check(
+        probe_signature(same_a) == probe_signature(same_b),
+        "two probes measuring the same thing get different signatures because of aliases or "
+        "formatting - the duplicate that shipped would still ship",
+    )
+
+    scoped = summary("well.well_master", "w.ex_rig_on_date IS NULL", "w.rig_on_date IS NOT NULL")
+    check(
+        probe_signature(same_a) != probe_signature(scoped),
+        "a rule examining a NARROWER population is called a duplicate of one examining all of "
+        "it - that accuses two correct rules of being the same, which is how a warning like "
+        "this gets switched off",
+    )
+    other = summary("well.well_master", "w.ex_rig_off_date IS NULL")
+    check(
+        probe_signature(same_a) != probe_signature(other),
+        "two different conditions on one table collide",
+    )
+    check(
+        probe_signature("SELECT 1") == "",
+        "a probe with nothing comparable must return no signature rather than a partial one - a "
+        "FALSE duplicate is worse than a missed one",
+    )
+
+    import ast
+
+    path = os.path.join(_APP, "rules", "catalog.py")
+    source = open(path, encoding="utf-8").read()
+    body = ast.get_source_segment(source, next(
+        n for n in ast.walk(ast.parse(source))
+        if isinstance(n, ast.FunctionDef) and n.name == "duplicate_probes"
+    ))
+    check(
+        'probe.source == "expanded"' in body,
+        "structural family members are compared against each other. They share a shape BY "
+        "CONSTRUCTION and their features are already deduplicated, so this reports nine groups "
+        "of false duplicates - and a warning that cries wolf gets ignored",
+    )
+
+
+def test_author_sees_every_outstanding_objection() -> None:
+    """A rewrite must not be able to fix one objection by reintroducing another.
+
+    THE BUG: the feedback builder was an if/elif chain, so exactly one message ever reached the
+    author - while the state it reads goes to deliberate trouble to keep the reviewer's semantic
+    instruction alive across attempts, for precisely this reason. A rule rejected on MEANING,
+    rewritten, and then tripping a mechanical check saw only the mechanical error. It fixed
+    that, quietly reinstated what the reviewer had refused, and was rejected again on review -
+    two attempts spent alternating between two objections, satisfying neither, and the rule
+    recorded as failed with its budget spent.
+
+    Adding two hard checks in FRONT of the reviewer (grain, saturation) turned that from an
+    occasional collision into a likely one, because both fire after the reviewer has spoken.
+    """
+    from app.graph.nodes.sql_author import _feedback_sections
+
+    base = {"summary_sql": "SELECT 1", "detail_sql": "SELECT 2"}
+    semantic = "Derive the threshold from the data, do not invent a multiplier."
+
+    alone = "\n".join(_feedback_sections({**base, "verify_feedback": semantic}))
+    check(semantic in alone, "a verifier rejection on its own never reaches the author")
+    check(
+        "YOUR PREVIOUS ATTEMPT WAS" in alone,
+        "the author is not shown the SQL it is being asked to change",
+    )
+
+    for mechanical, label in (
+        ("validation_error", "the validator"),
+        ("exec_error", "the database"),
+        ("contract_error", "the contract/grain checks"),
+    ):
+        both = "\n".join(
+            _feedback_sections({**base, mechanical: "something broke", "verify_feedback": semantic})
+        )
+        check(
+            "something broke" in both,
+            f"a rejection from {label} does not reach the author",
+        )
+        check(
+            semantic in both,
+            f"when {label} rejects a rewrite, the reviewer's standing objection is DROPPED - "
+            f"the author will fix the mechanical fault and reinstate what was already refused",
+        )
+        check(
+            both.index("something broke") < both.index(semantic),
+            "the mechanical fault must come first: a query that cannot run cannot be reviewed, "
+            "so that is what has to be fixed before the semantic objection can even be tested",
+        )
+
+
+def test_detail_rows_are_one_per_entity() -> None:
+    """A findings row must name one thing to fix, and name it once.
+
+    THE INCIDENT: the task data keeps one record per update. Four probes read it without
+    resolving to the current record, so DETAIL returned the same task once per historical
+    update - 43,534 rows for 10,860 distinct tasks, and 75-79% duplication on three more
+    checks. The report's headline counted history rows, and the workbook handed someone four
+    copies of every row to fix. A fifth probe used a positional row number as its key, so its
+    findings could not be traced to anything at all.
+
+    Every one of those rules says in plain words to take the most recent record per task.
+    Nothing checked that it had happened, and the evidence was already in hand: the sample rows
+    the executor fetches during compilation. This is decided from those, with no model call.
+    """
+    from app.rules.contract import grain_problems
+
+    cols = ["entity_key", "entity_label", "evidence_x"]
+
+    repeated = [["T1", "a", 1], ["T1", "a", 1], ["T1", "a", 1], ["T2", "b", 2], ["T2", "b", 2],
+                ["T3", "c", 3]]
+    check(
+        bool(grain_problems(cols, repeated)),
+        "a DETAIL repeating the same entity_key is accepted - the grain bug that inflated a "
+        "report fourfold would ship again",
+    )
+
+    positional = [[i, "x", i] for i in range(1, 9)]
+    check(
+        bool(grain_problems(cols, positional)),
+        "entity_key as a positional row number (1, 2, 3 ...) is accepted, so a finding can name "
+        "a position in a result set instead of a record someone can fix",
+    )
+
+    clean = [["A", "a", 1], ["B", "b", 2], ["C", "c", 3], ["D", "d", 4], ["E", "e", 5],
+             ["F", "f", 6]]
+    check(
+        not grain_problems(cols, clean),
+        "a correct DETAIL is being rejected - false rejections cost a full authoring cycle each",
+    )
+    check(
+        not grain_problems(cols, [["T1", "a", 1], ["T1", "a", 1]]),
+        "judging grain from two sample rows: too little evidence, and a wrong rejection here is "
+        "more expensive than the duplicate it would catch",
+    )
+    check(
+        not grain_problems(["evidence_x"], clean),
+        "grain judged without an entity_key column - there is nothing to judge against",
+    )
+
+    # THE CASE THAT ACTUALLY SHIPPED, and which the two checks above do not see: the keys were
+    # all DISTINCT record ids, and everything a reader looks at repeated. Reproduced at the
+    # measured ratio - 25 sample rows carrying 10 distinct findings.
+    from app.rules.contract import grain_concerns
+
+    history = [[1000 + i, "TASK-%d" % (i // 4), 1.1, "same sentence"] for i in range(25)]
+    graingy = "TABLE x.y  -- 9 rows\n  MANY ROWS PER task_code - de-duplicate\n"
+    check(
+        bool(grain_problems(cols + ["evidence_t"], history, False, graingy)),
+        "DETAIL repeating one record under distinct ids is accepted when the SCHEMA itself marks "
+        "the table as MANY ROWS PER entity - this is the 43,534-rows-for-10,860-tasks bug",
+    )
+
+    # THE REJECTION MUST NAME WHAT REPEATS, not just count it.
+    #
+    # The first version reported only the arithmetic - "25 rows reduce to 10" - and left the
+    # author to work out WHICH column identified the thing. Three rules then burned three
+    # attempts each without ever reaching the reviewer, while rules that happened to guess the
+    # right column passed first time. That difference was guesswork, not capability, and the
+    # sample already held the answer.
+    message = " ".join(grain_problems(cols + ["evidence_t"], history, False, graingy))
+    check(
+        "TASK-0" in message,
+        "the rejection does not quote the record that repeats, so the author must guess which "
+        "column to group on - exactly what made three rules fail three attempts each",
+    )
+    check(
+        "task_code" in message,
+        "the rejection does not pass on the grain marker the SCHEMA already states, which names "
+        "the very key the author needs to partition by",
+    )
+    check(
+        "ROW_NUMBER" in message and "PARTITION BY" in message,
+        "the rejection says to de-duplicate but not how - the author is left to invent the "
+        "mechanism while its retry budget runs out",
+    )
+    check(
+        not grain_problems(cols + ["evidence_t"], history, False, ""),
+        "repetition is REFUSED without the schema marker to justify it. A hundred records "
+        "pointing at one missing parent legitimately look alike; only the reviewer can tell, so "
+        "without the marker this must be a concern rather than a refusal",
+    )
+    check(
+        bool(grain_concerns(cols + ["evidence_t"], history)),
+        "unexplained repetition does not even reach the reviewer as a concern",
+    )
+    # The measured separation: correct probes returned 25 distinct rows from 25, broken ones 5
+    # to 15. Anything in between must not sit near the line.
+    distinct25 = [[i, "TASK-%d" % i, i, "t%d" % i] for i in range(25)]
+    check(
+        not grain_problems(cols + ["evidence_t"], distinct25, False, graingy)
+        and not grain_concerns(cols + ["evidence_t"], distinct25),
+        "a probe returning 25 distinct findings from 25 rows is flagged - that is what EVERY "
+        "correct probe in the measured report looked like",
+    )
+
+
+def test_a_saturated_scope_is_refused_above_the_floor() -> None:
+    """scope_total must be a denominator, not the anomalies counted twice.
+
+    Three checks in one report read "N of N (100.00%)", one of which had a real denominator the
+    week before (373 of 422) and had since collapsed onto its own failures. A percentage that is
+    100% by construction tells a business reader that everything is broken, about a population
+    defined as the broken things.
+
+    The floor matters as much as the rule: a small population genuinely can be entirely bad -
+    the same check legitimately reported 5 of 5 - so below it this stays an advisory for the
+    reviewer rather than a refusal.
+    """
+    from app.config import settings
+    from app.rules.contract import sanity_concerns, saturation_problems
+
+    big = settings.saturation_floor + 1000
+    check(
+        bool(saturation_problems({"scope_total": big, "anomaly_count": big})),
+        f"a probe flagging all {big} records in its scope is stored as though it had measured "
+        f"something",
+    )
+    check(
+        not saturation_problems({"scope_total": 5, "anomaly_count": 5}),
+        "a genuinely small all-bad population is refused - 5 of 5 was a real finding",
+    )
+    check(
+        bool(sanity_concerns({"scope_total": 5, "anomaly_count": 5})),
+        "below the floor it must still reach the reviewer as an advisory, or it is simply hidden",
+    )
+    check(
+        not saturation_problems({"scope_total": big, "anomaly_count": big - 1}),
+        "a probe with a real denominator is being refused",
+    )
+
+    import ast
+
+    path = os.path.join(_APP, "graph", "nodes", "sanity_gate.py")
+    body = ast.get_source_segment(
+        open(path, encoding="utf-8").read(),
+        next(n for n in ast.walk(ast.parse(open(path, encoding="utf-8").read()))
+             if isinstance(n, ast.FunctionDef) and n.name == "sanity_gate_node"),
+    )
+    for fn in ("grain_problems", "saturation_problems"):
+        check(
+            fn in body and body.index(fn) < body.index("# ── ADVISORY"),
+            f"{fn} is not enforced as a HARD contract check - it was advisory in effect once "
+            f"already, and a report shipped with the consequences",
+        )
+
+
+def test_summary_is_told_which_counts_are_unconfirmed() -> None:
+    """The executive summary must not quote a saturated count as plain fact.
+
+    The finding's own section carried the caveat; the summary did not, and stated "6,435 tasks
+    cannot be traced to an activity" where 6,435 was also everything that check examined. Most
+    readers read only the summary.
+    """
+    import ast
+
+    path = os.path.join(_APP, "graph", "nodes", "summarizer.py")
+    source = open(path, encoding="utf-8").read()
+    body = ast.get_source_segment(source, next(
+        n for n in ast.walk(ast.parse(source))
+        if isinstance(n, ast.FunctionDef) and n.name == "summarizer_node"
+    ))
+    check(
+        'row["anomaly_count"] == row["scope_total"]' in body,
+        "the summarizer never identifies which findings flagged their whole scope",
+    )
+    check(
+        "UNCONFIRMED" in body,
+        "the summarizer is not told to qualify a count with no denominator, so it will present "
+        "one beside measured percentages as the same kind of number",
+    )
+
+
 def test_reference_prune_never_starves_a_rule() -> None:
     """Cutting the reference material must not remove what a rule is ABOUT.
 
@@ -1164,6 +1583,17 @@ def main() -> int:
         ("schema block states row counts", test_schema_block_states_row_counts),
         ("family clones must prove they execute", test_family_clones_must_prove_they_execute),
         ("reference prune never starves a rule", test_reference_prune_never_starves_a_rule),
+        ("a dedup that reduces nothing is refused", test_a_dedup_that_reduces_nothing_is_refused),
+        ("a malformed rule heading is never silently ignored",
+         test_a_malformed_rule_heading_is_never_silently_ignored),
+        ("two rules measuring the same thing are reported",
+         test_two_rules_measuring_the_same_thing_are_reported),
+        ("author sees every outstanding objection", test_author_sees_every_outstanding_objection),
+        ("detail rows are one per entity", test_detail_rows_are_one_per_entity),
+        ("a saturated scope is refused above the floor",
+         test_a_saturated_scope_is_refused_above_the_floor),
+        ("summary is told which counts are unconfirmed",
+         test_summary_is_told_which_counts_are_unconfirmed),
         (
             "every schema.txt reader survives a comment on the TABLE line",
             test_every_reader_of_schema_txt_survives_a_comment_on_the_table_line,

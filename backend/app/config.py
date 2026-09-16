@@ -181,6 +181,21 @@ class Settings:
     reference_prune: bool = field(
         default_factory=lambda: _get_bool("ANOMALY_REFERENCE_PRUNE", True)
     )
+    # A probe whose scope equals its anomalies is rejected once its scope reaches this size.
+    # Below it, a population genuinely can be entirely bad - the same check legitimately
+    # reported 5 of 5 when five records were in scope - so it is raised as an advisory for the
+    # reviewer instead. A saturated scope in the thousands is not that, and reads to a business
+    # audience as "100% of this is broken" about a population defined as the broken things.
+    saturation_floor: int = field(
+        default_factory=lambda: _get_int("ANOMALY_SATURATION_FLOOR", 50)
+    )
+    # How close a probe's scope may come to a table's full row count before its de-duplication
+    # is judged to have done nothing. Not zero: a probe legitimately drops rows with a NULL
+    # measure, and the case that prompted this read 110,181 against 110,184 rows. Raise it if a
+    # correct probe is ever refused; lower it to be stricter about partial de-duplication.
+    dedup_scope_tolerance: float = field(
+        default_factory=lambda: _get_float("ANOMALY_DEDUP_SCOPE_TOLERANCE", 0.01)
+    )
     # Sections at or below this size are NEVER dropped. Dropping a short policy statement saves
     # nothing and can cost a whole probe, so only the large topical sections are candidates.
     # Raise it to be safer, lower it to cut more.
