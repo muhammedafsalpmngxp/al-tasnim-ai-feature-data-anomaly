@@ -46,7 +46,15 @@ def executor_node(state: CompileState) -> dict:
         # The longer DETAIL deadline governs the whole connection: a detail query legitimately
         # scans, and inheriting the one-row SUMMARY deadline would report every large rule as a
         # timeout rather than as the working probe it is.
-        conn = get_connection(timeout=settings.detail_timeout)
+        #
+        # A SMOKE TEST IS THE EXCEPTION, and takes the SHORT deadline. It runs no detail, so the
+        # long one would only mean waiting ten minutes to learn that an aggregate is slow -
+        # which is not what a smoke test is asking. It asks whether the SQL is VALID, and an
+        # invalid statement is rejected when it is parsed, in milliseconds.
+        smoke = bool(state.get("smoke_test"))
+        conn = get_connection(
+            timeout=settings.query_timeout if smoke else settings.detail_timeout
+        )
         cur = conn.cursor()
 
         cur.execute(summary_sql)
@@ -55,6 +63,23 @@ def executor_node(state: CompileState) -> dict:
         # here rather than being silently read as the first row.
         summary_fetched = [list(r) for r in cur.fetchmany(2)]
         summary_row: list[Any] = summary_fetched[0] if summary_fetched else []
+
+        if not (detail_sql or "").strip():
+            elapsed = time.perf_counter() - start
+            log.info(
+                "exec ok [%s]: summary %d row(s), detail not run in %.2fs",
+                rule_id, len(summary_fetched), elapsed,
+            )
+            return {
+                "exec_error": "",
+                "summary_columns": summary_columns,
+                "summary_row": summary_row,
+                "summary_row_count": len(summary_fetched),
+                "detail_columns": [],
+                "detail_rows": [],
+                "detail_truncated": False,
+                "detail_skipped": True,
+            }
 
         cur.execute(detail_sql)
         detail_columns = _columns(cur)

@@ -89,9 +89,19 @@ def _feedback_sections(state: CompileState) -> list[str]:
         # Without a mechanical error this IS the rejection, and carries the previous attempt
         # with it. Alongside one, it is the objection that still stands underneath.
         head = (
-            "AN INDEPENDENT REVIEWER ALSO REJECTED THIS RULE EARLIER, AND THAT OBJECTION STILL "
-            "STANDS. Satisfy it AS WELL as the problem above - a rewrite that fixes only the "
-            "problem above will be rejected again for this:\n"
+            "AN INDEPENDENT REVIEWER ALSO REJECTED THIS RULE EARLIER. Satisfy that AS WELL "
+            "where you can - a rewrite that fixes only the problem above may be rejected again "
+            "for this.\n\n"
+            "BUT WHERE THE TWO CONFLICT, THE REQUIREMENT ABOVE WINS. It is checked by code "
+            "against what your query actually returned; the review below is a judgement and can "
+            "be mistaken. If doing what the reviewer asks would breach it, do NOT do it - "
+            "satisfy the requirement above and disregard that part of the review.\n\n"
+            "THE REVIEWER SAID:\n"
+            # A probe correctly scoped to 35,796 tasks was told to key on the row `id` instead.
+            # It complied, the scope became the full 110,181 rows, and three rewrites were
+            # refused before the rule failed - having already had the right answer on attempt
+            # two. Restating the objection without saying which authority wins is what kept it
+            # chasing an instruction the code would never accept.
             if mechanical
             else previous + "\n\nAN INDEPENDENT REVIEWER REJECTED IT.\nWHAT TO FIX:\n"
         )

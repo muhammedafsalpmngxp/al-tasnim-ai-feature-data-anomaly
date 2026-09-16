@@ -106,6 +106,9 @@ class CompileState(TypedDict, total=False):
     detail_columns: list[str]
     detail_rows: list[list[Any]]  # at most sample_rows - never the real result
     detail_truncated: bool
+    # Set only by compiler._smoke_test: run the SUMMARY only, on the short timeout. A clone is
+    # being checked for VALID SQL, not measured - see the docstring there.
+    smoke_test: bool
     # Always False during a compile: both halves are executed so both can be contract-checked
     # (see executor.py). The field exists because the detection run, which DOES skip DETAIL on
     # a zero count, reports the same outcome shape.

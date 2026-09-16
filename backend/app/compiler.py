@@ -268,17 +268,32 @@ def _smoke_test(probe: CompiledProbe) -> str:
     surfaced weeks later as a cryptic ODBC error in an unattended run - the precise failure
     mode this engine exists to prevent.
 
-    This costs no model call. It is one aggregate and one capped sample against a read-only
-    connection, which is what the probe would do on its next run anyway. A clone that cannot
-    execute is recorded as FAILED, with the database's own message, and appears in the report
-    as a check that is not running rather than as a check that silently found nothing.
+    ONLY THE SUMMARY IS RUN, AND THAT MATTERS. The first version executed both halves, and on a
+    database where a foreign-key DETAIL scan across a 124,000-row table takes minutes, forty
+    clones turned a compile into an outage: one probe hit the 600-second detail timeout and the
+    next dropped the connection entirely after 936 seconds. The compile became slower and less
+    reliable than the bug it was added to prevent.
+
+    The summary is the cheap half - one aggregate, no row fetch - and it is sufficient. Every
+    failure this check exists to catch is a fault in the SQL ITSELF: a column selected twice, a
+    name that does not exist on this feature's table, a type the substituted query cannot
+    handle. SQL Server rejects those when the statement is parsed and bound, before a row is
+    read, so the summary surfaces them exactly as the detail would. What the detail adds is a
+    full scan, which proves nothing new about a query built from a template that was already
+    executed and reviewed against a real feature.
+
+    A clone that cannot execute is recorded as FAILED, with the database's own message, and
+    appears in the report as a check that is not running rather than as one that silently found
+    nothing.
     """
     from app.graph.nodes.executor import executor_node
 
     result = executor_node({
         "rule_id": probe.rule_id,
         "summary_sql": probe.summary_sql,
-        "detail_sql": probe.detail_sql,
+        # An empty DETAIL makes the executor skip that half. Deliberate - see above.
+        "detail_sql": "",
+        "smoke_test": True,
     })
     return str(result.get("exec_error") or "")
 

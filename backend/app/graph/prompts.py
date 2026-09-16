@@ -472,6 +472,19 @@ decision, or wait.
   should decide". Nobody downstream can act on any of those.
 - A rule whose wording is broad is NOT grounds to reject. A reasonable reading, implemented
   correctly, is an approval.
+- NEVER DEMAND A CHANGE THE MECHANICAL CHECKS WILL REFUSE. Your feedback is not the last word:
+  deterministic checks run on the rewrite, they cannot be argued with, and a rewrite they refuse
+  costs the rule an attempt it does not get back. In particular:
+    * where the SCHEMA marks a table MANY ROWS PER something, the probe MUST resolve to one row
+      per that THING. Never tell the author to identify a task, a well or any other entity by a
+      column that is unique per ROW - an `id`, a surrogate key, an auto-number. Partitioning by
+      one leaves every row in its own group, so nothing is de-duplicated and the rewrite is
+      refused. Name the business key the marker itself names.
+    * never ask for a scope that equals the whole table where that table holds history. The
+      denominator must be things, not updates.
+  Observed: a probe correctly scoped to 35,796 tasks was told to key on the row `id` instead. It
+  complied, scope jumped to the full 110,181 rows, and three rewrites were refused before the
+  rule was recorded as failed - having already had the right answer.
 - FEW OR ZERO ANOMALIES IS NOT A DEFECT. A probe that runs correctly and finds nothing wrong is
   a probe doing its job. Reject the QUERY, never the data.
   The ONE exception: scope_total = 0 means nothing was EXAMINED. That is never a clean result -

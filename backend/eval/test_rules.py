@@ -594,6 +594,37 @@ def test_author_sees_every_outstanding_objection() -> None:
             "the mechanical fault must come first: a query that cannot run cannot be reviewed, "
             "so that is what has to be fixed before the semantic objection can even be tested",
         )
+        # AND THE AUTHOR MUST BE TOLD WHICH ONE WINS.
+        #
+        # A probe correctly scoped to 35,796 tasks was told by the reviewer to key on the row
+        # `id` instead. It complied, the scope became the full 110,181 rows, the mechanical
+        # check refused it three times, and the rule failed - having had the right answer on
+        # attempt two. Showing both objections without ranking them is what kept it chasing an
+        # instruction the code would never accept.
+        check(
+            "THE REQUIREMENT ABOVE WINS" in both,
+            "the author is shown two objections and not told which takes precedence. When the "
+            "reviewer's judgement contradicts a mechanical check, the author will follow the "
+            "reviewer and be refused until its budget runs out",
+        )
+        check(
+            "disregard that part of the review" in both,
+            "the author is never given permission to ignore a review that cannot be satisfied, "
+            "so a mistaken objection is terminal rather than recoverable",
+        )
+
+    from app.graph.prompts import RULE_VERIFIER_SYSTEM
+
+    check(
+        "MECHANICAL CHECKS WILL REFUSE" in RULE_VERIFIER_SYSTEM,
+        "the verifier is not told that its recommendations are themselves checked - so it will "
+        "keep demanding rewrites the contract refuses, at a full attempt each",
+    )
+    check(
+        "unique per ROW" in RULE_VERIFIER_SYSTEM,
+        "the verifier is not warned against naming a row-unique key as an entity identity, "
+        "which is the exact advice that cost DQ-D27 its entire retry budget",
+    )
 
 
 def test_detail_rows_are_one_per_entity() -> None:
@@ -897,6 +928,38 @@ def test_family_clones_must_prove_they_execute() -> None:
         ),
         "the smoke test must run BEFORE the probe's status decides where it is recorded, or a "
         "clone that cannot execute is still counted as compiled",
+    )
+
+    # IT MUST RUN THE SUMMARY ONLY. Executing both halves turned a compile into an outage: a
+    # foreign-key DETAIL scan across a 124,000-row table took 223 seconds, the next hit the
+    # 600-second timeout, and the one after dropped the connection entirely after 936s. The
+    # summary is sufficient - every fault this catches is rejected when the statement is parsed,
+    # before a row is read - and it takes the SHORT timeout for the same reason.
+    smoke = next(
+        (ast.get_source_segment(source, n) for n in ast.walk(tree)
+         if isinstance(n, ast.FunctionDef) and n.name == "_smoke_test"),
+        "",
+    )
+    check(
+        '"detail_sql": ""' in smoke,
+        "the smoke test executes the DETAIL query. On a large database that is a full scan per "
+        "clone, and forty of them timed out and killed the connection - while proving nothing "
+        "the summary does not already prove",
+    )
+    check(
+        '"smoke_test": True' in smoke,
+        "the smoke test does not identify itself to the executor, so it inherits the ten-minute "
+        "detail timeout to check a one-row aggregate",
+    )
+
+    executor = open(os.path.join(_APP, "graph", "nodes", "executor.py"), encoding="utf-8").read()
+    check(
+        "smoke_test" in executor and "query_timeout if smoke else" in executor,
+        "the executor ignores the smoke-test flag, so the short timeout is never applied",
+    )
+    check(
+        'if not (detail_sql or "").strip():' in executor,
+        "the executor runs a blank DETAIL rather than skipping it",
     )
 
 
