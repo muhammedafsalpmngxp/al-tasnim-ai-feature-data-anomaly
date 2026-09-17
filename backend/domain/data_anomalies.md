@@ -349,6 +349,51 @@ immediately, with no change to this description and no change to any code.
 
 ---
 
+## RULE DQ-A13 - Rig left the well before it arrived
+
+- category: Milestone dates
+- severity: critical
+- entity: well
+- method: rule
+- sql_mode: authored
+- status: disabled
+- tags: milestone, rig, rig-off, lifecycle
+
+**What is wrong**
+The date the rig actually left the well falls before the date it actually arrived. Both of these
+record what happened, not what was planned.
+
+**Why it matters**
+A rig cannot leave a well before it arrives, so one of the two dates is wrong. Drilling is
+measured between exactly these two events, so the well reports a negative drilling period and
+every duration, variance and lifecycle figure built on it is wrong by the size of the inversion.
+
+**How to detect**
+Look at wells where both actual dates are known. Flag those where the rig left before it
+arrived. Severity is the size of the inversion in days.
+
+**Do NOT flag**
+Wells missing either actual date — a well that has not been drilled yet is not an inversion.
+Being ahead of the expected schedule is not an anomaly: this check is about two recorded facts
+contradicting each other, not about earliness.
+
+**Disabled — this exact pair of dates is already checked**, by the structural check in Group G
+that compares every start/end date pair the database holds. Switching this on as well would
+report the same wells twice and inflate the flagged-record count, which is the one error a
+data-quality report cannot afford to make.
+
+It is kept here, switched off, so the business concern is on record rather than lost, and so the
+decision can be revisited: change the status to `active` the moment the structural check stops
+covering it. One thing is lost by disabling this rather than the structural check, and it is
+recorded so the trade is visible — this description carries the business severity and the
+business explanation, and the structural check reports the same wells in generic terms.
+
+The earlier check in this group that compares the actual rig-off against the **expected** rig-on
+is a genuinely different question and stays active. That one asks whether a well finished before
+it was due to start; this one asks whether two recorded facts contradict each other.
+
+---
+
 # GROUP B — The pegging sheet
 
 ## RULE DQ-B01 - Pegging sheet missed its deadline
@@ -1516,6 +1561,77 @@ Report **one row per task**.
 
 **Do NOT flag**
 Tasks where either source has no planned finish date.
+
+---
+
+## RULE DQ-D33 - Task finished but was never recorded as starting
+
+- category: Task integrity
+- severity: high
+- entity: task
+- method: rule
+- sql_mode: authored
+- status: active
+- placeholder_date: 1900-01-01
+- tags: task, dates, execution, completeness
+
+**What is wrong**
+A task has an actual finish date recorded while its actual start date is absent.
+
+**Why it matters**
+Work that finished must have started. Without the start, the task's duration cannot be worked
+out at all, so it drops silently out of every duration and productivity figure instead of
+appearing as a gap — the totals still look complete while being short by however many tasks read
+this way.
+
+**How to detect**
+Take the most recent record for each task. Flag those holding an actual finish date where the
+actual start date is absent.
+
+Report **one row per task**, not one per record.
+
+**Do NOT flag**
+Tasks with no actual finish date — work that has not finished is not expected to show a start
+here, and unstarted work is a separate concern. Tasks where either date is the known placeholder
+value rather than a real one.
+
+---
+
+## RULE DQ-D34 - Task progress went backwards
+
+- category: Task history
+- severity: medium
+- entity: task
+- method: rule
+- sql_mode: authored
+- status: draft
+- tags: task, history, progress, regression
+
+**What is wrong**
+The latest progress recorded for a task is lower than the progress recorded for it before — for
+example 80% followed by 60%.
+
+**Why it matters**
+Progress falling is one of three different things: a correction, a rollback, or two conflicting
+records for the same task. Each needs a different response, and none of them is visible in a
+report that only ever reads the newest value. Where it is a conflict, every roll-up built on
+that task is wrong by the difference.
+
+**How to detect**
+This check needs the HISTORY, not the current record. Put each task's records in time order and
+flag a task whose latest progress is lower than the progress in the record immediately before
+it.
+
+Report **one row per task**, with both figures and when each was recorded.
+
+**Do NOT flag**
+Tasks with only one record — there is nothing to compare. Tasks where the earlier progress is
+absent rather than higher: a value appearing for the first time is not a decrease.
+
+**Draft — listed but not run.** The business has not yet confirmed whether progress is allowed
+to fall legitimately. Until it rules, this stays unrun so it cannot report a routine correction
+as a defect, and stays listed so the gap is visible rather than quietly dropped. Change the
+status to `active` once the business has decided.
 
 ---
 

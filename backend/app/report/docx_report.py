@@ -68,6 +68,64 @@ def _shape_of(text: str) -> str:
     return _DIGITS.sub("<n>", masked).strip()
 
 
+def _start_on_a_new_page(paragraph):
+    """Begin this paragraph on a fresh page, WITHOUT inserting an empty one.
+
+    `doc.add_page_break()` does not insert a break - it inserts a PARAGRAPH whose only content
+    is a break run. That paragraph still occupies a line, and it is the line that produced the
+    blank pages in this report: when the preceding section happened to end near the foot of a
+    page, the break paragraph itself would not fit, so Word moved it to the next page and THEN
+    honoured its break - consuming a whole page to render nothing. Two sections use a break
+    here (Findings, and Checks that did not report), which is exactly the two blank pages the
+    document was carrying.
+
+    Setting `page_break_before` on the heading that should start the page asks for the same
+    thing with no paragraph of its own, so it cannot be orphaned and cannot leave a page empty.
+    It is also what Word's own "Page break before" paragraph setting does, which means the
+    document reflows correctly if a reader edits the text above it.
+    """
+    paragraph.paragraph_format.page_break_before = True
+    return paragraph
+
+
+def _justify(paragraph):
+    """Justify running prose. Returns the paragraph, so it composes with the builders above."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    return paragraph
+
+
+def _apply_document_styles(doc) -> None:
+    """Justify the body text ONCE, at the style, rather than on every paragraph built below.
+
+    Doing it per paragraph means every future paragraph has to remember, and the one that
+    forgets is invisible until a reader notices a ragged block halfway down page nine. A style
+    covers what exists and what is added later.
+
+    HEADINGS ARE PUT BACK TO LEFT explicitly. The stock template bases them on Normal, so
+    justifying Normal alone silently justifies them too - and a heading long enough to wrap is
+    then stretched to the margin with gaps between its words.
+
+    Justification is invisible on a single-line paragraph (the last line of a justified
+    paragraph is never stretched), so the short bullets, captions and table cells here are
+    unaffected - they simply gain correct behaviour if they ever wrap.
+    """
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    styles = doc.styles
+    for name in ("Normal", "List Bullet"):
+        try:
+            styles[name].paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        except KeyError:  # a template without this style - never worth losing the report over
+            continue
+    for name in ("Title", "Heading 1", "Heading 2", "Heading 3", "Intense Quote"):
+        try:
+            styles[name].paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        except KeyError:
+            continue
+
+
 def _severity_run(paragraph, severity: str):
     from docx.shared import RGBColor
 
@@ -193,6 +251,7 @@ def build(state, path: str | None = None) -> str:
     section.right_margin = Inches(0.9)
     section.top_margin = Inches(0.8)
     section.bottom_margin = Inches(0.8)
+    _apply_document_styles(doc)
 
     totals = state.get("totals") or {}
     by_severity = state.get("by_severity") or {}
@@ -244,8 +303,7 @@ def build(state, path: str | None = None) -> str:
     results = {r.rule_id: r for r in (state.get("results") or [])}
     rules = state.get("rules") or {}
 
-    doc.add_page_break()
-    doc.add_heading("Findings", level=1)
+    _start_on_a_new_page(doc.add_heading("Findings", level=1))
     if not ranked:
         doc.add_paragraph("No check found anything to report.")
 
@@ -323,8 +381,7 @@ def build(state, path: str | None = None) -> str:
     not_running = state.get("not_running") or []
     failed = [r for r in (state.get("results") or []) if not r.ok]
     if gaps or not_running or failed:
-        doc.add_page_break()
-        doc.add_heading("Checks that did not report", level=1)
+        _start_on_a_new_page(doc.add_heading("Checks that did not report", level=1))
         doc.add_paragraph(
             "These checks produced no finding, but not because the data is clean. They are "
             "listed so the coverage of this report is not overstated."

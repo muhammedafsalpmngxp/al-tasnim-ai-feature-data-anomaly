@@ -1636,6 +1636,110 @@ def test_a_stale_catalog_is_never_silently_executed() -> None:
     )
 
 
+def test_word_report_has_no_blank_pages() -> None:
+    """Regression: the document carried two blank pages, one before each section break.
+
+    `doc.add_page_break()` inserts a PARAGRAPH whose only content is a break. That paragraph
+    occupies a line, so when the section above it ended near the foot of a page it did not fit,
+    moved to the next page, and then broke again - a whole page rendering nothing. The two
+    calls (Findings, Checks that did not report) are exactly the two blank pages observed.
+
+    The fix asks the HEADING to start a page instead, which adds no paragraph of its own. This
+    test pins both halves: no break-only paragraph may be emitted, and the headings that should
+    open a page must actually say so - otherwise a later edit could remove the blank page by
+    removing the page break altogether, and nobody would notice the sections had merged.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("docx") is None:
+        print("         (Word report check skipped - python-docx not installed)")
+        return
+
+    import tempfile
+
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    from app.report import docx_report
+    from app.rules.spec import ProbeResult
+
+    result = ProbeResult(
+        rule_id="DQ-T01", ok=True, scope_total=100, anomaly_count=7, anomaly_pct=7.0,
+        detail_columns=["entity_key", "explain_text"],
+        detail_rows=[["W-1", "the expected date is missing"]],
+        detail_total=7,
+    )
+    state = {
+        "run_id": "test-run",
+        "score": 93,
+        "totals": {"probes_run": 1, "probes_with_findings": 1, "records_examined": 100,
+                   "records_flagged": 7},
+        "by_severity": {"critical": 1},
+        "summary": "A paragraph long enough to wrap across more than one line so that "
+                   "justification is observable at all, followed by a bullet.\n"
+                   "- One bullet point.",
+        "score_basis": "test",
+        "ranked": [{"rule_id": "DQ-T01", "title": "Test finding", "severity": "critical",
+                    "category": "Test", "anomaly_count": 7, "scope_total": 100,
+                    "anomaly_pct": 7.0}],
+        "results": [result],
+        "rules": {},
+        # Forces the second section, so BOTH page-break sites are exercised.
+        "empty_scope": [("DQ-T02", "Examined nothing")],
+        "not_running": [],
+    }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        target = os.path.join(tmp, "test.docx")
+        docx_report.build(state, target)
+
+        from docx import Document
+
+        doc = Document(target)
+        blank_breaks = [
+            p for p in doc.paragraphs
+            if not p.text.strip() and "<w:br" in p._p.xml and 'w:type="page"' in p._p.xml
+        ]
+        check(
+            not blank_breaks,
+            f"the Word report emits {len(blank_breaks)} break-only paragraph(s); each one can "
+            "render as a blank page when the section above it ends near the foot of a page",
+        )
+
+        opens_a_page = {
+            p.text.strip() for p in doc.paragraphs
+            if p.paragraph_format.page_break_before
+        }
+        for heading in ("Findings", "Checks that did not report"):
+            check(
+                heading in opens_a_page,
+                f'"{heading}" no longer starts on a new page - the section now runs on from '
+                "whatever precedes it",
+            )
+
+        body = [
+            p for p in doc.paragraphs
+            if p.style.name in ("Normal", "List Bullet") and p.text.strip()
+        ]
+        check(
+            bool(body),
+            "the Word report produced no body paragraphs, so alignment cannot be checked",
+        )
+        check(
+            all(
+                (p.alignment or p.style.paragraph_format.alignment)
+                == WD_ALIGN_PARAGRAPH.JUSTIFY
+                for p in body
+            ),
+            "body prose in the Word report is not justified",
+        )
+        for name in ("Title", "Heading 1", "Heading 2"):
+            check(
+                doc.styles[name].paragraph_format.alignment == WD_ALIGN_PARAGRAPH.LEFT,
+                f"style {name!r} is not left-aligned - a heading long enough to wrap would be "
+                "stretched to the margin",
+            )
+
+
 def main() -> int:
     tests = [
         ("every module parses and imports", test_every_module_parses),
@@ -1678,6 +1782,7 @@ def main() -> int:
         ("families expand without SQL", test_families_expand_without_sql),
         ("staleness is judged per probe", test_staleness_is_judged_per_probe),
         ("a stale catalog is never silently executed", test_a_stale_catalog_is_never_silently_executed),
+        ("Word report has no blank pages", test_word_report_has_no_blank_pages),
     ]
     for name, fn in tests:
         before = len(_failures)
