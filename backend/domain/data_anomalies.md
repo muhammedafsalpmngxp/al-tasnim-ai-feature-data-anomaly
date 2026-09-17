@@ -394,6 +394,101 @@ it was due to start; this one asks whether two recorded facts contradict each ot
 
 ---
 
+## RULE DQ-A14 - Rig left the well but was never recorded as arriving
+
+- category: Milestone dates
+- severity: critical
+- entity: well
+- method: rule
+- sql_mode: authored
+- status: active
+- tags: milestone, rig, rig-on, rig-off, lifecycle, completeness
+
+**What is wrong**
+A well has an actual rig-off date recorded while its actual rig-on date is absent.
+
+**Why it matters**
+Drilling is measured from the rig arriving to the rig leaving, so a well with only the second of
+those two facts has no measurable drilling period at all. It does not appear as a bad number — it
+drops out of every duration and variance figure silently, and the well reads as if drilling never
+happened on it.
+
+**How to detect**
+Look at wells where the actual rig-off date is present. Flag those where the actual rig-on date
+is absent.
+
+**Do NOT flag**
+Wells with no actual rig-off recorded — a well that has not finished drilling is not expected to
+show an arrival for this purpose. Wells holding both actual dates, whether or not they ran early
+or late against the plan: earliness is not an anomaly and a contradiction between the two dates
+is a different check in this group.
+
+---
+
+## RULE DQ-A15 - Active well has no task activities
+
+- category: Structural completeness
+- severity: high
+- entity: well
+- method: rule
+- sql_mode: authored
+- status: active
+- tags: well, task, traceability, coverage
+
+**What is wrong**
+A well that has not been completed has no task records that can be traced to it.
+
+**Why it matters**
+Progress, delay and resource analysis for a live well is built entirely from its task records. A
+well with none of them is not reported as having a problem — it is absent from the analysis
+altogether, so nobody looking at task-level reporting can tell it is being missed.
+
+**How to detect**
+Look only at wells that are not yet completed. Flag a well where no task record can be traced to
+it at all.
+
+Report **one row per well**.
+
+**Do NOT flag**
+Completed wells — their work is finished and their absence from live task analysis is expected.
+A well whose tasks exist but where one individual task fails to resolve: that is a task-level
+traceability problem and is checked separately.
+
+---
+
+## RULE DQ-A16 - Well has no usable location
+
+- category: Reference integrity
+- severity: medium
+- entity: well
+- method: rule
+- sql_mode: authored
+- status: draft
+- tags: reference, location, well
+
+**What is wrong**
+A well has no location recorded, or the location it records cannot be traced to the authoritative
+source of locations.
+
+**Why it matters**
+Location identifies where the work is physically happening, and anything reported by area,
+cluster or site silently omits a well that has none.
+
+**How to detect**
+Look at wells and check that the location is both present and resolves against whichever source
+the business names as authoritative for locations.
+
+**Do NOT flag**
+Wells the business has confirmed do not require a location.
+
+**Draft — there is no agreed authoritative source of locations yet.** More than one place in this
+database holds something location-shaped and they do not agree; one of them is empty. Activating
+this against the wrong one would report every well as defective, or none. Name the authoritative
+source in the business rules and change the status to `active`; nothing else here needs to
+change.
+
+---
+
 # GROUP B — The pegging sheet
 
 ## RULE DQ-B01 - Pegging sheet missed its deadline
@@ -1632,6 +1727,256 @@ absent rather than higher: a value appearing for the first time is not a decreas
 to fall legitimately. Until it rules, this stays unrun so it cannot report a routine correction
 as a defect, and stays listed so the gap is visible rather than quietly dropped. Change the
 status to `active` once the business has decided.
+
+---
+
+## RULE DQ-D35 - Task is not attached to any well
+
+- category: Reference integrity
+- severity: high
+- entity: task
+- method: rule
+- sql_mode: authored
+- status: active
+- tags: task, well, traceability, completeness
+
+**What is wrong**
+A task records no well at all, so there is no way to say which well the work belongs to.
+
+**Why it matters**
+Everything reported per well — progress, slippage, crew effort — is assembled by grouping tasks
+under their well. A task with no well is not reported against the wrong well; it is reported
+against none, so the work it represents quietly disappears from every well-level total while
+still counting in the overall ones.
+
+**How to detect**
+Take the most recent record for each task. Flag those where no well is recorded.
+
+Report **one row per task**, not one per record.
+
+**Do NOT flag**
+Tasks that record a well which cannot be traced — naming something that does not exist is a
+different condition from naming nothing, and the two have different fixes. That case is the next
+check.
+
+---
+
+## RULE DQ-D36 - Task is attached to a well that does not exist
+
+- category: Reference integrity
+- severity: high
+- entity: task
+- method: rule
+- sql_mode: authored
+- status: active
+- tags: task, well, reference, traceability
+
+**What is wrong**
+A task records a well, but that well cannot be traced to a real one.
+
+**Why it matters**
+The task looks correctly attributed until someone tries to follow the link. Every report that
+joins tasks to wells drops the task silently rather than raising an error, so the work is missing
+from well-level figures while appearing perfectly healthy in task-level ones.
+
+**How to detect**
+Take the most recent record for each task that records a well. Flag those whose well cannot be
+traced to the master list of wells.
+
+Report **one row per task**, with the value that could not be traced.
+
+**Do NOT flag**
+Tasks recording no well at all — that is the previous check. Differences of spacing or letter
+case alone, where the well is otherwise the same one.
+
+---
+
+## RULE DQ-D37 - Task has no crew assigned
+
+- category: Reference integrity
+- severity: high
+- entity: task
+- method: rule
+- sql_mode: authored
+- status: active
+- tags: task, crew, resource, completeness
+
+**What is wrong**
+A task that has to be carried out by somebody names no crew.
+
+**Why it matters**
+Crew productivity, workload and utilisation are all worked out per crew. Work with no crew is
+counted in the totals but attributed to nobody, so every crew appears less busy than it is and
+the effort cannot be planned against.
+
+**How to detect**
+Take the most recent record for each task that represents work to be executed. Flag those naming
+no crew.
+
+Report **one row per task**.
+
+**Do NOT flag**
+Tasks that name a crew which cannot be traced — that is a separate check in this group, and the
+two must not both report the same task. Task types the business has confirmed need no crew.
+
+---
+
+## RULE DQ-D38 - Project has no work breakdown
+
+- category: Structural completeness
+- severity: high
+- entity: project
+- method: rule
+- sql_mode: authored
+- status: active
+- tags: project, wbs, structure
+
+**What is wrong**
+A project has no work-breakdown groups beneath it.
+
+**Why it matters**
+The work breakdown is how work is organised and how progress is rolled up into a project figure.
+A project without one cannot produce a progress number at all, so it is absent from project
+reporting rather than showing as incomplete.
+
+**How to detect**
+Look at projects that are in scope for construction reporting. Flag a project where no
+work-breakdown group can be traced to it.
+
+Report **one row per project**.
+
+**Do NOT flag**
+Projects the business has placed outside construction reporting. Do not read an empty or
+unrelated mapping table as proof that a project has no breakdown — if the relationship cannot be
+established from the business rules, report that rather than reporting every project as broken.
+
+---
+
+## RULE DQ-D39 - Work-breakdown group holds no activities
+
+- category: Structural completeness
+- severity: medium
+- entity: wbs
+- method: rule
+- sql_mode: authored
+- status: active
+- tags: wbs, activity, structure
+
+**What is wrong**
+A work-breakdown group exists but no activity belongs to it.
+
+**Why it matters**
+An empty group contributes no work to project progress while still carrying its share of the
+weighting. The project's progress is then divided among groups, one of which can never advance,
+so the total is permanently held below what the work actually justifies.
+
+**How to detect**
+Look at work-breakdown groups belonging to a project in scope. Flag a group where no activity can
+be traced to it.
+
+Report **one row per group**.
+
+**Do NOT flag**
+Groups the business defines as structural headings that are not meant to hold activities
+directly.
+
+---
+
+## RULE DQ-D40 - Activity has no work recorded against it
+
+- category: Structural completeness
+- severity: medium
+- entity: activity
+- method: rule
+- sql_mode: authored
+- status: active
+- tags: activity, task, traceability, coverage
+
+**What is wrong**
+An activity is defined in the work breakdown, but no task has ever been recorded against it.
+
+**Why it matters**
+The activity is planned work that execution data never touches, so it cannot be monitored,
+measured or reported as late. It sits in the plan looking complete-able while nothing exists to
+complete it.
+
+**How to detect**
+Follow each activity through to the tasks recorded against it. Flag activities with none.
+
+Report **one row per activity**.
+
+**Do NOT flag**
+Activities the business defines as summary, planning-only or otherwise not executed. Activities
+whose tasks exist but fail to resolve — that is the task-side traceability check, and reporting
+both would count the same broken link twice.
+
+---
+
+## RULE DQ-D41 - Active task has not been updated for a long time
+
+- category: Task history
+- severity: medium
+- entity: task
+- method: rule
+- sql_mode: authored
+- status: draft
+- tags: task, freshness, stale
+
+**What is wrong**
+A task that is still open has had no update for an unusually long time.
+
+**Why it matters**
+A stale task carries dates and a progress figure that look perfectly valid, so nothing about it
+appears wrong — but the figures describe a situation that may have moved on weeks ago. Every
+forecast built on it is confidently out of date, which is worse than an obviously missing value.
+
+**How to detect**
+For each task still open, measure how long it has been since its most recent update, against the
+latest date the data itself reaches rather than against today's clock. Flag those older than the
+threshold the business has agreed.
+
+Report **one row per task**, with the age.
+
+**Do NOT flag**
+Completed tasks. Tasks within the agreed window.
+
+**Draft — no freshness threshold has been agreed.** How long is too long is a business judgement
+about how often this data is expected to be maintained, and it differs by work type. Do not pick
+a number here: agree one, record it in the business rules, and change the status to `active`.
+
+---
+
+## RULE DQ-D42 - Task names equipment that does not exist
+
+- category: Reference integrity
+- severity: medium
+- entity: task
+- method: rule
+- sql_mode: authored
+- status: draft
+- tags: task, equipment, resource, reference
+
+**What is wrong**
+A task names a piece of equipment that cannot be traced to the equipment register.
+
+**Why it matters**
+Utilisation and cost are reported per item of equipment. Work attributed to something that is not
+in the register is counted in the totals but cannot be charged, scheduled or maintained against
+anything real.
+
+**How to detect**
+Take the most recent record for each task that names equipment. Flag those whose equipment cannot
+be traced to the authoritative register.
+
+Report **one row per task**.
+
+**Do NOT flag**
+Tasks naming no equipment, where equipment is not required for that kind of work.
+
+**Draft — the task-to-equipment relationship is not established.** The equipment register exists
+and is populated, but nothing states how a task refers to an item in it, nor which kinds of work
+are required to name one. Both have to be recorded in the business rules before this can be
+anything other than a guess. Change the status to `active` once they are.
 
 ---
 
