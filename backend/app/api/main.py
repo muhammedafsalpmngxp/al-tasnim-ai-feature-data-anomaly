@@ -258,8 +258,17 @@ async def _stream_job(work, name: str):
         events.put((event, data))
 
     def worker() -> None:
+        from app.rules.lockfile import CompileLockError
+
         try:
             work(emit)
+        except CompileLockError as exc:
+            # Another PROCESS holds the catalog lock - a CLI compile, typically, which _BUSY
+            # above cannot see. Nothing ran and nothing is broken, so it is reported in the
+            # lock's own words rather than as "CompileLockError: ...", which reads to an
+            # operator like a defect in the engine.
+            log.info("api: %s refused - %s", name, exc)
+            events.put(("error", {"message": str(exc), "busy": True}))
         except Exception as exc:  # noqa: BLE001 - the client must be told, not left hanging
             log.warning("api: %s failed - %s: %s", name, type(exc).__name__, exc)
             events.put(("error", {"message": f"{type(exc).__name__}: {exc}"}))

@@ -912,10 +912,11 @@ def test_family_clones_must_prove_they_execute() -> None:
         "compiler._smoke_test is gone - nothing executes a cloned query before storing it",
     )
 
-    body = next(
-        (ast.get_source_segment(source, n) for n in ast.walk(tree)
-         if isinstance(n, ast.FunctionDef) and n.name == "compile_rules"),
-        "",
+    # BOTH halves: compile_rules is a thin wrapper holding the cross-process lock and
+    # _compile_rules is the body it delegates to, so a check for either must see both.
+    body = "\n".join(
+        ast.get_source_segment(source, n) or "" for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name in ("compile_rules", "_compile_rules")
     )
     check(
         "_smoke_test(probe)" in body,
@@ -1036,10 +1037,11 @@ def test_family_retries_another_member_before_giving_up() -> None:
     source = open(path, encoding="utf-8").read()
     tree = ast.parse(source)
 
-    body = next(
-        (ast.get_source_segment(source, n) for n in ast.walk(tree)
-         if isinstance(n, ast.FunctionDef) and n.name == "compile_rules"),
-        "",
+    # BOTH halves: compile_rules is a thin wrapper holding the cross-process lock and
+    # _compile_rules is the body it delegates to, so a check for either must see both.
+    body = "\n".join(
+        ast.get_source_segment(source, n) or "" for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name in ("compile_rules", "_compile_rules")
     )
     check(bool(body), "compile_rules not found in compiler.py")
 
@@ -1082,10 +1084,11 @@ def test_compile_progress_is_reportable() -> None:
 
     path = os.path.join(_APP, "compiler.py")
     source = open(path, encoding="utf-8").read()
-    body = next(
-        (ast.get_source_segment(source, n) for n in ast.walk(ast.parse(source))
-         if isinstance(n, ast.FunctionDef) and n.name == "compile_rules"),
-        "",
+    # BOTH halves: compile_rules is a thin wrapper holding the cross-process lock and
+    # _compile_rules is the body it delegates to, so a check for either must see both.
+    body = "\n".join(
+        ast.get_source_segment(source, n) or "" for n in ast.walk(ast.parse(source))
+        if isinstance(n, ast.FunctionDef) and n.name in ("compile_rules", "_compile_rules")
     )
     check("progress" in body, "compile_rules exposes no progress callback")
     check(
@@ -1740,6 +1743,186 @@ def test_word_report_has_no_blank_pages() -> None:
             )
 
 
+def test_compile_lock_excludes_another_process() -> None:
+    """The lock must hold across PROCESSES, which is the only case that matters.
+
+    A threading test would pass against a lock that protects nothing: the bug being fixed is a
+    CLI compile racing the API's, and those are separate processes, so this spawns real ones.
+
+    Three properties, in the order they matter:
+
+      1. while A holds it, B is refused - with CompileLockError, not a generic failure;
+      2. once A releases it, B can take it - a lock that is never released is a deadlock
+         wearing a lock's clothes;
+      3. if A is KILLED while holding it, B can still take it. This is the property the whole
+         design rests on. There is no stale-lock timeout and no PID liveness check, so if the
+         kernel did not release the lock on abnormal termination, one crashed compile would
+         lock the tool out permanently and only a manual file deletion would recover it.
+    """
+    import subprocess
+    import tempfile
+    import time
+
+    # Each case gets its own lock path, so a failure cannot leak into the next case and so the
+    # real .cache/compile.lock is never touched by the suite.
+    holder_src = (
+        "import os,sys,time\n"
+        f"sys.path.insert(0, {_BACKEND!r})\n"
+        "from app.rules import lockfile\n"
+        "lockfile.LOCK_PATH = sys.argv[1]\n"
+        "with lockfile.compile_lock():\n"
+        "    print('HELD', flush=True)\n"
+        "    time.sleep(float(sys.argv[2]))\n"
+        "print('RELEASED', flush=True)\n"
+    )
+
+    def try_acquire(path: str, want_holder: bool = False) -> str:
+        """'ok' if this separate process could take the lock, 'refused', or the error.
+
+        With want_holder, a refusal prints the holder's pid instead, so the test can prove the
+        refusal MESSAGE is usable - see the mandatory-lock note below.
+        """
+        report = (
+            "    print('holder:' + str(exc.holder.get('pid')))\n" if want_holder
+            else "    print('refused')\n"
+        )
+        src = (
+            "import sys\n"
+            f"sys.path.insert(0, {_BACKEND!r})\n"
+            "from app.rules import lockfile\n"
+            "lockfile.LOCK_PATH = sys.argv[1]\n"
+            "try:\n"
+            "    with lockfile.compile_lock():\n"
+            "        print('ok')\n"
+            "except lockfile.CompileLockError as exc:\n"
+            + report
+        )
+        out = subprocess.run(
+            [sys.executable, "-c", src, path],
+            capture_output=True, text=True, timeout=60,
+        )
+        # Scanned for the verdict rather than read off the last line: compile_lock() LOGS on
+        # acquire and release, so on the success path "lock: ... released" is printed after
+        # "ok" and taking the final line reports a passing case as a failure.
+        lines = [ln.strip() for ln in ((out.stdout or "") + "\n" + (out.stderr or "")).split("\n")]
+        for line in lines:
+            if line in ("ok", "refused") or line.startswith("holder:"):
+                return line
+        return (out.stderr or out.stdout or "no output").strip()[-200:]
+
+    def start_holder(path: str, seconds: float):
+        proc = subprocess.Popen(
+            [sys.executable, "-c", holder_src, path, str(seconds)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        # Wait for it to say it actually holds the lock. Sleeping a fixed interval instead
+        # makes the test pass on a fast machine and flake on a loaded one.
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            line = proc.stdout.readline()
+            if line.strip() == "HELD":
+                return proc
+            if proc.poll() is not None:
+                break
+        proc.kill()
+        raise AssertionError("the holder process never reported holding the lock")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # ── 1 & 2: held → refused, released → acquirable ──
+        path = os.path.join(tmp, "a.lock")
+        holder = start_holder(path, 8)
+        try:
+            check(
+                try_acquire(path) == "refused",
+                "a second PROCESS acquired the compile lock while another held it - two "
+                "compiles can run at once and the slower one's work is silently discarded",
+            )
+            # THE REFUSAL MUST NAME ITS HOLDER, and on Windows that is not free: a byte-range
+            # lock there is MANDATORY, so a process that does not hold the lock cannot read the
+            # locked bytes at all. Putting the mutex byte on top of the diagnostic JSON made
+            # every read fail and every refusal say "another process is compiling" - true, and
+            # useless to whoever has to find out which one. Caught in a live two-process run,
+            # pinned here so the offset cannot quietly move back.
+            check(
+                try_acquire(path, want_holder=True) == f"holder:{holder.pid}",
+                "a refused compile cannot identify the process holding the lock, so an "
+                "operator has no way to find out what to wait for",
+            )
+        finally:
+            holder.terminate()
+            holder.wait(timeout=30)
+
+        check(
+            try_acquire(path) == "ok",
+            "the compile lock was not released when its holder exited - every later compile "
+            "is refused for ever",
+        )
+
+        # ── 3: killed holder → the kernel releases it ──
+        path = os.path.join(tmp, "b.lock")
+        holder = start_holder(path, 120)
+        holder.kill()
+        holder.wait(timeout=30)
+        check(
+            try_acquire(path) == "ok",
+            "the compile lock survived its holder being KILLED. The design has no stale-lock "
+            "timeout and no PID liveness check precisely because the OS is supposed to release "
+            "it here - if it does not, one crashed compile locks the tool out permanently",
+        )
+
+        # The lockfile is deliberately never deleted: its EXISTENCE is not the lock, and
+        # unlinking it on release would let two processes lock different inodes at one path.
+        check(
+            os.path.exists(path),
+            "the lockfile was deleted on release - see the unlink race in lockfile.py",
+        )
+
+
+def test_compile_is_guarded_by_the_lock() -> None:
+    """The guard must be on compile_rules itself, not on one of its callers.
+
+    The catalog is read at the start of a compile to decide what can be reused and written at
+    the end. Locking only the save would still let a second compile read the same starting
+    state and overwrite everything the first built, so the lock has to span the whole function
+    - and it has to be on the function every caller goes through, not on the CLI or the API,
+    either of which can be bypassed by the other.
+    """
+    with open(os.path.join(_APP, "compiler.py"), encoding="utf-8") as fh:
+        source = fh.read()
+    check(
+        "with compile_lock():" in source,
+        "compiler.py does not hold the compile lock - a CLI compile and a UI compile can run "
+        "at the same time and the slower one's probes vanish silently",
+    )
+    check(
+        "_compile_rules(" in source,
+        "the locked wrapper no longer delegates to the compile body",
+    )
+    # The only writer. If a second one ever appears, the lock stops covering the catalog and
+    # this test is where that gets noticed.
+    check(
+        source.count("catalog_store.save(") == 1,
+        "compiler.py now saves the catalog in more than one place - the lock guards "
+        "compile_rules, so every catalog write must happen inside it",
+    )
+
+    with open(os.path.join(_APP, "rules", "lockfile.py"), encoding="utf-8") as fh:
+        lock_source = fh.read()
+    check(
+        "O_EXCL" in lock_source,
+        "the lockfile is not created with exclusive creation, so two processes can both "
+        "believe they created it",
+    )
+    # The decision that was explicitly taken: no age-based recovery. A compile legitimately
+    # runs for 25-40 minutes, and a timeout firing during one would let a second compile
+    # destroy its work - a worse bug than the race being fixed.
+    check(
+        "os.remove(LOCK_PATH)" not in lock_source and "os.unlink(LOCK_PATH)" not in lock_source,
+        "the lock module deletes the lockfile, which reintroduces both the unlink race and, if "
+        "it is age-based, the risk of breaking a live compile's lock",
+    )
+
+
 def main() -> int:
     tests = [
         ("every module parses and imports", test_every_module_parses),
@@ -1783,6 +1966,8 @@ def main() -> int:
         ("staleness is judged per probe", test_staleness_is_judged_per_probe),
         ("a stale catalog is never silently executed", test_a_stale_catalog_is_never_silently_executed),
         ("Word report has no blank pages", test_word_report_has_no_blank_pages),
+        ("compile is guarded by the lock", test_compile_is_guarded_by_the_lock),
+        ("compile lock excludes another process", test_compile_lock_excludes_another_process),
     ]
     for name, fn in tests:
         before = len(_failures)

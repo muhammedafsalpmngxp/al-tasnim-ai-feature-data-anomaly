@@ -280,10 +280,19 @@ def cmd_compile(args) -> int:
         f"main model {settings.active_model})"
     )
 
-    catalog, report, errors = compile_rules(
-        only=args.rule or None, force=args.force, retry_failed=args.retry_failed,
-        source=args.source,
-    )
+    # A refused lock is NOT a failed compile, and must not read like one: nothing was tried and
+    # nothing is wrong with the rules. Reported as its own message with its own exit code, so a
+    # script can tell "try again later" from "this needs looking at".
+    from app.rules.lockfile import CompileLockError
+
+    try:
+        catalog, report, errors = compile_rules(
+            only=args.rule or None, force=args.force, retry_failed=args.retry_failed,
+            source=args.source,
+        )
+    except CompileLockError as exc:
+        console.print(f"[yellow]{exc}[/]")
+        return 3
 
     table = Table(show_header=True, header_style="bold cyan", title="Compile result")
     table.add_column("Outcome")

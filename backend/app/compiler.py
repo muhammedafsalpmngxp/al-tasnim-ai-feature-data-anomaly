@@ -27,6 +27,7 @@ from app.graph.build import build_compile_graph
 from app.llm import get_usage_report, start_usage_tracking
 from app.observability import get_logger
 from app.rules import catalog as catalog_store
+from app.rules.lockfile import CompileLockError, compile_lock  # noqa: F401 - re-exported
 from app.rules.expand import (
     coverage_summary,
     expand_families,
@@ -314,6 +315,27 @@ def _failed_probe(rule: AnomalyRule, fingerprint: str, error: str) -> CompiledPr
 
 
 def compile_rules(
+    only: list[str] | None = None,
+    force: bool = False,
+    retry_failed: bool = False,
+    source: str | None = None,
+    progress=None,
+) -> tuple[catalog_store.Catalog, CompileReport, list[str]]:
+    """Compile every rule that needs it, holding the cross-process catalog lock.
+
+    THE LOCK WRAPS THE WHOLE COMPILE, not just the save. The catalog is read at the start to
+    decide what can be reused and written at the end; a lock around the write alone would still
+    let a second compile read the same starting state and overwrite everything the first one
+    built. See app/rules/lockfile.py for why the lock is an OS lock rather than a timeout.
+
+    This is a wrapper rather than an indent of the body below, so the compile itself is
+    byte-for-byte what it was - the guard is added around it, not woven into it.
+    """
+    with compile_lock():
+        return _compile_rules(only, force, retry_failed, source, progress)
+
+
+def _compile_rules(
     only: list[str] | None = None,
     force: bool = False,
     retry_failed: bool = False,
