@@ -1727,19 +1727,73 @@ def test_word_report_has_no_blank_pages() -> None:
             bool(body),
             "the Word report produced no body paragraphs, so alignment cannot be checked",
         )
+        # READ OFF THE PARAGRAPH, NOT OFF THE STYLE, because that is the value Word applies.
+        # Three reports were shipped whose styles carried the alignment correctly while every
+        # paragraph in them resolved to None, and the earlier form of this check - which fell
+        # back to the style - reported them as justified.
+        unjustified = [
+            p.text[:60] for p in body if p.alignment != WD_ALIGN_PARAGRAPH.JUSTIFY
+        ]
         check(
-            all(
-                (p.alignment or p.style.paragraph_format.alignment)
-                == WD_ALIGN_PARAGRAPH.JUSTIFY
-                for p in body
-            ),
-            "body prose in the Word report is not justified",
+            not unjustified,
+            f"{len(unjustified)} body paragraph(s) in the Word report are not justified, "
+            f"e.g. {unjustified[:2]}",
         )
-        for name in ("Title", "Heading 1", "Heading 2"):
+        headings = [
+            p for p in doc.paragraphs
+            if (p.style.name.startswith("Heading") or p.style.name == "Title") and p.text.strip()
+        ]
+        check(
+            headings and all(p.alignment == WD_ALIGN_PARAGRAPH.LEFT for p in headings),
+            "headings in the Word report are not left-aligned - one long enough to wrap would "
+            "be stretched to the margin with gaps between its words",
+        )
+
+        # ── The disclaimer, on every page ──
+        #
+        # Asserted on the SECTION FOOTER rather than by counting paragraphs: the footer is the
+        # only construct Word repeats on every page by definition, so a disclaimer written into
+        # the body flow would land wherever the text happened to reach and be absent from the
+        # rest. is_linked_to_previous must be off, or a section inheriting its footer shows
+        # nothing of its own.
+        for section in doc.sections:
+            footer_text = " ".join(p.text for p in section.footer.paragraphs).strip()
             check(
-                doc.styles[name].paragraph_format.alignment == WD_ALIGN_PARAGRAPH.LEFT,
-                f"style {name!r} is not left-aligned - a heading long enough to wrap would be "
-                "stretched to the margin",
+                docx_report.DISCLAIMER in footer_text,
+                "the verification disclaimer is missing from a section footer, so pages in "
+                "that section carry no disclaimer at all",
+            )
+            check(
+                section.footer.is_linked_to_previous is False,
+                "a section footer is linked to the previous one, so it renders nothing of its "
+                "own and those pages lose the disclaimer",
+            )
+        sizes = [
+            r.font.size for p in doc.sections[0].footer.paragraphs for r in p.runs
+            if r.text.strip()
+        ]
+        check(
+            sizes and all(s is not None and s.pt <= 9 for s in sizes),
+            "the footer disclaimer is not set in a small font, so it competes with the "
+            "findings for the reader's attention",
+        )
+
+        # ── The catalog note ──
+        #
+        # Shown whether or not anything is still stale, because probes rebuilt mid-run produced
+        # findings from SQL written minutes ago - but labelled WARNING only when something is
+        # genuinely still wrong. Reporting a staleness the run had already fixed as an
+        # outstanding warning is how a banner stops being read.
+        note = "4 probe(s) were rebuilt automatically before this run"
+        for stale, want in ((False, "Note: "), (True, "WARNING: ")):
+            target2 = os.path.join(tmp, f"note-{stale}.docx")
+            docx_report.build({**state, "catalog_stale": stale, "catalog_note": note}, target2)
+            texts = [p.text for p in Document(target2).paragraphs]
+            check(
+                any(t.startswith(want) and note in t for t in texts),
+                f"with catalog_stale={stale} the report does not carry the catalog note "
+                f"prefixed {want!r} - a reader cannot tell a resolved rebuild from a live "
+                "problem",
             )
 
 

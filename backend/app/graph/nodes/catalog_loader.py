@@ -148,6 +148,12 @@ def catalog_loader_node(state: RunState) -> dict:
         too_many = len(outdated) > settings.auto_compile_max_rules
         if settings.auto_compile and not too_many:
             outdated, note = _recompile(sorted(outdated), note)
+            # RECOMPUTED, NOT LEFT AS IT WAS. `stale` was decided before the rebuild and never
+            # revisited, so a staleness the run had already FIXED was still reported as
+            # outstanding - the report printed "WARNING" over a note whose own text said the
+            # probes had been rebuilt. `outdated` now holds only what could not be rebuilt, so
+            # it is the honest answer to "is anything still stale?".
+            stale = bool(outdated)
             catalog = catalog_store.load()
             rules = _all_rules_by_id()
             selected = [

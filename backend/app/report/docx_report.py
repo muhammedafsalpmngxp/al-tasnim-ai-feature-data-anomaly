@@ -126,6 +126,74 @@ def _apply_document_styles(doc) -> None:
             continue
 
 
+# Printed at the foot of EVERY page. Short on purpose: a disclaimer nobody finishes reading is
+# not a disclaimer.
+DISCLAIMER = (
+    "Al-Tasnim AI Data Anomaly Analysis may contain errors or inaccuracies. Please verify "
+    "important findings against the source data before taking action."
+)
+
+
+def _page_footer(doc, text: str) -> None:
+    """Put `text` in the section footer, so Word repeats it on every page.
+
+    A FOOTER, NOT A PARAGRAPH PER PAGE. Word decides where pages break - the builder cannot
+    know, and anything written into the body flow lands wherever the text happens to reach
+    rather than at the foot of each page. The footer is the only construct that is by
+    definition on every page, and it keeps repaginating correctly when the content changes.
+
+    linked_to_previous is cleared on every section: a section that inherits its footer shows
+    nothing of its own, and a document that later grows a second section would silently lose
+    the disclaimer on those pages.
+    """
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Pt, RGBColor
+
+    for section in doc.sections:
+        section.footer.is_linked_to_previous = False
+        paragraph = section.footer.paragraphs[0]
+        paragraph.text = ""
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = paragraph.add_run(text)
+        run.italic = True
+        run.font.size = Pt(7)
+        # Grey rather than black: it must be legible on every page without competing with the
+        # findings for attention.
+        run.font.color.rgb = RGBColor.from_string("808080")
+
+
+def _justify_body(doc) -> None:
+    """Set alignment on every finished paragraph: justified prose, left headings.
+
+    WHY THIS RUNS AT THE END AND NOT AT EACH add_paragraph(). Alignment inherited from a STYLE
+    is correct XML and persists through a save, but it is only honoured when nothing between
+    the style and the paragraph overrides it - and the stock template, a Word version, or any
+    style this document uses that is not Normal can do exactly that. Setting it on the
+    paragraph itself is the value Word actually applies, with nothing left to resolve.
+
+    Done in ONE pass at the end rather than at forty call sites, so a paragraph added later
+    cannot be the one that forgets.
+    """
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    # Headings, captions and quotes stay left. A heading long enough to wrap would otherwise be
+    # stretched to the margin with gaps between its words, which reads as a defect.
+    left = ("Title", "Intense Quote")
+    for paragraph in doc.paragraphs:
+        name = paragraph.style.name if paragraph.style is not None else "Normal"
+        if name.startswith("Heading") or name in left:
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        else:
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    # Table cells hold short labels and counts. Justifying them does nothing on one line and
+    # looks wrong the moment one wraps, so they are explicitly left.
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for paragraph in cell.paragraphs:
+                    paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+
 def _severity_run(paragraph, severity: str):
     from docx.shared import RGBColor
 
@@ -294,9 +362,18 @@ def build(state, path: str | None = None) -> str:
             p.add_run(fragment).bold = bold
 
     _small(doc, "How the score is calculated: " + str(state.get("score_basis", "")))
-    if state.get("catalog_stale") and state.get("catalog_note"):
+
+    # SHOWN WHETHER OR NOT ANYTHING IS STILL WRONG, because "four probes were out of date and
+    # were rebuilt before this run" is something a reader of these numbers is entitled to know -
+    # the SQL behind four of the findings was written minutes ago, not at the last compile.
+    #
+    # The LABEL is what changes. It used to be WARNING unconditionally, so a staleness that had
+    # already been resolved was reported as an outstanding problem: readers asked about a defect
+    # that had fixed itself seconds earlier, and a label that cries wolf stops being read.
+    if state.get("catalog_note"):
         p = doc.add_paragraph()
-        p.add_run("WARNING: " + str(state["catalog_note"])).bold = True
+        stale = bool(state.get("catalog_stale"))
+        p.add_run(("WARNING: " if stale else "Note: ") + str(state["catalog_note"])).bold = stale
 
     # ── Findings ──
     ranked = state.get("ranked") or []
@@ -416,6 +493,10 @@ def build(state, path: str | None = None) -> str:
                 p = doc.add_paragraph(style="List Bullet")
                 p.add_run(f"{item.get('rule_id', '')} - {item.get('title', '')}: ").bold = True
                 p.add_run(str(item.get("reason", ""))[:400])
+
+    # Both run over the FINISHED document, so nothing added above can escape them.
+    _justify_body(doc)
+    _page_footer(doc, DISCLAIMER)
 
     doc.save(target)
     log.info(
