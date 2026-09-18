@@ -25,9 +25,11 @@ usually fail again, at full cost, every single run.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 
 from app.observability import get_logger
 from app.rules.spec import AnomalyRule, CompiledProbe
@@ -37,7 +39,91 @@ log = get_logger()
 _CACHE_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".cache"
 )
-_CATALOG_PATH = os.path.join(_CACHE_DIR, "anomaly_catalog.json")
+
+# ONE CATALOG PER DATABASE, NOT ONE CATALOG.
+#
+# Every probe here was authored, grounded and reviewed against ONE database, at a cost of
+# roughly one model call each and half an hour for a full build. Point DB_NAME somewhere else
+# and all of it is correctly judged stale - the database identity is folded into the structure
+# fingerprint - so a compile rebuilds the lot. That much is right.
+#
+# What was wrong is where the rebuild LANDED. A single file meant the new catalog overwrote the
+# old one, and the previous database's half hour of work was not set aside, it was destroyed.
+# Switching back rebuilt it from nothing, and switching again destroyed the other. Two databases
+# used in rotation therefore cost a full compile EVERY TIME, for ever, for work that had already
+# been done twice.
+#
+# Keyed by identity, so each database keeps its own and a switch back is free. The name is in
+# the filename for a human reading the directory; the hash is what actually distinguishes them,
+# because two servers can host databases with the same name and the name alone is not identity.
+_CATALOG_STEM = "anomaly_catalog"
+# Where the catalog lived when there was only one. Read as a LAST RESORT so an existing
+# installation does not lose a compile it has already paid for - see _legacy_path().
+_LEGACY_CATALOG_PATH = os.path.join(_CACHE_DIR, f"{_CATALOG_STEM}.json")
+
+
+def current_database() -> dict[str, str]:
+    """Which database this process is pointed at, as a catalog records it."""
+    from app.config import settings
+
+    return {"name": settings.db_name, "server": settings.db_server}
+
+
+# Matches ONLY a per-database catalog: the slug always ends in the 8-hex identity digest that
+# _slug() appends. Deliberately not "anything with an extra dot in the name" - a hand-made
+# backup like `anomaly_catalog.before-grain-fix.json` sitting in the same directory would be
+# mistaken for a migrated catalog and silently cancel the upgrade path below.
+_PER_DATABASE_NAME = re.compile(
+    rf"^{re.escape(_CATALOG_STEM)}\.[A-Za-z0-9_.-]+-[0-9a-f]{{8}}\.json$"
+)
+
+
+def _slug(database: dict[str, str]) -> str:
+    """A filename-safe, human-readable, COLLISION-FREE key for one database.
+
+    The readable part is for whoever opens .cache and wants to know what they are looking at.
+    The hash is the part that means anything: it covers server, port and name, so a database
+    restored onto a second server under the same name does not quietly share the first one's
+    probes.
+    """
+    from app.config import settings
+
+    identity = f"{settings.db_server}:{settings.db_port}/{settings.db_name}".lower()
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
+    readable = re.sub(r"[^A-Za-z0-9_.-]+", "-", database.get("name") or "db").strip("-")[:40]
+    return f"{readable or 'db'}-{digest}"
+
+
+def path() -> str:
+    """Where THIS database's catalog is written."""
+    return os.path.join(_CACHE_DIR, f"{_CATALOG_STEM}.{_slug(current_database())}.json")
+
+
+def _legacy_path() -> str:
+    """The pre-split catalog, ONLY while no database has a catalog of its own yet.
+
+    This is the upgrade path, and it is deliberately a one-off. An installation that compiled
+    before the split has one `anomaly_catalog.json` holding real, paid-for work; throwing it
+    away on upgrade would charge the operator a full rebuild for installing a new build.
+    Adopting it cannot make a wrong probe run - database identity is inside every stored
+    fingerprint, so a catalog adopted by the wrong database is judged stale and rebuilt - so the
+    worst case is a recompile that was going to happen anyway.
+
+    THE MOMENT ANY PER-DATABASE CATALOG EXISTS, THIS FILE IS SUPERSEDED and never read again.
+    Without that condition the stale file would be offered to the SECOND database too, and to
+    the third, each time producing a confident "loaded 82 probes" log line about probes written
+    for somewhere else, followed by a full rebuild. Correct, but alarming to read and pointless
+    to compute. It is left on disk rather than deleted: it is somebody's record of a compile,
+    and a cache that erases files on upgrade is a cache people stop trusting.
+    """
+    if not os.path.exists(_LEGACY_CATALOG_PATH):
+        return ""
+    try:
+        if any(_PER_DATABASE_NAME.match(name) for name in os.listdir(_CACHE_DIR)):
+            return ""
+    except OSError:
+        return ""
+    return _LEGACY_CATALOG_PATH
 
 # Bumped when the MEANING of a stored field changes. Without it an older catalog would be
 # loaded and trusted by newer code that reads its fields differently - and the failure would be
@@ -53,6 +139,10 @@ class Catalog:
     structure_fingerprint: str = ""
     compiled_at: str = ""
     version: int = CATALOG_VERSION
+    # Which database these probes were written against. Recorded so a file can be identified
+    # from its contents rather than only from its name, and so a catalog that somehow reaches
+    # the wrong database can be recognised and refused rather than half-trusted.
+    database: dict[str, str] = field(default_factory=dict)
 
     def get(self, rule_id: str) -> CompiledProbe | None:
         return self.probes.get(rule_id)
@@ -77,16 +167,29 @@ class Catalog:
 
 
 def load() -> Catalog:
-    """Read the catalog. A missing, unreadable or outdated file yields an EMPTY catalog.
+    """Read THIS DATABASE's catalog. A missing, unreadable or outdated file yields an EMPTY one.
 
     Never raises. A corrupt catalog is a recoverable situation - everything in it can be
     rebuilt from the rule files and the database - so the honest response is to say so and
     recompile, not to stop the operator from running anything at all.
+
+    Reads only; it never moves or deletes a file. A read that rearranged the cache would be a
+    surprise to every caller, and several of them are concurrent API requests.
     """
-    if not os.path.exists(_CATALOG_PATH):
-        return Catalog(probes={})
+    database = current_database()
+    source = path()
+    if not os.path.exists(source):
+        source = _legacy_path()
+        if not source:
+            return Catalog(probes={})
+        log.info(
+            "catalog: %s has no catalog of its own yet - reading the pre-split %s. Anything "
+            "that does not match this database will be rebuilt, and the result saved as %s.",
+            database.get("name") or "this database",
+            os.path.basename(_LEGACY_CATALOG_PATH), os.path.basename(path()),
+        )
     try:
-        with open(_CATALOG_PATH, encoding="utf-8") as fh:
+        with open(source, encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError) as exc:
         log.warning("catalog: could not be read (%s) - it will be rebuilt", exc)
@@ -97,6 +200,20 @@ def load() -> Catalog:
         log.warning(
             "catalog: written by format version %s, this build expects %s - rebuilding",
             version or "unknown", CATALOG_VERSION,
+        )
+        return Catalog(probes={})
+
+    # A catalog that names a DIFFERENT database is refused outright rather than half-trusted.
+    # Per-probe staleness would catch it anyway - database identity is inside every fingerprint
+    # - but only probe by probe, and only for probes a rule still asks for. Refusing here means
+    # the answer cannot depend on which rules happen to be enabled today. Files with no
+    # database recorded predate the field and are left to the fingerprint, as before.
+    written_for = data.get("database") or {}
+    if written_for and not _same_database(written_for, database):
+        log.warning(
+            "catalog: %s was compiled against %s, not %s - ignoring it and rebuilding.",
+            os.path.basename(source), written_for.get("name") or "another database",
+            database.get("name") or "this database",
         )
         return Catalog(probes={})
 
@@ -115,9 +232,20 @@ def load() -> Catalog:
         structure_fingerprint=str(data.get("structure_fingerprint") or ""),
         compiled_at=str(data.get("compiled_at") or ""),
         version=version,
+        database=written_for,
     )
     log.info("catalog: loaded %d probe(s) - %s", len(probes), catalog.counts())
     return catalog
+
+
+def _same_database(a: dict[str, str], b: dict[str, str]) -> bool:
+    """Same server AND same name. Either side unlabelled is NOT a match."""
+    if not a or not b:
+        return False
+    return (
+        (a.get("name") or "").lower() == (b.get("name") or "").lower()
+        and (a.get("server") or "").lower() == (b.get("server") or "").lower()
+    )
 
 
 def save(catalog: Catalog) -> str:
@@ -128,18 +256,27 @@ def save(catalog: Catalog) -> str:
     would silently drop checks, and nothing downstream could tell.
     """
     os.makedirs(_CACHE_DIR, exist_ok=True)
+    # Stamped with the database at SAVE time, not with whatever the loaded file claimed. These
+    # probes were just written against the database this process is connected to, and that is
+    # the only thing the stamp is allowed to mean.
+    catalog.database = current_database()
     payload = {
         "version": CATALOG_VERSION,
+        "database": catalog.database,
         "structure_fingerprint": catalog.structure_fingerprint,
         "compiled_at": catalog.compiled_at,
         "probes": [p.to_json() for p in catalog.probes.values()],
     }
-    tmp = _CATALOG_PATH + ".tmp"
+    destination = path()
+    tmp = destination + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, ensure_ascii=False)
-    os.replace(tmp, _CATALOG_PATH)
-    log.info("catalog: saved %d probe(s) - %s", len(catalog.probes), catalog.counts())
-    return _CATALOG_PATH
+    os.replace(tmp, destination)
+    log.info(
+        "catalog: saved %d probe(s) for %s - %s",
+        len(catalog.probes), catalog.database.get("name") or "this database", catalog.counts(),
+    )
+    return destination
 
 
 def structure_moved(
@@ -253,10 +390,6 @@ def prune_removed(catalog: Catalog, rule_ids: set[str]) -> list[str]:
             len(gone), ", ".join(sorted(gone)[:10]) + (" ..." if len(gone) > 10 else ""),
         )
     return gone
-
-
-def path() -> str:
-    return _CATALOG_PATH
 
 
 def duplicate_probes(catalog: Catalog) -> list[tuple[str, ...]]:

@@ -157,8 +157,10 @@ class AnomalyRule:
 class CompiledProbe:
     """A rule after compilation: the SQL that will actually run, plus how it got there.
 
-    Persisted to .cache/anomaly_catalog.json. `rule_hash` and `structure_fingerprint` together
-    decide whether this entry is still valid, or whether this one rule must be recompiled.
+    Persisted to .cache/anomaly_catalog.<database>.json - one per database, because these
+    probes are only valid against the one they were authored against. `rule_hash` and
+    `structure_fingerprint` together decide whether this entry is still valid, or whether this
+    one rule must be recompiled.
     """
 
     rule_id: str

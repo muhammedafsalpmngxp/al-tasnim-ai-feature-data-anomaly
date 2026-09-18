@@ -146,18 +146,25 @@ _SHOW_FILES = {
     # The compiled SQL itself. Inspectable on purpose: the probes decide what the report says,
     # so being able to read exactly what will run - without a database or a model - is what
     # makes a finding auditable.
-    "catalog": "anomaly_catalog.json",
+    #
+    # Resolved through catalog.path() rather than named here, because there is one catalog PER
+    # DATABASE and its filename carries which. A fixed name would print another database's
+    # probes, or claim none had been compiled while a full catalog sat beside it.
+    "catalog": None,
 }
 
 
 def cmd_show(args) -> int:
     """Print a cached artefact, so what the agents will actually see is inspectable."""
+    from app.rules import catalog as catalog_store
+
     console = _console()
     name = _SHOW_FILES.get(args.what)
-    path = os.path.join(_cache_dir(), name)
+    path = catalog_store.path() if name is None else os.path.join(_cache_dir(), name)
     if not os.path.exists(path):
         console.print(
-            f"[yellow]{name} does not exist yet.[/] Run: python -m app.cli introspect"
+            f"[yellow]{os.path.basename(path)} does not exist yet.[/] Run: "
+            + ("python -m app.cli compile" if name is None else "python -m app.cli introspect")
         )
         return 1
     with open(path, encoding="utf-8") as fh:
@@ -516,34 +523,61 @@ def cmd_run(args) -> int:
 
 
 def cmd_runs(args) -> int:
-    """Show the recorded run history - the trend, which one score alone cannot give."""
+    """Show the recorded run history - the trend, which one score alone cannot give.
+
+    A TREND IS ONLY A TREND IF EVERY ROW MEASURED THE SAME DATABASE. Point DB_NAME somewhere
+    else and yesterday's rows describe a different system; printed in one column of scores with
+    nothing to separate them, the step between two databases reads as a change in data quality.
+    So the rows for this database come first, the rest are listed below under the database they
+    actually measured, and every row says which one it was.
+    """
     from rich.table import Table
 
-    from app.runner import history
+    from app.runner import current_database, history_for_current_database
 
     console = _console()
-    runs = history()
-    if not runs:
+    mine, others = history_for_current_database()
+    database = current_database()
+    here = database.get("name") or "this database"
+    if not mine and not others:
         console.print("[yellow]No runs recorded yet.[/] Run: python -m app.cli run")
         return 1
 
-    table = Table(show_header=True, header_style="bold cyan", title="Run history")
-    table.add_column("Run")
-    table.add_column("When")
-    table.add_column("Score", justify="right")
-    table.add_column("Findings", justify="right")
-    table.add_column("Flagged", justify="right")
-    table.add_column("Took", justify="right")
-    for run in runs[: args.limit]:
-        score = run.score
-        colour = "green" if score >= 90 else "yellow" if score >= 70 else "red"
-        table.add_row(
-            run.run_id, run.started_at[:19], f"[{colour}]{score}[/]",
-            str(run.totals.get("probes_with_findings", 0)),
-            f"{run.totals.get('records_flagged', 0):,}",
-            f"{run.seconds:.0f}s",
+    def _table(rows, title: str) -> Table:
+        table = Table(show_header=True, header_style="bold cyan", title=title)
+        table.add_column("Run")
+        table.add_column("When")
+        table.add_column("Database")
+        table.add_column("Score", justify="right")
+        table.add_column("Findings", justify="right")
+        table.add_column("Flagged", justify="right")
+        table.add_column("Took", justify="right")
+        for run in rows:
+            score = run.score
+            colour = "green" if score >= 90 else "yellow" if score >= 70 else "red"
+            table.add_row(
+                run.run_id, run.started_at[:19],
+                run.database.get("name") or "[yellow]not recorded[/]",
+                f"[{colour}]{score}[/]",
+                str(run.totals.get("probes_with_findings", 0)),
+                f"{run.totals.get('records_flagged', 0):,}",
+                f"{run.seconds:.0f}s",
+            )
+        return table
+
+    if mine:
+        console.print(_table(mine[: args.limit], f"Run history - {here}"))
+    else:
+        console.print(f"[yellow]No run has been recorded against {here} yet.[/]")
+
+    if others:
+        console.print()
+        console.print(
+            f"[yellow]{len(others)} other run(s)[/] measured a different database, or were "
+            "recorded before runs noted which database they measured. They are kept, but they "
+            f"say nothing about {here} - do not read them as part of its trend."
         )
-    console.print(table)
+        console.print(_table(others[: args.limit], "Other databases"))
     return 0
 
 

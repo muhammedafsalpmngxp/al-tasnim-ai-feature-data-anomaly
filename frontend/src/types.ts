@@ -29,6 +29,14 @@ export interface Finding {
   concerns: string[]
 }
 
+// Which database a run measured. Optional because runs recorded before the field existed do
+// not have it - and an absent value means UNKNOWN, never "the current one". See RunSummary in
+// backend/app/runner.py for why guessing is the thing to avoid.
+export interface DatabaseRef {
+  name: string
+  server: string
+}
+
 export interface NotRunning {
   rule_id: string
   title: string
@@ -39,6 +47,7 @@ export interface NotRunning {
 export interface RunResult {
   run_id: string
   started_at: string
+  database?: DatabaseRef
   seconds: number
   score: number
   score_basis: string
@@ -61,6 +70,7 @@ export interface RunResult {
 export interface RunRow {
   run_id: string
   started_at: string
+  database?: DatabaseRef
   seconds: number
   score: number
   totals: Totals
@@ -110,8 +120,19 @@ export interface RuleDetail {
   } | null
 }
 
+// The one heavy operation this server is running, as anybody may read it - not only the tab
+// that started it. `elapsed` is computed SERVER-side; the client's clock is not the server's.
+export interface JobSnapshot {
+  job: 'compile' | 'run'
+  started_at: string
+  elapsed: number
+  done: number
+  total: number
+  label: string
+}
+
 export interface Status {
-  database: { name: string; server: string }
+  database: DatabaseRef
   schemas: string[]
   models: { main: string; fast: string }
   catalog: {
@@ -122,6 +143,11 @@ export interface Status {
     not_applicable: number
   }
   runs: number
+  // Split by database, decided on the SERVER so the dashboard and `python -m app.cli runs`
+  // cannot give different answers to "how much history is there for this database?".
+  runs_here: number
+  runs_elsewhere: number
   latest_run: RunRow | null
   busy: boolean
+  job: JobSnapshot | null
 }

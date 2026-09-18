@@ -40,6 +40,13 @@ _RESULTS_DIR = os.path.join(_CACHE_DIR, "run_results")
 MAX_HISTORY = 200
 
 
+def current_database() -> dict[str, str]:
+    """Which database this process is pointed at, as a run records it."""
+    from app.config import settings
+
+    return {"name": settings.db_name, "server": settings.db_server}
+
+
 @dataclass
 class RunSummary:
     """One row of the history. Small by design - no findings, ever."""
@@ -53,13 +60,26 @@ class RunSummary:
     report_paths: dict[str, str] = field(default_factory=dict)
     llm_calls: int = 0
     error: str = ""
+    # WHICH DATABASE THIS SCORE IS ABOUT.
+    #
+    # The history exists to show a DIRECTION OF TRAVEL, and a trend is only a trend if every
+    # point measures the same subject. Point DB_NAME somewhere else - a restored copy, staging,
+    # next year's database - and without this field the next run lands in the same series as
+    # the old one: the chart draws a line from one database to another and calls the step a
+    # change in data quality. That is the single most misleading thing this history could say,
+    # so the subject is recorded with the score.
+    #
+    # Empty for runs recorded before this field existed. Absent is NOT treated as "the current
+    # one" anywhere - an unlabelled point could be from any database, and guessing is how the
+    # mixing this prevents would come straight back.
+    database: dict[str, str] = field(default_factory=dict)
 
     def to_json(self) -> dict:
         return {
             "run_id": self.run_id, "started_at": self.started_at, "seconds": self.seconds,
             "score": self.score, "totals": self.totals, "by_severity": self.by_severity,
             "report_paths": self.report_paths, "llm_calls": self.llm_calls,
-            "error": self.error,
+            "error": self.error, "database": self.database,
         }
 
     @classmethod
@@ -74,6 +94,17 @@ class RunSummary:
             report_paths=data.get("report_paths") or {},
             llm_calls=int(data.get("llm_calls") or 0),
             error=data.get("error", ""),
+            database=data.get("database") or {},
+        )
+
+    def same_database_as(self, database: dict[str, str]) -> bool:
+        """Was this run made against `database`? False when either side is unlabelled."""
+        if not self.database or not database:
+            return False
+        return (
+            (self.database.get("name") or "").lower() == (database.get("name") or "").lower()
+            and (self.database.get("server") or "").lower()
+            == (database.get("server") or "").lower()
         )
 
 
@@ -89,6 +120,28 @@ def history() -> list[RunSummary]:
         return []
     runs = [RunSummary.from_json(r) for r in (data.get("runs") or [])]
     return sorted(runs, key=lambda r: r.started_at, reverse=True)
+
+
+def history_for_current_database() -> tuple[list[RunSummary], list[RunSummary]]:
+    """(runs against the database this process is pointed at, every other recorded run).
+
+    THE SPLIT LIVES HERE, NOT IN A CALLER. The API and the CLI both show this history, and the
+    whole reason the API is a thin shell over this module is so the two can never disagree about
+    what the engine did. A filter written in one of them would have made the dashboard hide an
+    old database's runs while `python -m app.cli runs` listed them in the same table as today's,
+    unlabelled - two answers to one question, which is the thing that arrangement exists to
+    prevent.
+
+    "Every other run" is returned rather than dropped because those runs are still a true record
+    of what was found, and the count of them is what turns a bare "nothing here" into "nothing
+    here FOR THIS DATABASE, and here is what else there is".
+    """
+    database = current_database()
+    mine: list[RunSummary] = []
+    others: list[RunSummary] = []
+    for run in history():
+        (mine if run.same_database_as(database) else others).append(run)
+    return mine, others
 
 
 def _record(summary: RunSummary) -> None:
@@ -114,6 +167,7 @@ def _save_results(run_id: str, final: dict, summary: RunSummary) -> None:
     payload = {
         "run_id": run_id,
         "started_at": summary.started_at,
+        "database": summary.database,
         "seconds": summary.seconds,
         "score": summary.score,
         "score_basis": final.get("score_basis", ""),
@@ -224,6 +278,7 @@ def run_detection(
         report_paths=final.get("report_paths") or {},
         llm_calls=int(final.get("llm_calls") or 0),
         error=error or str(final.get("report_error") or ""),
+        database=current_database(),
     )
     _record(summary)
     _save_results(run_id, final, summary)

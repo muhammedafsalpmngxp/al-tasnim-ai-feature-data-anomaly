@@ -356,6 +356,29 @@ def _compile_rules(
     report = CompileReport()
     start_usage_tracking()
 
+    # ── The cached picture of the database, REFRESHED BEFORE THE RULES ARE EXPANDED ──────
+    #
+    # ORDER IS LOAD-BEARING HERE, and it was wrong. A structural family is one rule applied to
+    # every matching feature the schema declares, and that feature list is read out of
+    # .cache/schema.txt by rules/schema_index.py - a plain file parser with no freshness check
+    # of its own, by design. So expanding the families first expanded them over WHATEVER
+    # DATABASE WAS LAST INTROSPECTED, and these three calls, which are what rewrites that
+    # cache, ran afterwards.
+    #
+    # On an unchanged database nobody could see it. On the first compile after DB_NAME moved it
+    # was severe and silent: every family member was generated for the PREVIOUS database's
+    # tables, so each one failed to author against tables this database does not have; the new
+    # database's own foreign keys, date pairs and numeric ranges got no probes at all, because
+    # nothing had enumerated them; and prune_removed judged the whole catalog against that wrong
+    # rule list. Compiling a second time appeared to fix it - by then the first compile had
+    # rewritten the cache - which made it look like a flaky compile rather than an ordering bug.
+    #
+    # Moving them costs nothing. All three are fingerprinted caches: on a database that has not
+    # changed they compare a hash and return the file they already had.
+    schema = introspect.build_schema_text()
+    values = introspect.build_value_hints()
+    numbers = introspect.build_numeric_hints()
+
     rules, errors = _all_rules()
     for problem in errors:
         log.warning("load: %s", problem)
@@ -399,9 +422,6 @@ def _compile_rules(
         )
         signatures = {}
 
-    schema = introspect.build_schema_text()
-    values = introspect.build_value_hints()
-    numbers = introspect.build_numeric_hints()
     # The probe SHAPES are a property of THIS ENGINE's contract, not of the business, so they
     # live beside the contract in prompts.py rather than at the top of the file a business
     # owner opens to describe an anomaly.

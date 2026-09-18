@@ -20,10 +20,12 @@ running them inline would freeze every other request, including /api/health.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import os
 import queue
 import threading
+import time
 from typing import Any, Iterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -38,6 +40,74 @@ log = get_logger()
 # Only one heavy operation at a time. Not a queue: a caller told "busy, try again" can decide
 # what to do, while a caller silently queued behind a twenty-minute compile cannot.
 _BUSY = threading.Lock()
+
+# WHAT THE RUNNING JOB IS DOING, READABLE BY SOMEBODY WHO IS NOT HOLDING THE STREAM.
+#
+# The SSE stream reaches the caller who STARTED the job. That is one browser tab, and a compile
+# runs for half an hour - long enough that the tab gets reloaded, closed, opened on another
+# machine, or simply left while the operator goes to lunch. Every one of those loses the stream
+# while the job keeps running, and the UI could then only say "another operation is in
+# progress": no bar, no percentage, no clock, and indistinguishable from a hang.
+#
+# So the same progress events are recorded here as well, and /api/status hands the snapshot to
+# anyone who asks. IN MEMORY ON PURPOSE - it describes a thread inside this process, so a
+# restart that loses it has lost the job it described too, and a snapshot that outlived its
+# work would be a lie on the dashboard.
+_JOB_LOCK = threading.Lock()
+_JOB: dict[str, Any] | None = None
+
+
+def _job_started(name: str) -> None:
+    global _JOB
+    with _JOB_LOCK:
+        _JOB = {
+            "job": name,
+            "started_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "_monotonic": time.monotonic(),
+            "done": 0,
+            "total": 0,
+            "label": "",
+        }
+
+
+def _job_progress(name: str, data: dict) -> None:
+    """Fold one progress event into the snapshot.
+
+    A compile counts RULES and a run counts STAGES, so the numbers arrive under different keys.
+    They are normalised to done/total/label HERE rather than in the client, so a second client
+    cannot end up rendering the same job differently from the first.
+    """
+    with _JOB_LOCK:
+        if _JOB is None or _JOB.get("job") != name:
+            return
+        if name == "compile":
+            _JOB["done"] = int(data.get("done") or 0)
+            _JOB["label"] = str(data.get("rule_id") or "")
+        else:
+            _JOB["done"] = int(data.get("step") or 0)
+            _JOB["label"] = str(data.get("stage") or "")
+        _JOB["total"] = int(data.get("total") or 0)
+
+
+def _job_finished() -> None:
+    global _JOB
+    with _JOB_LOCK:
+        _JOB = None
+
+
+def _job_snapshot() -> dict | None:
+    """The running job with a SERVER-COMPUTED elapsed time, or None when nothing is running.
+
+    Elapsed seconds are sent rather than a start time alone because the client's clock is not
+    this machine's: a browser a few minutes out of step would otherwise show a compile that
+    started in the future, or one that has apparently been running for hours.
+    """
+    with _JOB_LOCK:
+        if _JOB is None:
+            return None
+        snapshot = {k: v for k, v in _JOB.items() if not k.startswith("_")}
+        snapshot["elapsed"] = round(time.monotonic() - _JOB["_monotonic"], 1)
+        return snapshot
 
 app = FastAPI(
     title="Data Quality & Anomaly Sentinel",
@@ -80,10 +150,14 @@ def health() -> dict:
 def status() -> dict:
     """Everything a dashboard needs to render before any run: what exists and what is current."""
     from app.rules import catalog as catalog_store
-    from app.runner import history
+    from app.runner import history, history_for_current_database
 
     catalog = catalog_store.load()
     runs = history()
+    # Scoped to this database, exactly as /api/runs/latest is. The two describe the same thing
+    # and a dashboard that read one for its headline and the other for its status line would
+    # contradict itself the moment DB_NAME moved.
+    mine, other_database_runs = history_for_current_database()
     return {
         "database": {"name": settings.db_name, "server": settings.db_server},
         "schemas": list(settings.allowed_schemas),
@@ -96,8 +170,11 @@ def status() -> dict:
             "not_applicable": len(catalog.not_applicable),
         },
         "runs": len(runs),
-        "latest_run": runs[0].to_json() if runs else None,
+        "runs_here": len(mine),
+        "runs_elsewhere": len(other_database_runs),
+        "latest_run": mine[0].to_json() if mine else None,
         "busy": _BUSY.locked(),
+        "job": _job_snapshot(),
     }
 
 
@@ -180,24 +257,50 @@ def runs(limit: int = Query(default=50, ge=1, le=200)) -> dict:
 
 @app.get("/api/runs/latest", dependencies=[Depends(require_api_key)])
 def latest_run() -> dict:
-    from app.runner import history, load_results
+    """The newest run MADE AGAINST THE DATABASE THIS PROCESS IS POINTED AT.
 
-    recorded = history()
-    if not recorded:
+    Not simply the newest run. Change DB_NAME and the previous database's last run is still the
+    newest row in the index - it would be served as the dashboard's headline score, its findings
+    and its summary, describing a database nobody is looking at any more, with nothing on screen
+    to say so. A dashboard that confidently reports the wrong system is worse than an empty one,
+    so an unmatched history is answered with "nothing here yet" and the reason.
+    """
+    from app.runner import current_database, history_for_current_database, load_results
+
+    mine, others = history_for_current_database()
+    if not mine and not others:
         raise HTTPException(status_code=404, detail="No run has been recorded yet")
-    results = load_results(recorded[0].run_id)
+    if not mine:
+        database = current_database()
+        raise HTTPException(status_code=404, detail=(
+            f"No run has been recorded against {database.get('name') or 'this database'} yet. "
+            f"The history holds {len(others)} run(s) from another database or from before "
+            "runs recorded which database they measured."
+        ))
+    results = load_results(mine[0].run_id)
     if results is None:
         raise HTTPException(status_code=404, detail="The latest run has no stored results")
+    results.setdefault("database", mine[0].database)
     return results
 
 
 @app.get("/api/runs/{run_id}", dependencies=[Depends(require_api_key)])
 def run_detail(run_id: str) -> dict:
-    from app.runner import load_results
+    """One run by id - INCLUDING one from another database, deliberately.
+
+    Old runs stay readable: they are a record of what was true, and deleting the past because
+    the connection string moved would destroy the only evidence of it. What they must not do is
+    masquerade as current, so the database each one measured travels with it and the UI says so.
+    """
+    from app.runner import history, load_results
 
     results = load_results(run_id)
     if results is None:
         raise HTTPException(status_code=404, detail=f"No stored results for run {run_id!r}")
+    if not results.get("database"):
+        # Written before the results file carried it; the index row may still know.
+        row = next((r for r in history() if r.run_id == run_id), None)
+        results["database"] = row.database if row else {}
     return results
 
 
@@ -253,8 +356,14 @@ async def _stream_job(work, name: str):
         return StreamingResponse(busy(), media_type="text/event-stream")
 
     events: queue.Queue = queue.Queue()
+    _job_started(name)
 
     def emit(event: str, data: Any) -> None:
+        # Recorded BEFORE it is queued. The queue is drained by whoever holds the stream, and
+        # if nobody does - a closed tab - it is never drained at all; the snapshot has to be
+        # updated on the producing side or it would freeze exactly when it matters most.
+        if event == "progress" and isinstance(data, dict):
+            _job_progress(name, data)
         events.put((event, data))
 
     def worker() -> None:
@@ -273,6 +382,9 @@ async def _stream_job(work, name: str):
             log.warning("api: %s failed - %s: %s", name, type(exc).__name__, exc)
             events.put(("error", {"message": f"{type(exc).__name__}: {exc}"}))
         finally:
+            # Ordered: the snapshot is cleared BEFORE the lock is released, so /api/status can
+            # never answer "not busy" while still describing a running job.
+            _job_finished()
             events.put(None)
             _BUSY.release()
 

@@ -22,7 +22,7 @@ rule_loader → grounding → anomaly_sql_author → validator → executor
              catalog_writer ← rule_verifier ← sanity_gate ────┘
 ```
 
-Turns each declared anomaly into a validated, executed, verified pair of SQL probes and writes them to `.cache/anomaly_catalog.json`.
+Turns each declared anomaly into a validated, executed, verified pair of SQL probes and writes them to `.cache/anomaly_catalog.<database>.json` - one catalog per database, so pointing `DB_NAME` somewhere else does not destroy the probes compiled for the first one.
 
 ### RUN — frequent, near-free
 

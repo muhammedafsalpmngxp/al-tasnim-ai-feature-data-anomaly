@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, downloadReport, stream } from './api/client'
 import { CategoryBar, SEVERITY_COLOURS, ScoreTrend, SeverityDonut } from './components/Charts'
-import type { RuleDetail, RuleRow, RunResult, RunRow, Status } from './types'
+import type { DatabaseRef, JobSnapshot, RuleDetail, RuleRow, RunResult, RunRow, Status } from './types'
 
 type Tab = 'dashboard' | 'findings' | 'rules' | 'runs'
 
@@ -46,14 +46,25 @@ function formatDuration(seconds: number): string {
   return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, '0')}m`
 }
 
+function sameDatabase(a: DatabaseRef | undefined, b: DatabaseRef | undefined): boolean {
+  if (!a?.name || !b?.name) return false
+  return (
+    a.name.toLowerCase() === b.name.toLowerCase() &&
+    (a.server ?? '').toLowerCase() === (b.server ?? '').toLowerCase()
+  )
+}
+
 function Actions({
   onDone,
   busy,
   failed,
+  job,
 }: {
   onDone: () => void
   busy: boolean
   failed: number
+  // The server's view of whatever is running, which may be a job this tab never started.
+  job: JobSnapshot | null
 }) {
   const [active, setActive] = useState<'' | 'compile' | 'run'>('')
   const [progress, setProgress] = useState('')
@@ -64,6 +75,16 @@ function Actions({
   const [total, setTotal] = useState(0)
   const [startedAt, setStartedAt] = useState<number | null>(null)
   const elapsed = useElapsed(startedAt)
+
+  // A poll is up to three seconds old, so THIS tab's job can finish while the last snapshot
+  // still describes it as running. Without this the bar would jump back for one poll and hide
+  // the line that says what the job actually produced - the one thing the operator was waiting
+  // for. Set when our own stream ends, cleared as soon as the server agrees nothing is running.
+  const [ownJobEnded, setOwnJobEnded] = useState(false)
+  useEffect(() => {
+    if (!job) setOwnJobEnded(false)
+  }, [job])
+  const serverJob = ownJobEnded ? null : job
 
   const go = (job: 'compile' | 'run', path: string) => {
     setActive(job)
@@ -105,19 +126,40 @@ function Actions({
       onEnd: () => {
         setActive('')
         setStartedAt(null)
+        setOwnJobEnded(true)
         onDone()
       },
     })
   }
 
   const disabled = !!active || busy
-  const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0
+
+  // WHAT TO DRAW. This tab's own stream when it has one, otherwise the server's snapshot of
+  // whatever is running - which is what a reloaded page, a second tab or a colleague's browser
+  // sees. Without the second case the whole element disappeared the moment the stream was lost,
+  // leaving a disabled button and the words "another operation is in progress" beside it for
+  // the remaining twenty minutes: the exact "is it working or is it hung?" this bar exists to
+  // answer, reached by closing a tab.
+  const adopted = !active && !!serverJob
+  const shownKind = active || serverJob?.job || ''
+  const shownDone = active ? done : serverJob?.done ?? 0
+  const shownTotal = active ? total : serverJob?.total ?? 0
+  const shownElapsed = active ? elapsed : Math.round(serverJob?.elapsed ?? 0)
+  const shownText = active
+    ? progress
+    : serverJob
+      ? shownTotal > 0
+        ? `${shownDone} of ${shownTotal}${serverJob.label ? ` — ${serverJob.label}` : ''}`
+        : 'starting…'
+      : ''
+
+  const pct = shownTotal > 0 ? Math.min(100, Math.round((shownDone / shownTotal) * 100)) : 0
   // Projected from the rate actually observed, not from an assumed cost per rule: rules differ
   // enormously (a cloned family member costs no model call at all), so a fixed estimate would
   // be wrong in both directions. Shown only once there is enough evidence to mean anything.
   const remaining =
-    active === 'compile' && done >= 3 && total > done && elapsed > 0
-      ? Math.round((elapsed / done) * (total - done))
+    shownKind === 'compile' && shownDone >= 3 && shownTotal > shownDone && shownElapsed > 0
+      ? Math.round((shownElapsed / shownDone) * (shownTotal - shownDone))
       : 0
 
   return (
@@ -159,11 +201,13 @@ function Actions({
             {active === 'compile' ? 'Retrying…' : `Retry ${failed} failed`}
           </button>
         )}
-        {busy && !active && <span className="muted">another operation is in progress</span>}
+        {busy && !active && !serverJob && (
+          <span className="muted">another operation is in progress</span>
+        )}
         {error && <span className="error">{error}</span>}
       </div>
 
-      {active && (
+      {(active || serverJob) && (
         <div className="job" role="status" aria-live="polite">
           <div
             className="job-bar"
@@ -176,22 +220,30 @@ function Actions({
                 seconds reads as stuck, which is the impression this whole element exists to
                 avoid. */}
             <div
-              className={total > 0 ? 'job-fill' : 'job-fill indeterminate'}
-              style={total > 0 ? { width: `${pct}%` } : undefined}
+              className={shownTotal > 0 ? 'job-fill' : 'job-fill indeterminate'}
+              style={shownTotal > 0 ? { width: `${pct}%` } : undefined}
             />
           </div>
           <div className="job-line">
             <span>
-              {total > 0 && <strong>{pct}%</strong>} {progress}
+              {shownTotal > 0 && <strong>{pct}%</strong>} {shownText}
+              {/* Said plainly. Someone who did not press the button needs to know the work is
+                  real and already under way, not that their own click went astray. */}
+              {adopted && (
+                <span className="muted">
+                  {' '}— {shownKind === 'compile' ? 'compile' : 'detection run'} already in
+                  progress, started {serverJob?.started_at?.slice(11, 16)}
+                </span>
+              )}
             </span>
             <span className="muted">
-              {formatDuration(elapsed)} elapsed
+              {formatDuration(shownElapsed)} elapsed
               {remaining > 0 && ` · about ${formatDuration(remaining)} left`}
             </span>
           </div>
         </div>
       )}
-      {!active && progress && <span className="muted">{progress}</span>}
+      {!active && !serverJob && progress && <span className="muted">{progress}</span>}
     </div>
   )
 }
@@ -386,18 +438,46 @@ function RulesTab({ onPick }: { onPick: (id: string) => void }) {
 
 function RunsTab({
   runs,
+  database,
   onOpen,
   onError,
 }: {
   runs: RunRow[]
+  database: DatabaseRef | undefined
   onOpen: (id: string) => void
   onError: (message: string) => void
 }) {
+  // THE TREND PLOTS ONE DATABASE, NEVER TWO.
+  //
+  // A trend line answers "is the data getting better or worse?", and that question only means
+  // something if every point measured the same thing. Point DB_NAME at a different database and
+  // the next run lands in the same series as the last: the chart draws a step between two
+  // systems and the reader takes it for a change in quality. A run whose database was never
+  // recorded is excluded for the same reason - it might be from either, and the honest answer
+  // to "which?" is to leave it out of a comparison rather than to guess.
+  //
+  // Excluded from the CHART only. The table below lists every run there has ever been.
+  const mine = runs.filter((r) => sameDatabase(r.database, database))
+  const others = runs.length - mine.length
+
   return (
     <>
       <section className="card">
-        <h2>Score over time</h2>
-        <ScoreTrend runs={runs} />
+        <h2>Score over time — {database?.name || 'this database'}</h2>
+        {mine.length > 0 ? (
+          <ScoreTrend runs={mine} />
+        ) : (
+          <p className="muted">
+            No run has been recorded against {database?.name || 'this database'} yet.
+          </p>
+        )}
+        {others > 0 && (
+          <p className="muted">
+            {others} earlier run(s) are not plotted: they measured a different database, or were
+            recorded before runs noted which database they measured. Mixing them into one line
+            would show the change of database as a change in data quality.
+          </p>
+        )}
       </section>
       <section className="card">
         <h2>Run history</h2>
@@ -406,6 +486,7 @@ function RunsTab({
             <tr>
               <th>Run</th>
               <th>When</th>
+              <th>Database</th>
               <th className="num">Score</th>
               <th className="num">With findings</th>
               <th className="num">Flagged</th>
@@ -414,31 +495,37 @@ function RunsTab({
             </tr>
           </thead>
           <tbody>
-            {runs.map((r) => (
-              <tr key={r.run_id}>
-                <td className="mono clickable" onClick={() => onOpen(r.run_id)}>{r.run_id}</td>
-                <td>{r.started_at.slice(0, 19).replace('T', ' ')}</td>
-                <td className={'num ' + scoreClass(r.score)}>{r.score}</td>
-                <td className="num">{n(r.totals?.probes_with_findings)}</td>
-                <td className="num">{n(r.totals?.records_flagged)}</td>
-                <td className="num">{r.seconds}s</td>
-                <td>
-                  {(['xlsx', 'docx'] as const).map((f) =>
-                    r.report_paths?.[f] ? (
-                      <button
-                        key={f}
-                        className="link"
-                        onClick={() =>
-                          downloadReport(r.run_id, f).catch((e) => onError(String(e)))
-                        }
-                      >
-                        {f}
-                      </button>
-                    ) : null,
-                  )}
-                </td>
-              </tr>
-            ))}
+            {runs.map((r) => {
+              const current = sameDatabase(r.database, database)
+              return (
+                <tr key={r.run_id}>
+                  <td className="mono clickable" onClick={() => onOpen(r.run_id)}>{r.run_id}</td>
+                  <td>{r.started_at.slice(0, 19).replace('T', ' ')}</td>
+                  <td className={current ? undefined : 'warnText'}>
+                    {r.database?.name || 'not recorded'}
+                  </td>
+                  <td className={'num ' + scoreClass(r.score)}>{r.score}</td>
+                  <td className="num">{n(r.totals?.probes_with_findings)}</td>
+                  <td className="num">{n(r.totals?.records_flagged)}</td>
+                  <td className="num">{r.seconds}s</td>
+                  <td>
+                    {(['xlsx', 'docx'] as const).map((f) =>
+                      r.report_paths?.[f] ? (
+                        <button
+                          key={f}
+                          className="link"
+                          onClick={() =>
+                            downloadReport(r.run_id, f).catch((e) => onError(String(e)))
+                          }
+                        >
+                          {f}
+                        </button>
+                      ) : null,
+                    )}
+                  </td>
+                </tr>
+              )
+            })}
           </tbody>
         </table>
         {!runs.length && <p className="muted">No run has been recorded yet.</p>}
@@ -466,15 +553,60 @@ export default function App() {
   const [runs, setRuns] = useState<RunRow[]>([])
   const [picked, setPicked] = useState('')
   const [error, setError] = useState('')
+  // Whether the last poll saw work in flight, so the moment it STOPS can be noticed once.
+  const working = useRef(false)
 
   const refresh = useCallback(() => {
-    api.status().then(setStatus).catch((e) => setError(String(e)))
+    api.status()
+      .then((s) => {
+        setStatus(s)
+        working.current = s.busy || !!s.job
+      })
+      .catch((e) => setError(String(e)))
     api.runs().then((d) => setRuns(d.runs)).catch(() => setRuns([]))
-    // A 404 here is the normal state before the first run, not an error worth shouting about.
+    // A 404 here is the normal state before the first run against this database, not an error
+    // worth shouting about.
     api.latestRun().then(setRun).catch(() => setRun(null))
   }, [])
 
   useEffect(refresh, [refresh])
+
+  // ── Poll the server's status ───────────────────────────────────────────────
+  //
+  // BUSY IS A SERVER FACT AND IT CHANGES WITHOUT THIS BROWSER DOING ANYTHING. It was read once
+  // on mount and then only when a job THIS TAB started ended - so a page opened during a
+  // compile latched `busy` on for ever: both buttons greyed out, "another operation is in
+  // progress" beside them, and no way back but a manual reload. Nothing was wrong with the
+  // server; the page simply never asked again.
+  //
+  // Two rates, because the two situations want different things. While something is running the
+  // bar has to move, so 3s. While nothing is, the only thing polling can discover is a compile
+  // somebody started on the command line or in another tab, which is worth noticing within
+  // half a minute and not worth re-reading the catalog for more often than that.
+  const activity = !!status?.busy || !!status?.job
+  useEffect(() => {
+    const id = setInterval(async () => {
+      try {
+        const next = await api.status()
+        setStatus(next)
+        const busyNow = next.busy || !!next.job
+        // Work just finished - the catalog counts, the run list and the latest run on screen
+        // all describe the world before it ran.
+        if (working.current && !busyNow) refresh()
+        working.current = busyNow
+      } catch {
+        /* A failed poll is not worth a banner: the next one will either work or the user's own
+           next action will surface the real error. */
+      }
+    }, activity ? 3000 : 30000)
+    return () => clearInterval(id)
+  }, [activity, refresh])
+
+  // Runs from a database other than the one this server is now pointed at. Counted rather than
+  // hidden: "no run yet" is misleading when there is a whole history sitting behind it that
+  // simply measured something else.
+  const foreignRuns = status?.runs_elsewhere ?? 0
+  const runIsForeign = !!(run && status && !sameDatabase(run.database, status.database))
 
   const openRun = (id: string) => {
     api.run(id).then((r) => { setRun(r); setTab('findings') }).catch((e) => setError(String(e)))
@@ -496,10 +628,21 @@ export default function App() {
           onDone={refresh}
           busy={!!status?.busy}
           failed={status?.catalog.failed ?? 0}
+          job={status?.job ?? null}
         />
       </header>
 
       {error && <p className="error banner">{error}</p>}
+      {/* A run opened from the history may predate a change of DB_NAME. Every number below it
+          then describes a different database, which nothing else on the page would reveal. */}
+      {runIsForeign && (
+        <p className="error banner">
+          This run measured{' '}
+          <strong>{run?.database?.name || 'a database that was not recorded'}</strong>, not{' '}
+          <strong>{status?.database.name}</strong>. Its score and findings say nothing about the
+          database this server is connected to now.
+        </p>
+      )}
       {run?.catalog_stale && <p className="error banner">{run.catalog_note}</p>}
 
       <nav>
@@ -513,7 +656,16 @@ export default function App() {
       {tab === 'dashboard' && (
         <>
           {!run && <section className="card"><p className="muted">
-            No run yet. Compile the rules, then press <strong>Run detection</strong>.
+            {foreignRuns > 0 ? (
+              <>
+                No run has been recorded against <strong>{status?.database.name}</strong> yet.
+                The history holds {foreignRuns} run(s) from another database — they are kept,
+                and shown on the <strong>runs</strong> tab, but none of them describes this one.
+                Compile the rules, then press <strong>Run detection</strong>.
+              </>
+            ) : (
+              <>No run yet. Compile the rules, then press <strong>Run detection</strong>.</>
+            )}
           </p></section>}
           {run && (
             <>
@@ -605,7 +757,14 @@ export default function App() {
       )}
 
       {tab === 'rules' && <RulesTab onPick={setPicked} />}
-      {tab === 'runs' && <RunsTab runs={runs} onOpen={openRun} onError={setError} />}
+      {tab === 'runs' && (
+        <RunsTab
+          runs={runs}
+          database={status?.database}
+          onOpen={openRun}
+          onError={setError}
+        />
+      )}
 
       {picked && <RuleDrawer id={picked} onClose={() => setPicked('')} />}
     </div>
