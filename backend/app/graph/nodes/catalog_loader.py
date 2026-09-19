@@ -247,6 +247,20 @@ def catalog_loader_node(state: RunState) -> dict:
             probes.append(probe)
             continue
         rule = rules.get(probe.rule_id)
+        # A REJECTED RULE IS NOT A COVERAGE GAP, so it is left out of the report entirely.
+        #
+        # Everything else in `not_running` means "this subject matter is unmonitored, and you
+        # should know" - a draft awaiting agreement, a probe that failed, a concept this schema
+        # cannot express. A rejected discovery is the opposite: somebody looked at it and
+        # decided it was not a real anomaly. Listing it would tell the reader they have a gap
+        # where they made a decision, and after a year of refusals that section would be mostly
+        # ideas nobody wanted.
+        #
+        # Its probe is still in the catalog here because pruning happens at compile time; this
+        # is what keeps it out of the report in the meantime. It never runs either way - the
+        # `blocked` check above already excluded it from `probes`.
+        if rule is not None and rule.status == "rejected":
+            continue
         if probe.rule_id in outdated:
             status = "stale"
         elif rule is not None and not rule.runnable:

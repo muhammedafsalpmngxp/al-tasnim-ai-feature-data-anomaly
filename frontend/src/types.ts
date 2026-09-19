@@ -61,6 +61,16 @@ export interface RunResult {
   empty_scope: string[]
   not_running: NotRunning[]
   failed: { rule_id: string; error: string }[]
+  /** Findings from rules still ON TRIAL. Deliberately a separate list, never merged into
+   *  `ranked`: these count towards no figure in `totals` and no part of `score`, and a reader
+   *  must always be able to tell which findings came from a rule a person wrote. */
+  discovered_ranked?: Finding[]
+  discovered_totals?: {
+    probes_run: number
+    probes_with_findings: number
+    records_examined: number
+    records_flagged: number
+  }
   report_paths: Record<string, string>
   catalog_stale: boolean
   catalog_note: string
@@ -88,7 +98,10 @@ export interface RuleRow {
   entity: string
   method: string
   sql_mode: string
-  source: 'declared' | 'generic'
+  source: 'declared' | 'expanded' | 'discovered' | string
+  /** The rule's LIFECYCLE: active · probation · draft · disabled. Distinct from
+   *  `compiled_status`, which only says whether its SQL built. A rule on trial compiles
+   *  perfectly well, so showing the compiled status alone makes it look established. */
   status: string
   compiled_status: string
   compiled_at: string
@@ -138,7 +151,10 @@ export interface Status {
   catalog: {
     compiled_at: string
     total: number
+    /** TRUSTED probes only. Rules on trial are counted separately, so this always matches the
+     *  set of checks the score was actually computed from. */
     active: number
+    on_trial?: number
     failed: number
     not_applicable: number
   }
@@ -150,4 +166,53 @@ export interface Status {
   latest_run: RunRow | null
   busy: boolean
   job: JobSnapshot | null
+}
+
+// ── Discovery ──────────────────────────────────────────────────────────────────
+// A proposal is NOT a rule. It has no DQ id, no SQL and no place in the catalog until a person
+// accepts it; `hash` is only a handle so a click can name one. The real id arrives at the
+// moment of decision, which is why Pending rows carry a hash and decided rows carry a rule_id.
+
+export interface Proposal {
+  hash: string
+  title: string
+  what_is_wrong: string
+  why_it_matters: string
+  how_to_detect: string
+  do_not_flag: string
+  category: string
+  severity: Severity | string
+  entity: string
+  evidence: string
+  /** The measured fact this was grounded in, in the profiler's own words - never the model's
+   *  paraphrase of a number. */
+  observation_fact?: string
+  observation_id?: string
+  confidence?: string
+  database?: string
+}
+
+export interface DecidedRule {
+  rule_id: string
+  title: string
+  /** probation · active · rejected */
+  status: string
+  reason: string
+  evidence: string
+  discovered_from: string
+  decided: string
+}
+
+export interface DroppedProposal {
+  title: string
+  reason: string
+  detail: string
+}
+
+export interface Discoveries {
+  pending: Proposal[]
+  dropped: DroppedProposal[]
+  accepted: DecidedRule[]
+  rejected: DecidedRule[]
+  path: string
 }

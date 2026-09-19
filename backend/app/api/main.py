@@ -146,6 +146,50 @@ def health() -> dict:
     return {"ok": ok, "database": message, "model": settings.active_model}
 
 
+def _rules_by_id() -> dict:
+    """Every rule the loader can see, by id. Never raises - a status call must always answer."""
+    try:
+        from app.rules.expand import expand_families
+        from app.rules.loader import load_rules
+
+        rules, _ = load_rules()
+        rules, _ = expand_families(rules)
+        return {r.rule_id: r for r in rules}
+    except Exception:  # noqa: BLE001 - a broken rule file must not blank the whole dashboard
+        return {}
+
+
+def _probe_counts(catalog, rules_by_id: dict) -> tuple[int, int]:
+    """(trusted, on trial) - probes that will actually RUN, split by whether they are scored.
+
+    COUNTED FROM THE RULE, NOT THE PROBE. `catalog.active` means "this SQL built", which is
+    true of three different things a header must not add together:
+
+      a trusted rule    runs, and its findings are in the score          -> trusted
+      a rule on trial   runs, and its findings are in no headline figure -> on trial
+      a REFUSED rule    does not run at all, but its probe is still on
+                        file until the next compile prunes it           -> neither
+
+    That last case is why this is not simply a subtraction. Refusing an accepted rule left its
+    probe in the catalog, so the header went UP by one - advertising a check that had just been
+    switched off as an established one.
+    """
+    trusted = on_trial = 0
+    for probe in catalog.active:
+        rule = rules_by_id.get(probe.rule_id)
+        # No rule at all: an orphaned probe the next compile will prune. Counted as trusted
+        # because that is what it was, and under-reporting coverage is the worse error.
+        if rule is None:
+            trusted += 1
+        elif not rule.runnable:
+            continue
+        elif rule.scored:
+            trusted += 1
+        else:
+            on_trial += 1
+    return trusted, on_trial
+
+
 @app.get("/api/status", dependencies=[Depends(require_api_key)])
 def status() -> dict:
     """Everything a dashboard needs to render before any run: what exists and what is current."""
@@ -158,6 +202,7 @@ def status() -> dict:
     # and a dashboard that read one for its headline and the other for its status line would
     # contradict itself the moment DB_NAME moved.
     mine, other_database_runs = history_for_current_database()
+    _trusted, _on_trial_count = _probe_counts(catalog, _rules_by_id())
     return {
         "database": {"name": settings.db_name, "server": settings.db_server},
         "schemas": list(settings.allowed_schemas),
@@ -165,7 +210,10 @@ def status() -> dict:
         "catalog": {
             "compiled_at": catalog.compiled_at,
             "total": len(catalog.probes),
-            "active": len(catalog.active),
+            # SPLIT BY TRUST, not just by whether the SQL compiled - see _probe_counts. The
+            # count beside the score must describe the same set of checks the score came from.
+            "active": _trusted,
+            "on_trial": _on_trial_count,
             "failed": len(catalog.failed),
             "not_applicable": len(catalog.not_applicable),
         },
@@ -194,6 +242,13 @@ def rules(source: str | None = Query(default=None)) -> dict:
     items = []
     for rule in all_rules:
         if source and rule.source != source:
+            continue
+        # A REFUSED PROPOSAL IS NOT A RULE OF THIS SYSTEM. It is kept on file only so the Scout
+        # cannot raise the same idea again, and it is already listed - with the reason it was
+        # refused - under Refused on the Discover screen. Showing it here too would grow the
+        # rule list with things nobody wants checked, and a reader scanning for what the engine
+        # actually does would have to filter them out by eye on every visit.
+        if rule.status == "rejected":
             continue
         probe = catalog.get(rule.rule_id)
         items.append({
@@ -463,6 +518,90 @@ async def run_endpoint(
         })
 
     return await _stream_job(work, "run")
+
+
+# ── Discovery: propose new anomalies, and record what the operator decides ──────
+#
+# THE PROPOSING IS A STREAMED JOB; THE DECIDING IS NOT. Running the Scout spends a model call
+# and takes tens of seconds, so it streams like a compile or a run and shares the same lock -
+# two at once would double the spend for one answer. Accept and Reject spend nothing and touch
+# no database: they edit one file, so they are ordinary requests that return at once.
+#
+# NOTHING HERE REACHES THE CATALOG. A proposal becomes a rule only when a person accepts it, and
+# becomes SQL only when the ordinary compile writes it - through the same author, the same
+# contract checks and the same reviewer as every hand-written rule.
+
+@app.get("/api/discoveries", dependencies=[Depends(require_api_key)])
+def discoveries() -> dict:
+    """Everything the Discover screen renders: pending, accepted, rejected, and what was cut."""
+    from app.discovery import state as discovery_state
+
+    return discovery_state()
+
+
+@app.post("/api/discover", dependencies=[Depends(require_api_key)])
+async def discover_endpoint(max_proposals: int = Query(default=8, ge=1, le=20)):
+    """Run the Scout over this database and write its proposals, streaming stage progress."""
+    from app.discovery import discover
+
+    def work(emit) -> None:
+        def progress(step: int, total: int, stage: str) -> None:
+            emit("progress", {"step": step, "total": total, "stage": stage})
+
+        emit("result", discover(max_proposals=max_proposals, progress=progress))
+
+    return await _stream_job(work, "discover")
+
+
+@app.post("/api/discoveries/{proposal_hash}/accept", dependencies=[Depends(require_api_key)])
+def accept_discovery(proposal_hash: str, status: str = Query(default="probation")) -> dict:
+    """Admit one proposal as a rule, on trial by default.
+
+    `probation` runs it while counting it towards nothing on the dashboard, so it can be judged
+    on what it actually finds rather than on how it reads. Compile afterwards to give it SQL.
+    """
+    from app.discovery import accept
+
+    if status not in ("probation", "active"):
+        raise HTTPException(status_code=400, detail="status must be probation or active")
+    decided = accept(proposal_hash, status=status)
+    if not decided:
+        raise HTTPException(status_code=404, detail="That proposal is no longer pending")
+    return decided
+
+
+@app.post("/api/discoveries/{proposal_hash}/reject", dependencies=[Depends(require_api_key)])
+def reject_discovery(proposal_hash: str, reason: str = Query(default="")) -> dict:
+    """Refuse one proposal permanently, so the Scout cannot raise it again."""
+    from app.discovery import reject
+
+    decided = reject(proposal_hash, reason=reason)
+    if not decided:
+        raise HTTPException(status_code=404, detail="That proposal is no longer pending")
+    return decided
+
+
+@app.post("/api/discovered/{rule_id}/status", dependencies=[Depends(require_api_key)])
+def set_discovered_status(
+    rule_id: str,
+    status: str = Query(...),
+    reason: str = Query(default=""),
+) -> dict:
+    """Promote, refuse after accepting, or restore. All three are one status change.
+
+    Nothing is deleted: what was decided, and when, is the point of the file. The existing
+    engine does the rest - a rule that stops being runnable stops running on the next detection
+    run, and its probe is pruned from the catalog on the next compile.
+    """
+    from app.discovery import set_status
+
+    try:
+        changed = set_status(rule_id, status, reason)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not changed:
+        raise HTTPException(status_code=404, detail=f"No discovered rule {rule_id!r}")
+    return {"rule_id": rule_id, "status": status}
 
 
 # ── The built UI ────────────────────────────────────────────────────────────────

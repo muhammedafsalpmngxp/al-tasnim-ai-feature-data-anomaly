@@ -580,6 +580,107 @@ def cmd_run(args) -> int:
     return 1 if (failures or final.get("report_error")) else 0
 
 
+def cmd_discover(args) -> int:
+    """Propose anomalies nobody has written a rule for, and record decisions about them.
+
+    One command for the whole lifecycle, because they are all the same small thing: a proposal,
+    and what a person decided about it. Running the Scout is the only part that costs anything.
+    """
+    from rich.table import Table
+
+    from app.discovery import accept, discover, reject, set_status, state
+
+    console = _console()
+
+    if args.accept:
+        decided = accept(args.accept)
+        if not decided:
+            console.print("[yellow]That proposal is no longer pending.[/]")
+            return 1
+        console.print(
+            f"[green]{decided['rule_id']}[/] accepted on trial - {decided['title']}\n"
+            "It runs but counts towards nothing on the dashboard until promoted. "
+            "Compile to give it SQL: [bold]python -m app.cli compile[/]"
+        )
+        return 0
+
+    if args.reject:
+        decided = reject(args.reject, reason=args.reason)
+        if not decided:
+            console.print("[yellow]That proposal is no longer pending.[/]")
+            return 1
+        console.print(
+            f"[dim]{decided['rule_id']} refused[/] - {decided['title']}\n"
+            "Recorded permanently, so the Scout will not raise it again."
+        )
+        return 0
+
+    if args.promote or args.restore:
+        rule_id = args.promote or args.restore
+        status = "active" if args.promote else "probation"
+        if not set_status(rule_id, status, args.reason):
+            console.print(f"[yellow]No discovered rule {rule_id!r}.[/]")
+            return 1
+        console.print(f"[green]{rule_id}[/] is now [bold]{status}[/].")
+        if args.promote:
+            console.print("Its findings now count towards the score.")
+        return 0
+
+    if not args.list:
+        console.print(
+            f"Looking for anomalies nobody has written a rule for "
+            f"(at most {args.max_proposals}, main model {settings.active_model})"
+        )
+        result = discover(max_proposals=args.max_proposals)
+        if result["error"]:
+            console.print(f"[yellow]{result['error']}[/]")
+            return 1
+        console.print(
+            f"{result['observations']} measured observation(s) considered in "
+            f"{result['seconds']:.0f}s, {result['llm_calls']} LLM call(s)"
+        )
+        for cut in result["dropped"]:
+            console.print(f"  [dim]dropped ({cut['reason']}): {cut['title']} - {cut['detail']}[/]")
+
+    current = state()
+    pending = current["pending"]
+    if pending:
+        table = Table(show_header=True, header_style="bold cyan", title="Awaiting a decision")
+        table.add_column("Handle")
+        table.add_column("Proposed anomaly")
+        table.add_column("Severity")
+        table.add_column("Evidence")
+        for item in pending:
+            table.add_row(
+                item.get("hash", ""), item.get("title", ""), item.get("severity", ""),
+                (item.get("evidence") or "")[:70],
+            )
+        console.print(table)
+        console.print(
+            "Decide with: [bold]--accept <handle>[/] or "
+            "[bold]--reject <handle> --reason \"...\"[/]"
+        )
+    else:
+        console.print("[dim]Nothing is awaiting a decision.[/]")
+
+    for label, rows in (("On trial / accepted", current["accepted"]),
+                        ("Refused", current["rejected"])):
+        if not rows:
+            continue
+        table = Table(show_header=True, header_style="bold", title=label)
+        table.add_column("Rule")
+        table.add_column("Anomaly")
+        table.add_column("Status")
+        table.add_column("Why / when")
+        for row in rows:
+            table.add_row(
+                row["rule_id"], row["title"], row["status"],
+                row.get("reason") or row.get("decided", ""),
+            )
+        console.print(table)
+    return 0
+
+
 def cmd_runs(args) -> int:
     """Show the recorded run history - the trend, which one score alone cannot give.
 
@@ -796,6 +897,27 @@ def main() -> None:
     p_runs = sub.add_parser("runs", help="show the recorded run history and score trend")
     p_runs.add_argument("--limit", type=int, default=20, help="how many runs to show")
     p_runs.set_defaults(func=cmd_runs)
+
+    p_disc = sub.add_parser(
+        "discover",
+        help="propose anomalies nobody has written a rule for yet, and decide on them",
+    )
+    p_disc.add_argument(
+        "--max", type=int, default=8, dest="max_proposals",
+        help="most proposals to ask for (default 8). Fewer, better-grounded ones beat more",
+    )
+    p_disc.add_argument("--list", action="store_true", help="show pending and decided; run nothing")
+    p_disc.add_argument("--accept", metavar="HASH", help="admit one pending proposal, on trial")
+    p_disc.add_argument("--reject", metavar="HASH", help="refuse one pending proposal for good")
+    p_disc.add_argument("--reason", default="", help="why it was refused - shown to the Scout")
+    p_disc.add_argument(
+        "--promote", metavar="DQ-Sxx",
+        help="move a rule on trial to active, so it counts towards the score",
+    )
+    p_disc.add_argument(
+        "--restore", metavar="DQ-Sxx", help="put a previously refused rule back on trial",
+    )
+    p_disc.set_defaults(func=cmd_discover)
 
     args = parser.parse_args()
     setup_logging(console=not args.quiet)

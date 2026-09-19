@@ -34,12 +34,25 @@ METHODS: tuple[str, ...] = ("rule", "statistical", "rollup")
 #   authored  no SQL present; generated from the prose alone
 SQL_MODES: tuple[str, ...] = ("pinned", "seed", "authored")
 
-STATUSES: tuple[str, ...] = ("active", "draft", "disabled")
+# A rule's lifecycle.
+#   active      runs, and its findings count towards the headline score
+#   probation   RUNS, but its findings are reported separately and count towards NOTHING on the
+#               dashboard. The state a discovered rule is accepted INTO, so it can be judged on
+#               what it actually finds rather than on how its description reads. Promote it to
+#               `active` once it has earned that.
+#   draft       listed, never run - the definition is not agreed yet, and the gap stays visible
+#   disabled    switched off deliberately, usually because something else already covers it
+#   rejected    a discovered proposal the operator refused. Never runs, and - unlike `disabled` -
+#               it is not a coverage gap, so it is kept out of the report entirely. It is
+#               retained only so the Scout cannot propose the same idea again.
+STATUSES: tuple[str, ...] = ("active", "probation", "draft", "disabled", "rejected")
 
 # Where a rule came from. "declared" is written as itself in data_anomalies.md; "expanded" is
 # one concrete member of a structural family, produced by applying one such rule to every
-# matching feature the schema declares (app/rules/expand.py).
-SOURCES: tuple[str, ...] = ("declared", "expanded")
+# matching feature the schema declares (app/rules/expand.py); "discovered" was PROPOSED by the
+# Scout (app/graph/nodes/scout.py) and accepted by a person - the proposal is the machine's, the
+# decision to keep it is never the machine's.
+SOURCES: tuple[str, ...] = ("declared", "expanded", "discovered")
 
 # The value that means "derive the threshold from the data, do not substitute a literal".
 AUTO = "auto"
@@ -140,8 +153,30 @@ class AnomalyRule:
         """
         return hashlib.sha256(self.raw.encode("utf-8")).hexdigest()[:16]
 
+    # THE SINGLE PREDICATE THAT DECIDES WHETHER A RULE EXISTS AS FAR AS THE ENGINE IS CONCERNED.
+    # It governs what compiles, what runs, what stays in the catalog and what is pruned from it -
+    # seven call sites in all - so widening it is the one change here that can silently alter
+    # which SQL executes against the database.
+    #
+    # `probation` is included deliberately: a discovered rule that never ran could never be
+    # judged, and judging a proposal by its prose alone is exactly what this whole design avoids.
+    # It runs; `scored` below is what keeps it out of the headline numbers until promoted.
+    _RUNNABLE: tuple[str, ...] = ("active", "probation")
+
     @property
     def runnable(self) -> bool:
+        return self.status in AnomalyRule._RUNNABLE
+
+    @property
+    def scored(self) -> bool:
+        """Whether this rule's findings reach the score and the headline totals.
+
+        SEPARATE FROM `runnable`, and that separation IS the probation mechanism. A probation
+        rule executes and its findings are shown - in their own section, with their own counts -
+        but the score, the flagged total, the examined total and the check counts are computed
+        from trusted rules alone. So a proposal nobody has vetted cannot move a number anyone
+        reports, no matter how wrong it is.
+        """
         return self.status == "active"
 
     @property

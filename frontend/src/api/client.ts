@@ -1,4 +1,4 @@
-import type { RuleDetail, RuleRow, RunResult, RunRow, Status } from '../types'
+import type { Discoveries, RuleDetail, RuleRow, RunResult, RunRow, Status } from '../types'
 
 // Blank during development: vite.config.ts proxies /api to the backend, so the browser talks
 // to one origin and CORS never enters the picture. Set it only for a deployment where the UI
@@ -28,6 +28,21 @@ async function get<T>(path: string): Promise<T> {
   return res.json() as Promise<T>
 }
 
+/** A POST with no body. Every mutating discovery action is one - the payload is in the path. */
+async function post<T>(path: string): Promise<T> {
+  const res = await fetch(BASE + path, { method: 'POST', headers: headers() })
+  if (!res.ok) {
+    let detail = res.statusText
+    try {
+      detail = (await res.json()).detail ?? detail
+    } catch {
+      /* a non-JSON error body is still worth reporting as the status text */
+    }
+    throw new Error(`${res.status}: ${detail}`)
+  }
+  return res.json() as Promise<T>
+}
+
 export const api = {
   status: () => get<Status>('/api/status'),
   rules: (source?: string) =>
@@ -40,6 +55,24 @@ export const api = {
   run: (id: string) => get<RunResult>(`/api/runs/${encodeURIComponent(id)}`),
   reportUrl: (runId: string, fmt: 'xlsx' | 'docx') =>
     `${BASE}/api/runs/${encodeURIComponent(runId)}/report/${fmt}`,
+
+  // ── Discovery ──
+  // Reading the list is a plain GET; running the Scout streams, so it goes through stream()
+  // like a compile or a run. Deciding spends nothing and returns at once.
+  discoveries: () => get<Discoveries>('/api/discoveries'),
+  acceptProposal: (hash: string) =>
+    post<{ rule_id: string; title: string; status: string }>(
+      `/api/discoveries/${encodeURIComponent(hash)}/accept`,
+    ),
+  rejectProposal: (hash: string, reason: string) =>
+    post<{ rule_id: string; title: string; status: string }>(
+      `/api/discoveries/${encodeURIComponent(hash)}/reject?reason=${encodeURIComponent(reason)}`,
+    ),
+  setDiscoveredStatus: (ruleId: string, status: string, reason = '') =>
+    post<{ rule_id: string; status: string }>(
+      `/api/discovered/${encodeURIComponent(ruleId)}/status?status=${encodeURIComponent(status)}` +
+        (reason ? `&reason=${encodeURIComponent(reason)}` : ''),
+    ),
 }
 
 /**

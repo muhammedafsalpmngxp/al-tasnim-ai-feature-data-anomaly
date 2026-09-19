@@ -453,6 +453,52 @@ def build(state, path: str | None = None) -> str:
         for concern in result.concerns:
             _small(doc, "Note: " + concern)
 
+    # ── Findings from rules still on trial ──
+    #
+    # ITS OWN SECTION, AFTER THE FINDINGS AND BEFORE THE TRANSPARENCY NOTE, and never merged
+    # into either. These rules were proposed by the Scout and accepted for trial; no one has yet
+    # confirmed they measure what they claim. Their counts appear nowhere in the score or the
+    # headline totals, so the section has to say what it is - a reader who mistakes these for
+    # settled findings would act on a number nobody has vetted.
+    discovered = state.get("discovered_ranked") or []
+    if discovered:
+        totals_d = state.get("discovered_totals") or {}
+        _start_on_a_new_page(doc.add_heading("Findings from rules on trial", level=1))
+        doc.add_paragraph(
+            "These checks were proposed automatically and accepted for trial. They are NOT "
+            "included in the data quality score, the flagged record count, or any other figure "
+            "on the first page - those describe the established checks only. Treat what follows "
+            "as evidence for deciding whether each check is worth keeping, not as settled "
+            "findings."
+        )
+        _kv_table(doc, [
+            ("Rules on trial", f"{totals_d.get('probes_run', 0):,}"),
+            ("With findings", f"{totals_d.get('probes_with_findings', 0):,}"),
+            ("Records flagged", f"{totals_d.get('records_flagged', 0):,}"),
+            ("Records examined", f"{totals_d.get('records_examined', 0):,}"),
+        ])
+        for row in discovered:
+            doc.add_heading(f"{row['rule_id']} - {row['title']}", level=2)
+            headline = doc.add_paragraph()
+            _severity_run(headline, row["severity"])
+            headline.add_run(
+                f"  ·  {row['anomaly_count']:,} of {row['scope_total']:,} records "
+                f"({row['anomaly_pct']:.2f}%)  ·  {row['category']}  ·  on trial"
+            )
+            rule = rules.get(row["rule_id"])
+            prose = _prose(getattr(rule, "body", "") or "")
+            for heading in ("what is wrong", "why it matters"):
+                if prose.get(heading):
+                    p = doc.add_paragraph()
+                    p.add_run(heading.capitalize() + ". ").bold = True
+                    p.add_run(prose[heading])
+            result = results.get(row["rule_id"])
+            if result is not None:
+                for label, explanation in _samples(result, SAMPLES_PER_FINDING):
+                    p = doc.add_paragraph(style="List Bullet")
+                    p.add_run(f"{label}: ").bold = True
+                    p.add_run(explanation)
+
     # ── Transparency ──
     gaps = state.get("empty_scope") or []
     not_running = state.get("not_running") or []

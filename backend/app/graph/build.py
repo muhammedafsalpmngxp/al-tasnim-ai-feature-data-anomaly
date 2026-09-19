@@ -235,3 +235,66 @@ def build_run_graph():
     g.add_edge("summarizer", "report_builder")
     g.add_edge("report_builder", END)
     return g.compile()
+
+
+# ── The DISCOVER graph ──────────────────────────────────────────────────────────
+# A THIRD graph, separate from both of the above for the reason they are separate from each
+# other: it answers a different question and shares nothing with them but the files on disk.
+#
+#   COMPILE   is the SQL right?          per rule, retried, LLM-heavy, rare
+#   RUN       what does the data say?    whole database, linear, ONE LLM call, frequent
+#   DISCOVER  what is nobody checking?   whole database, linear, ONE LLM call, on demand
+#
+#   context_builder -> scout -> evidence_check -> dedup_filter -> proposal_writer
+#        (measures)    (LLM)     (drops the       (drops what is    (writes the
+#                                 ungrounded)      already known)    pending list)
+#
+# IT WRITES NO SQL, TOUCHES NO CATALOG AND CANNOT MAKE A RULE. Its entire output is a list of
+# suggestions in one regenerable file. A suggestion becomes a rule only when a person accepts
+# it, and becomes SQL only when the COMPILE graph above writes it - through the same author,
+# the same contract checks and the same reviewer as everything hand-written. That is the whole
+# safety argument: the machine may propose, and only a person may admit.
+#
+# Two early exits, both honest rather than silent:
+#   no observations   the database has not been described yet. Say so; do not ask a model to
+#                     guess at a schema nobody has read.
+#   no proposals      the Scout found nothing new worth a person's time. Zero is a correct
+#                     answer, and it still writes an empty list so the UI can say so plainly.
+
+
+def _route_after_context(state) -> str:
+    return "scout" if state.get("observations") else "proposal_writer"
+
+
+def _route_after_scout(state) -> str:
+    return "evidence_check" if state.get("proposals") else "proposal_writer"
+
+
+def build_discover_graph():
+    from app.graph.discover_state import DiscoverState
+    from app.graph.nodes.context_builder import context_builder_node
+    from app.graph.nodes.dedup_filter import dedup_filter_node
+    from app.graph.nodes.evidence_check import evidence_check_node
+    from app.graph.nodes.proposal_writer import proposal_writer_node
+    from app.graph.nodes.scout import scout_node
+
+    g = StateGraph(DiscoverState)
+    g.add_node("context_builder", context_builder_node)
+    g.add_node("scout", scout_node)
+    g.add_node("evidence_check", evidence_check_node)
+    g.add_node("dedup_filter", dedup_filter_node)
+    g.add_node("proposal_writer", proposal_writer_node)
+
+    g.add_edge(START, "context_builder")
+    g.add_conditional_edges(
+        "context_builder", _route_after_context,
+        {"scout": "scout", "proposal_writer": "proposal_writer"},
+    )
+    g.add_conditional_edges(
+        "scout", _route_after_scout,
+        {"evidence_check": "evidence_check", "proposal_writer": "proposal_writer"},
+    )
+    g.add_edge("evidence_check", "dedup_filter")
+    g.add_edge("dedup_filter", "proposal_writer")
+    g.add_edge("proposal_writer", END)
+    return g.compile()

@@ -1,9 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api, downloadReport, stream } from './api/client'
 import { CategoryBar, SEVERITY_COLOURS, ScoreTrend, SeverityDonut } from './components/Charts'
-import type { DatabaseRef, JobSnapshot, RuleDetail, RuleRow, RunResult, RunRow, Status } from './types'
+import type {
+  DatabaseRef,
+  Discoveries,
+  JobSnapshot,
+  RuleDetail,
+  RuleRow,
+  RunResult,
+  RunRow,
+  Status,
+} from './types'
 
-type Tab = 'dashboard' | 'findings' | 'rules' | 'runs'
+type Tab = 'dashboard' | 'findings' | 'discover' | 'rules' | 'runs'
 
 const n = (v: number | undefined) => (v ?? 0).toLocaleString()
 
@@ -373,6 +382,215 @@ function RuleDrawer({ id, onClose }: { id: string; onClose: () => void }) {
   )
 }
 
+// ── Discover ───────────────────────────────────────────────────────────────────
+// Proposals from the Scout, and what has been decided about them. Three lists that are always
+// visible - pending, accepted, refused - because the decision history IS the feature: without
+// the refused list on screen, nobody can tell whether a proposal is new or one they already
+// turned down.
+//
+// NOTHING HERE COMPILES OR RUNS ANYTHING. Accepting writes a rule into a file; the ordinary
+// Compile button is what turns it into SQL, through the same author and reviewer as every
+// hand-written rule. The banner says so, because a user who expects Accept to do the whole job
+// will wonder why nothing appeared in their findings.
+
+function DiscoverTab({ busy, onRun }: { busy: boolean; onRun: () => void }) {
+  const [data, setData] = useState<Discoveries | null>(null)
+  const [error, setError] = useState('')
+  const [working, setWorking] = useState('')
+  const [reason, setReason] = useState<Record<string, string>>({})
+
+  const load = useCallback(() => {
+    api.discoveries().then(setData).catch((e) => setError(String(e)))
+  }, [])
+  useEffect(load, [load])
+  // Re-read when a Scout run finishes: the pending list is written by the backend at the end of
+  // the job, so the screen would otherwise keep showing what was there before it started.
+  useEffect(() => { if (!busy) load() }, [busy, load])
+
+  async function act(label: string, fn: () => Promise<unknown>) {
+    setWorking(label)
+    setError('')
+    try {
+      await fn()
+      load()
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setWorking('')
+    }
+  }
+
+  const pending = data?.pending ?? []
+  const accepted = data?.accepted ?? []
+  const rejected = data?.rejected ?? []
+
+  return (
+    <>
+      <section className="card">
+        <div className="row-between">
+          <h2>Discover new anomalies</h2>
+          <button className="primary" disabled={busy} onClick={onRun}>
+            {busy ? 'Looking…' : 'Run discovery'}
+          </button>
+        </div>
+        <p className="muted">
+          The Scout reads what has been measured about this database and proposes checks nobody
+          has written a rule for yet. It proposes only — nothing runs until you accept it, and
+          an accepted rule still has to be compiled before it produces findings.
+        </p>
+        {error && <p className="error">{error}</p>}
+        {data && (
+          <p className="muted small">
+            Decisions are recorded permanently in <span className="mono">{data.path}</span>, so
+            they survive clearing the cache and a refused idea is never proposed again.
+          </p>
+        )}
+      </section>
+
+      <section className="card">
+        <h2>Awaiting a decision ({pending.length})</h2>
+        {pending.length === 0 && (
+          <p className="muted">
+            Nothing is waiting. Run discovery to look for anomalies that have no rule yet.
+          </p>
+        )}
+        {pending.map((p) => (
+          <div key={p.hash} className="finding">
+            <div className="row-between">
+              <h3>{p.title}</h3>
+              <Sev value={String(p.severity)} />
+            </div>
+            <p><strong>What is wrong.</strong> {p.what_is_wrong}</p>
+            <p><strong>Why it matters.</strong> {p.why_it_matters}</p>
+            <p><strong>How to detect.</strong> {p.how_to_detect}</p>
+            {p.do_not_flag && <p><strong>Do NOT flag.</strong> {p.do_not_flag}</p>}
+            {/* The profiler's own words, not the model's paraphrase of a number. This is what
+                makes the proposal checkable rather than merely plausible. */}
+            {p.observation_fact && (
+              <p className="muted small">
+                <strong>Measured:</strong> {p.observation_fact}
+              </p>
+            )}
+            <div className="row-between">
+              <input
+                placeholder="Why are you refusing it? (shown to the Scout so it never asks again)"
+                value={reason[p.hash] ?? ''}
+                onChange={(e) => setReason({ ...reason, [p.hash]: e.target.value })}
+              />
+              <span>
+                <button
+                  className="primary"
+                  disabled={!!working}
+                  onClick={() => act(p.hash, () => api.acceptProposal(p.hash))}
+                >
+                  {working === p.hash ? 'Working…' : 'Accept'}
+                </button>{' '}
+                <button
+                  disabled={!!working}
+                  onClick={() => act(p.hash, () => api.rejectProposal(p.hash, reason[p.hash] ?? ''))}
+                >
+                  Reject
+                </button>
+              </span>
+            </div>
+          </div>
+        ))}
+        {(data?.dropped?.length ?? 0) > 0 && (
+          <details>
+            <summary className="muted">
+              {data!.dropped.length} proposal(s) were filtered out before you saw them
+            </summary>
+            <ul className="muted small">
+              {data!.dropped.map((d, i) => (
+                <li key={i}><strong>{d.reason}:</strong> {d.title} — {d.detail}</li>
+              ))}
+            </ul>
+          </details>
+        )}
+      </section>
+
+      <section className="card">
+        <h2>Accepted ({accepted.length})</h2>
+        <p className="muted">
+          A rule on trial runs and its findings are shown in their own section, but it counts
+          towards nothing on the dashboard — not the score, not the flagged total — until you
+          promote it. Compile after accepting to give it SQL.
+        </p>
+        {accepted.length === 0 && <p className="muted">Nothing accepted yet.</p>}
+        {accepted.length > 0 && (
+          <table>
+            <thead>
+              <tr><th>Rule</th><th>Anomaly</th><th>Status</th><th>Decided</th><th /></tr>
+            </thead>
+            <tbody>
+              {accepted.map((r) => (
+                <tr key={r.rule_id}>
+                  <td className="mono">{r.rule_id}</td>
+                  <td>{r.title}</td>
+                  <td className={r.status === 'active' ? 'ok' : 'warnText'}>{r.status}</td>
+                  <td className="muted small">{r.decided}</td>
+                  <td>
+                    {r.status === 'probation' && (
+                      <button
+                        disabled={!!working}
+                        onClick={() => act(r.rule_id, () =>
+                          api.setDiscoveredStatus(r.rule_id, 'active'))}
+                      >
+                        Promote
+                      </button>
+                    )}{' '}
+                    <button
+                      disabled={!!working}
+                      onClick={() => act(r.rule_id, () =>
+                        api.setDiscoveredStatus(r.rule_id, 'rejected', 'withdrawn after trial'))}
+                    >
+                      Reject
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
+
+      <section className="card">
+        <h2>Refused ({rejected.length})</h2>
+        <p className="muted">
+          Kept on record so the Scout cannot propose the same idea again. Restore one to put it
+          back on trial.
+        </p>
+        {rejected.length === 0 && <p className="muted">Nothing refused yet.</p>}
+        {rejected.length > 0 && (
+          <table>
+            <thead>
+              <tr><th>Rule</th><th>Anomaly</th><th>Why it was refused</th><th /></tr>
+            </thead>
+            <tbody>
+              {rejected.map((r) => (
+                <tr key={r.rule_id}>
+                  <td className="mono">{r.rule_id}</td>
+                  <td>{r.title}</td>
+                  <td className="muted">{r.reason || '—'}</td>
+                  <td>
+                    <button
+                      disabled={!!working}
+                      onClick={() => act(r.rule_id, () =>
+                        api.setDiscoveredStatus(r.rule_id, 'probation'))}
+                    >
+                      Restore
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </section>
+    </>
+  )
+}
+
 function RulesTab({ onPick }: { onPick: (id: string) => void }) {
   const [rules, setRules] = useState<RuleRow[]>([])
   const [filter, setFilter] = useState('')
@@ -410,7 +628,13 @@ function RulesTab({ onPick }: { onPick: (id: string) => void }) {
             <th>Title</th>
             <th>Severity</th>
             <th>Source</th>
-            <th>Mode</th>
+            {/* THE RULE'S LIFECYCLE, shown beside the compiled state and not instead of it.
+                They answer different questions - "is this check trusted?" versus "did its SQL
+                build?" - and a rule on trial compiles perfectly well, so showing only the
+                second made a probation rule read as `active` here while the Discover screen
+                correctly called it `probation`. Two screens contradicting each other about
+                whether a check counts is worse than either answer alone. */}
+            <th>Status</th>
             <th>Compiled</th>
           </tr>
         </thead>
@@ -421,7 +645,12 @@ function RulesTab({ onPick }: { onPick: (id: string) => void }) {
               <td>{r.title}</td>
               <td><Sev value={r.severity} /></td>
               <td>{r.source}</td>
-              <td>{r.sql_mode}</td>
+              <td className={r.status === 'active' ? 'ok' : 'warnText'}>
+                {r.status}
+                {r.status === 'probation' && (
+                  <span className="muted small"> — not scored</span>
+                )}
+              </td>
               <td className={r.compiled_status === 'active' ? 'ok' : 'warnText'}>
                 {r.compiled_status}
               </td>
@@ -584,6 +813,20 @@ export default function App() {
   // somebody started on the command line or in another tab, which is worth noticing within
   // half a minute and not worth re-reading the catalog for more often than that.
   const activity = !!status?.busy || !!status?.job
+
+  // Discovery streams like a compile and shares the same server-side lock, so it is started
+  // here beside the other long jobs rather than inside the tab: the tab is unmounted whenever
+  // the user looks elsewhere, and a stream that dies on a tab change would leave the button
+  // stuck and the proposals unwritten. Progress reaches the screen through the same polled
+  // status the action bar already renders.
+  const runDiscovery = useCallback(() => {
+    setError('')
+    stream('/api/discover', {
+      onError: setError,
+      onEnd: () => refresh(),
+    })
+  }, [refresh])
+
   useEffect(() => {
     const id = setInterval(async () => {
       try {
@@ -620,7 +863,14 @@ export default function App() {
           {status && (
             <p className="muted">
               {status.database.name} @ {status.database.server} · {status.catalog.active} active
-              probe(s) · {status.models.main}
+              probe(s)
+              {/* Counted apart from the trusted probes, because they are exactly what the
+                  score does NOT include - folding them into one number here would advertise a
+                  coverage the headline figures do not actually have. */}
+              {(status.catalog.on_trial ?? 0) > 0 && (
+                <> · <span className="warnText">{status.catalog.on_trial} on trial</span></>
+              )}{' '}
+              · {status.models.main}
             </p>
           )}
         </div>
@@ -646,7 +896,7 @@ export default function App() {
       {run?.catalog_stale && <p className="error banner">{run.catalog_note}</p>}
 
       <nav>
-        {(['dashboard', 'findings', 'rules', 'runs'] as Tab[]).map((t) => (
+        {(['dashboard', 'findings', 'discover', 'rules', 'runs'] as Tab[]).map((t) => (
           <button key={t} className={tab === t ? 'active' : ''} onClick={() => setTab(t)}>
             {t}
           </button>
@@ -749,6 +999,41 @@ export default function App() {
             <h2>Findings — run {run.run_id}</h2>
             <FindingsTable run={run} onPick={setPicked} />
           </section>
+          {/* ITS OWN CARD, never folded into the table above. These rules were proposed
+              automatically and accepted only for trial; their counts are in no headline figure,
+              so the section has to say so or a reader will act on a number nobody has vetted. */}
+          {(run.discovered_ranked?.length ?? 0) > 0 && (
+            <section className="card">
+              <h2>Findings from rules on trial ({run.discovered_ranked!.length})</h2>
+              <p className="muted">
+                Proposed automatically and accepted for trial. <strong>Not</strong> included in
+                the score or any figure on the dashboard — {n(run.discovered_totals?.records_flagged)}{' '}
+                record(s) flagged of {n(run.discovered_totals?.records_examined)} examined. Use
+                this to decide whether each check is worth promoting.
+              </p>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Rule</th><th>What was found</th><th>Severity</th>
+                    <th className="num">Affected</th><th className="num">Of examined</th>
+                    <th className="num">Share</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {run.discovered_ranked!.map((f) => (
+                    <tr key={f.rule_id} className="clickable" onClick={() => setPicked(f.rule_id)}>
+                      <td className="mono">{f.rule_id}</td>
+                      <td>{f.title}</td>
+                      <td><Sev value={f.severity} /></td>
+                      <td className="num">{n(f.anomaly_count)}</td>
+                      <td className="num">{n(f.scope_total)}</td>
+                      <td className="num">{f.anomaly_pct.toFixed(2)}%</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+          )}
           <Gaps run={run} />
         </>
       )}
@@ -756,6 +1041,9 @@ export default function App() {
         <section className="card"><p className="muted">No run to show yet.</p></section>
       )}
 
+      {tab === 'discover' && (
+        <DiscoverTab busy={activity} onRun={() => runDiscovery()} />
+      )}
       {tab === 'rules' && <RulesTab onPick={setPicked} />}
       {tab === 'runs' && (
         <RunsTab

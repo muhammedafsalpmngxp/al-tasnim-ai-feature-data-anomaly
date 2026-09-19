@@ -2249,6 +2249,27 @@ def test_the_engine_never_writes_a_domain_file() -> None:
                 ast.unparse(a) for a in list(node.args) + [k.value for k in node.keywords]
             )
             rel = path.relative_to(_BACKEND).as_posix()
+            # EXACTLY ONE MODULE MAY WRITE UNDER domain/, AND ONLY ONE FILE IN IT.
+            #
+            # The rule this test enforces was always about the three USER-AUTHORED files -
+            # business_rules.md, data_anomalies.md and few_shots.md - and the directory-wide ban
+            # was the cheapest way to state it while nothing had reason to write there.
+            #
+            # app/rules/discoveries.py now does: it appends a rule to anomalies/discovered.md
+            # when a person clicks Accept or Reject, so every line in that file records a human
+            # decision. Narrowing the rule to name the one permitted writer is a more precise
+            # statement of the original intent than the blanket ban, not a weakening of it - the
+            # byte check below still proves the three user files are never touched, by anything.
+            if rel == "app/rules/discoveries.py":
+                check(
+                    "data_anomalies" not in args.lower()
+                    and "business_rules" not in args.lower()
+                    and "few_shots" not in args.lower(),
+                    f"{rel}:{node.lineno} calls {name}() on one of the USER-AUTHORED domain "
+                    f"files ({args[:120]}). This module may write anomalies/discovered.md and "
+                    f"nothing else under domain/.",
+                )
+                continue
             check(
                 "domain" not in args.lower(),
                 f"{rel}:{node.lineno} calls {name}() on a path naming the domain directory "
@@ -2422,6 +2443,398 @@ def test_the_eval_baseline_is_keyed_per_database() -> None:
     )
 
 
+def test_probation_runs_but_is_never_scored() -> None:
+    """The two predicates the whole discovery feature rests on, and they must not be the same.
+
+    `runnable` decides what compiles and executes; `scored` decides what reaches the score and
+    the headline totals. A discovered rule accepted on trial has to be BOTH - it runs, so it can
+    be judged on what it actually finds, and it counts towards nothing, so a proposal nobody has
+    confirmed cannot move a number anyone reports.
+
+    Collapsing the two is the failure this test exists to catch, in either direction: make
+    probation non-runnable and accepting a proposal silently does nothing; make it scored and an
+    unvetted rule moves the headline score the moment it is accepted.
+    """
+    from app.rules.spec import STATUSES, AnomalyRule
+
+    for status in ("probation", "rejected"):
+        check(status in STATUSES,
+              f"{status!r} is not an accepted status, so a discovered rule cannot be stored")
+
+    expected = {
+        # status        runnable  scored
+        "active":       (True,    True),
+        "probation":    (True,    False),   # ← runs, counts towards nothing
+        "draft":        (False,   False),
+        "disabled":     (False,   False),
+        "rejected":     (False,   False),
+    }
+    for status, (runnable, scored) in expected.items():
+        rule = AnomalyRule(rule_id="DQ-T99", title="t", status=status)
+        check(rule.runnable is runnable,
+              f"a {status!r} rule reports runnable={rule.runnable}, expected {runnable}")
+        check(rule.scored is scored,
+              f"a {status!r} rule reports scored={rule.scored}, expected {scored}")
+
+
+def test_the_scorer_keeps_probation_out_of_every_headline_number() -> None:
+    """Not just the score - the flagged total, the examined total and the counts as well.
+
+    Excluding a probation rule from the score while letting its findings into "records flagged"
+    would put two headline figures on one page telling contradictory stories: a dashboard
+    screaming half a million flagged records beside a score saying everything is fine. The
+    trusted numbers describe the trusted rules, completely.
+    """
+    from app.graph.nodes.scorer import scorer_node
+    from app.rules.spec import AnomalyRule, ProbeResult
+
+    def result(rule_id: str, scope: int, bad: int) -> ProbeResult:
+        return ProbeResult(rule_id=rule_id, ok=True, scope_total=scope, anomaly_count=bad,
+                           anomaly_pct=round(100.0 * bad / scope, 4))
+
+    out = scorer_node({
+        "results": [result("DQ-T01", 1000, 10), result("DQ-S01", 1000, 900)],
+        "rules": {
+            "DQ-T01": AnomalyRule(rule_id="DQ-T01", title="trusted", severity="high",
+                                  status="active"),
+            "DQ-S01": AnomalyRule(rule_id="DQ-S01", title="on trial", severity="critical",
+                                  status="probation", source="discovered"),
+        },
+    })
+
+    totals = out["totals"]
+    check(totals["records_flagged"] == 10,
+          f"records_flagged is {totals['records_flagged']}, expected 10 - the probation rule's "
+          "900 findings leaked into a headline total")
+    check(totals["records_examined"] == 1000,
+          f"records_examined is {totals['records_examined']}, expected 1000")
+    check(totals["probes_run"] == 1,
+          f"probes_run is {totals['probes_run']}, expected 1 - probation was counted as a check")
+    check(len(out["ranked"]) == 1 and out["ranked"][0]["rule_id"] == "DQ-T01",
+          "a probation rule appeared in the main findings table")
+    # 1% of a high rule, and nothing else: a 90%-flagged CRITICAL rule on trial must not drag
+    # the score down, which is the whole point of holding it back.
+    check(out["score"] > 98.0,
+          f"score is {out['score']} - the probation rule moved it; it must not")
+
+    discovered = out["discovered_ranked"]
+    check(len(discovered) == 1 and discovered[0]["rule_id"] == "DQ-S01",
+          "the probation rule is missing from its own section - it must be reported, just "
+          "never counted")
+    check(out["discovered_totals"]["records_flagged"] == 900,
+          "the probation section lost its own findings")
+    check("score" not in out["discovered_totals"],
+          "the probation section publishes a score of its own - two scores on one page invites "
+          "exactly the comparison this separation prevents")
+
+
+def test_a_discovery_decision_never_touches_the_user_s_files() -> None:
+    """Accept and Reject write ONE file, and it is not one the operator authored.
+
+    This is the ownership boundary of the whole feature. The engine may record a decision a
+    person made; it may never edit the business definitions they wrote. Checked by bytes rather
+    than by inspection, because that is the only way to catch a write arriving through a helper
+    nobody thought to look at.
+    """
+    import hashlib
+    import pathlib
+    import tempfile
+
+    from app.rules import discoveries as store
+
+    domain = pathlib.Path(_BACKEND) / "domain"
+    user_files = ("business_rules.md", "data_anomalies.md", "few_shots.md")
+    before = {
+        name: hashlib.sha256((domain / name).read_bytes()).hexdigest()
+        for name in user_files if (domain / name).exists()
+    }
+    check(len(before) == 3, "the three user-authored domain files should all be present")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        original_path, original_dir = store.DISCOVERED_PATH, store.DISCOVERED_DIR
+        original_pending = store.pending_path
+        store.DISCOVERED_DIR = tmp
+        store.DISCOVERED_PATH = os.path.join(tmp, "discovered.md")
+        store.pending_path = lambda: os.path.join(tmp, "pending.json")
+        try:
+            proposal = {
+                "title": "Task names a well that does not exist",
+                "what_is_wrong": "A task records a well that cannot be traced.",
+                "why_it_matters": "Well-level totals silently omit the work.",
+                "how_to_detect": "Flag tasks whose well cannot be traced.",
+                "do_not_flag": "Tasks recording no well at all.",
+                "category": "Reference integrity", "severity": "high", "entity": "task",
+                "evidence": "6,054 of 35,749", "hash": "abc123",
+            }
+            store.save_pending([proposal])
+
+            from app.discovery import accept, reject, set_status
+
+            decided = accept("abc123")
+            check(decided.get("rule_id") == "DQ-S01",
+                  f"the first accepted proposal should be DQ-S01, got {decided.get('rule_id')!r}")
+            check(decided.get("status") == "probation",
+                  "Accept must place a proposal on trial, not straight into the scored rules")
+            check(not store.load_pending(),
+                  "the accepted proposal is still pending - it could be decided on twice")
+
+            # The written block must parse through the REAL loader, not a stand-in: the whole
+            # point of writing into domain/anomalies/ is that the ordinary loader picks it up
+            # with no special handling, and only the real one proves that.
+            from app.rules import loader as rule_loader
+
+            def _parse():
+                original_domain = rule_loader._DOMAIN_DIR
+                rule_loader._DOMAIN_DIR = tmp
+                try:
+                    os.makedirs(os.path.join(tmp, rule_loader._SPLIT_DIR), exist_ok=True)
+                    target = os.path.join(tmp, rule_loader._SPLIT_DIR, "discovered.md")
+                    with open(target, "w", encoding="utf-8") as fh:
+                        fh.write(store._read())
+                    return rule_loader.load_rules()
+                finally:
+                    rule_loader._DOMAIN_DIR = original_domain
+
+            rules, errors = _parse()
+            check(not errors, f"the written rule does not parse: {errors[:2]}")
+            check(len(rules) == 1 and rules[0].status == "probation",
+                  "the accepted rule did not come back as a probation rule")
+            check(rules[0].source == "discovered",
+                  f"source is {rules[0].source!r} - it must be 'discovered', which is what keeps "
+                  "its findings out of the headline numbers")
+            check(rules[0].runnable and not rules[0].scored,
+                  "an accepted rule must run while counting towards nothing")
+
+            # Rejecting gets a real id too, so the file stays uniformly parseable and Restore is
+            # a status change rather than a special case.
+            store.save_pending([{**proposal, "hash": "def456",
+                                 "title": "Actual end before actual start"}])
+            refused = reject("def456", reason="valid historical snapshot behaviour")
+            check(refused.get("rule_id") == "DQ-S02",
+                  f"the second decision should be DQ-S02, got {refused.get('rule_id')!r}")
+            rules, errors = _parse()
+            check(not errors, f"the file stopped parsing once a rejection was written: {errors[:2]}")
+            rejected = next((r for r in rules if r.rule_id == "DQ-S02"), None)
+            check(rejected is not None and not rejected.runnable,
+                  "a rejected rule is runnable - it would compile and report")
+
+            check(set_status("DQ-S01", "active"), "promoting DQ-S01 failed")
+            rules, _ = _parse()
+            promoted = next(r for r in rules if r.rule_id == "DQ-S01")
+            check(promoted.scored,
+                  "a promoted rule still does not count towards the score")
+
+            check(set_status("DQ-S02", "probation"), "restoring DQ-S02 failed")
+            rules, _ = _parse()
+            restored = next(r for r in rules if r.rule_id == "DQ-S02")
+            check(restored.runnable,
+                  "a restored rule does not run, so Restore achieved nothing")
+        finally:
+            store.DISCOVERED_PATH, store.DISCOVERED_DIR = original_path, original_dir
+            store.pending_path = original_pending
+
+    after = {
+        name: hashlib.sha256((domain / name).read_bytes()).hexdigest()
+        for name in user_files if (domain / name).exists()
+    }
+    check(after == before,
+          "accepting or rejecting a proposal modified a user-authored domain file: "
+          + ", ".join(n for n in before if before[n] != after.get(n)))
+
+
+def test_the_scout_cannot_propose_what_is_covered_or_refused() -> None:
+    """Dedup is over MEANING, and it is code, not a request to a model.
+
+    The obvious design - remember each proposal by id and refuse ids seen before - fails
+    silently: a pending id is a hash of text the Scout wrote, so the same anomaly phrased
+    differently next week hashes to something else and sails through. The operator then refuses
+    the same idea repeatedly and concludes the feature is broken.
+    """
+    from app.graph.nodes.dedup_filter import dedup_filter_node
+    from app.graph.nodes.evidence_check import evidence_check_node
+
+    observations = [{"id": "OBS-001", "table": "well.task_daily", "column": "well_id",
+                     "fact": "6,054 of 35,749 task rows name a well that is not in the master"}]
+
+    grounded = {
+        "title": "Task names a well that is not in the well master",
+        "what_is_wrong": "x", "why_it_matters": "y",
+        "how_to_detect": "Flag task records whose well cannot be traced to the well master",
+        "observation_id": "OBS-001",
+    }
+    out = evidence_check_node({
+        "observations": observations,
+        "proposals": [
+            grounded,
+            {**grounded, "title": "Vague", "observation_id": ""},
+            {**grounded, "title": "Invented", "observation_id": "OBS-999"},
+        ],
+    })
+    check(len(out["proposals"]) == 1 and out["proposals"][0]["title"] == grounded["title"],
+          f"evidence_check kept {len(out['proposals'])} proposal(s); only the grounded one "
+          "should survive - an ungrounded proposal is a guess a person must read and refuse")
+    check(out["proposals"][0]["observation_fact"] == observations[0]["fact"],
+          "the measured wording was not attached, so the UI would show the model's paraphrase "
+          "of a number rather than the number")
+
+    # Worded differently from the existing rule on purpose: an id or a string comparison would
+    # let this through, which is precisely the failure being guarded against.
+    out = dedup_filter_node({
+        "proposals": [{
+            "title": "Task points at a well which does not exist anywhere",
+            "what_is_wrong": "task references a well absent from the master well list",
+            "how_to_detect": "flag task rows whose well cannot be found in the well master",
+        }],
+        "covered": [{"rule_id": "DQ-D36", "title": "Task is attached to a well that does not "
+                                                   "exist", "category": "Reference integrity",
+                     "tags": "task, well, reference"}],
+        "rejected": [],
+    })
+    check(not out["proposals"],
+          "a re-worded duplicate of an existing rule was not caught - the Scout will keep "
+          "proposing checks that already exist")
+    check(out["dropped"] and out["dropped"][0]["reason"] == "already covered",
+          "the duplicate vanished without a recorded reason")
+
+    out = dedup_filter_node({
+        "proposals": [{
+            "title": "Finish recorded before the start for a task",
+            "what_is_wrong": "actual finish precedes actual start",
+            "how_to_detect": "compare actual finish against actual start",
+        }],
+        "covered": [],
+        "rejected": [{"rule_id": "DQ-S02", "title": "Actual end before actual start",
+                      "reason": "valid historical snapshot behaviour"}],
+    })
+    check(not out["proposals"],
+          "a previously REFUSED idea came back - this is the failure that makes an operator "
+          "stop reading the proposal list altogether")
+    check(out["dropped"][0]["reason"] == "previously refused",
+          "the refused proposal was dropped for the wrong stated reason")
+
+
+def test_a_refused_rule_disappears_from_everything_that_lists_rules() -> None:
+    """Refusing a rule must remove it from sight, not merely stop it running.
+
+    A refused proposal is kept on file for exactly one reason - so the Scout cannot raise the
+    same idea again - and it is already listed under Refused on the Discover screen, with the
+    reason. Everywhere else it is noise:
+
+      THE RULES LIST   would grow with checks nobody wants, and a reader scanning for what the
+                       engine actually does would filter them out by eye on every visit.
+      THE REPORT       lists what is NOT running so coverage is never overstated. A refused
+                       idea is not a gap in coverage - it is a decision - and printing it as
+                       one tells the reader they are missing something they chose not to have.
+
+    The distinction from `disabled` is deliberate and is the reason this cannot be handled by
+    reusing that status: a disabled rule IS a real check somebody turned off, and belongs in
+    the report. A rejected one was never a check at all.
+    """
+    from app.api.main import rules as rules_endpoint
+    from app.graph.nodes.catalog_loader import catalog_loader_node
+    from app.rules.spec import AnomalyRule, CompiledProbe
+
+    listed = {r["rule_id"] for r in rules_endpoint(None)["rules"]}
+    from app.rules.loader import load_rules
+
+    parsed, _ = load_rules()
+    refused = {r.rule_id for r in parsed if r.status == "rejected"}
+    check(
+        not (listed & refused),
+        f"refused rule(s) {sorted(listed & refused)} are still in the rules list - rejecting "
+        "one must remove it from the rules section, not just stop it running",
+    )
+
+    # And the report's transparency section. Built with a probe still in the catalog, which is
+    # the real transient state: pruning happens at compile time, so between the refusal and the
+    # next compile the probe is there and something has to keep it out of the report.
+    probe = CompiledProbe(rule_id="DQ-S99", status="active", tables=("dbo.t",),
+                          summary_sql="SELECT 1", detail_sql="SELECT 1")
+    rejected_rule = AnomalyRule(rule_id="DQ-S99", title="refused idea", status="rejected",
+                                source="discovered")
+    disabled_rule = AnomalyRule(rule_id="DQ-X98", title="a check we turned off",
+                                status="disabled")
+    disabled_probe = CompiledProbe(rule_id="DQ-X98", status="active", tables=("dbo.t",),
+                                   summary_sql="SELECT 1", detail_sql="SELECT 1")
+
+    from app.rules import catalog as catalog_store
+
+    class _Fake:
+        probes = {"DQ-S99": probe, "DQ-X98": disabled_probe}
+
+        def counts(self):
+            return "fake"
+
+    original_load, original_rules = catalog_store.load, None
+    import app.graph.nodes.catalog_loader as loader_mod
+
+    original_rules = loader_mod._all_rules_by_id
+    catalog_store.load = lambda: _Fake()
+    loader_mod._all_rules_by_id = lambda: {"DQ-S99": rejected_rule, "DQ-X98": disabled_rule}
+    try:
+        out = catalog_loader_node({})
+    finally:
+        catalog_store.load = original_load
+        loader_mod._all_rules_by_id = original_rules
+
+    not_running = {n["rule_id"] for n in out["not_running"]}
+    check("DQ-S99" not in not_running,
+          "a refused rule is listed in the report as a check that did not report - it is a "
+          "decision, not a coverage gap, and after a year that section would be mostly "
+          "ideas nobody wanted")
+    check("DQ-X98" in not_running,
+          "a DISABLED rule vanished from the report too - that one IS a real check somebody "
+          "switched off, and hiding it overstates coverage")
+    check("DQ-S99" not in {p.rule_id for p in out["probes"]},
+          "a refused rule would still be EXECUTED")
+
+
+def test_a_rule_on_trial_is_never_counted_as_an_established_check() -> None:
+    """The header count and the score must describe the same set of checks.
+
+    `catalog.active` counts probes whose SQL built, and a rule on trial builds perfectly well -
+    so the dashboard header advertised it alongside the established checks while the score
+    beside it deliberately excluded it. Two numbers on one screen describing different sets,
+    with nothing saying so.
+    """
+    from app.api.main import _probe_counts
+    from app.rules.spec import AnomalyRule, CompiledProbe
+
+    class _Cat:
+        probes = {
+            "DQ-A01": CompiledProbe(rule_id="DQ-A01", status="active",
+                                    summary_sql="SELECT 1", detail_sql="SELECT 1"),
+            "DQ-S01": CompiledProbe(rule_id="DQ-S01", status="active",
+                                    summary_sql="SELECT 1", detail_sql="SELECT 1"),
+        }
+
+        @property
+        def active(self):
+            return list(self.probes.values())
+
+    rules = {
+        "DQ-A01": AnomalyRule(rule_id="DQ-A01", title="trusted", status="active"),
+        "DQ-S01": AnomalyRule(rule_id="DQ-S01", title="on trial", status="probation",
+                              source="discovered"),
+    }
+    catalog = _Cat()
+    trusted, on_trial = _probe_counts(catalog, rules)
+    check(on_trial == 1, f"on_trial counted {on_trial}, expected 1")
+    check(trusted == 1,
+          f"trusted counted {trusted}, expected 1 - the header would not match the set of "
+          "checks the score was computed from")
+
+    # A REFUSED rule keeps its compiled probe until the next compile prunes it. It must count
+    # as neither: rejecting a rule made the trusted count go UP by one, advertising a check
+    # that had just been switched off.
+    rules["DQ-S01"] = AnomalyRule(rule_id="DQ-S01", title="refused", status="rejected",
+                                  source="discovered")
+    trusted, on_trial = _probe_counts(catalog, rules)
+    check((trusted, on_trial) == (1, 0),
+          f"a refused rule with a lingering probe counted as (trusted={trusted}, "
+          f"on_trial={on_trial}); it must count as neither")
+
+
 def main() -> int:
     tests = [
         ("every module parses and imports", test_every_module_parses),
@@ -2473,6 +2886,17 @@ def main() -> int:
         ("an interval is not a foreign column", test_a_probe_that_prints_an_interval_keeps_its_columns),
         ("semantic drift detected, reload survived",
          test_semantic_drift_is_detected_but_survives_a_data_reload),
+        ("probation runs but is never scored", test_probation_runs_but_is_never_scored),
+        ("probation stays out of every headline number",
+         test_the_scorer_keeps_probation_out_of_every_headline_number),
+        ("a discovery decision never touches the user's files",
+         test_a_discovery_decision_never_touches_the_user_s_files),
+        ("the Scout cannot propose what is covered or refused",
+         test_the_scout_cannot_propose_what_is_covered_or_refused),
+        ("a refused rule disappears from everything that lists rules",
+         test_a_refused_rule_disappears_from_everything_that_lists_rules),
+        ("a rule on trial is never counted as established",
+         test_a_rule_on_trial_is_never_counted_as_an_established_check),
     ]
     for name, fn in tests:
         before = len(_failures)

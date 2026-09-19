@@ -86,9 +86,33 @@ def _severity_of(rule) -> str:
     return getattr(rule, "severity", "medium") or "medium"
 
 
+def _is_scored(rule) -> bool:
+    """Whether this rule's findings belong in the headline numbers.
+
+    A rule on PROBATION runs and reports, but counts towards nothing here - not the score, not
+    the flagged total, not the examined total, not the check counts. It was proposed by the
+    Scout and accepted for trial, and nobody has yet confirmed it measures what it claims.
+
+    THIS IS WHERE THE WHOLE DISCOVERY FEATURE IS MADE SAFE. A proposal that is simply wrong -
+    one that flags half the database - can waste a compile and clutter its own section of the
+    report, and that is the entire extent of the damage it can do. It cannot move a number
+    anyone quotes, because it never enters this arithmetic.
+
+    Missing rule, or one without the attribute: scored. The default has to be the SAFE side for
+    a data-quality tool, and silently dropping a real finding is far worse than counting one.
+    """
+    return bool(getattr(rule, "scored", True))
+
+
 def scorer_node(state: RunState) -> dict:
-    results = state.get("results") or []
+    every_result = state.get("results") or []
     rules = state.get("rules") or {}
+
+    # Partitioned before anything is counted, so no total below can accidentally include a
+    # probation rule. The two sets are then scored by the same code - `_tally` at the bottom
+    # runs over the discovered half - rather than by a second, drifting implementation.
+    results = [r for r in every_result if _is_scored(rules.get(r.rule_id))]
+    probation = [r for r in every_result if not _is_scored(rules.get(r.rule_id))]
 
     # Both sides of the weighted mean. A clean rule contributes 0 to the numerator and its full
     # weight to the denominator - which is what makes a clean check actually raise the score,
@@ -187,6 +211,14 @@ def scorer_node(state: RunState) -> dict:
             len(empty_scope), ", ".join(empty_scope[:10]),
         )
 
+    discovered_ranked, discovered_totals = _tally(probation, rules)
+    if probation:
+        log.info(
+            "score: %d probation rule(s) ran and are reported separately - %s record(s) "
+            "flagged, excluded from the score and from every headline total",
+            len(probation), f"{discovered_totals['records_flagged']:,}",
+        )
+
     return {
         "score": round(score, 1),
         "score_basis": SCORE_BASIS,
@@ -197,4 +229,51 @@ def scorer_node(state: RunState) -> dict:
         ),
         "ranked": ranked,
         "empty_scope": empty_scope,
+        # Kept entirely apart from the figures above, and rendered in its own section wherever
+        # it is shown. A reader must always be able to tell which findings came from a rule a
+        # person wrote and which from one a machine suggested.
+        "discovered_ranked": discovered_ranked,
+        "discovered_totals": discovered_totals,
+    }
+
+
+def _tally(results: list, rules: dict) -> tuple[list[dict], dict]:
+    """Rank and total one set of results, WITHOUT computing a score for it.
+
+    Deliberately no score. A score is a claim about the health of the data, and a set of rules
+    nobody has confirmed cannot make that claim - publishing a second number beside the real one
+    would invite exactly the comparison this separation exists to prevent. Counts and shares are
+    facts about what ran; a score is a verdict, and these rules have not earned one.
+    """
+    ranked: list[dict] = []
+    examined = flagged = 0
+    for result in results:
+        if not result.ok:
+            continue
+        examined += result.scope_total
+        flagged += result.anomaly_count
+        if result.scope_total <= 0 or result.anomaly_count <= 0:
+            continue
+        rule = rules.get(result.rule_id)
+        ranked.append({
+            "rule_id": result.rule_id,
+            "title": getattr(rule, "title", result.rule_id),
+            "category": getattr(rule, "category", "Uncategorised") or "Uncategorised",
+            "severity": _severity_of(rule),
+            "status": getattr(rule, "status", ""),
+            "scope_total": result.scope_total,
+            "anomaly_count": result.anomaly_count,
+            "anomaly_pct": result.anomaly_pct
+            or round(100.0 * result.anomaly_count / result.scope_total, 4),
+            "share": result.anomaly_count / result.scope_total,
+            "detail_total": result.detail_total,
+            "concerns": list(result.concerns),
+        })
+    ranked.sort(key=lambda r: (SEVERITY_RANK.get(r["severity"], 9), -r["share"]))
+    return ranked, {
+        "probes_run": len(results),
+        "probes_failed": sum(1 for r in results if not r.ok),
+        "probes_with_findings": len(ranked),
+        "records_examined": examined,
+        "records_flagged": flagged,
     }

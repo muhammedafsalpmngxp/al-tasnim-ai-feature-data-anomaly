@@ -43,6 +43,7 @@ from app.rules.spec import (
     AUTO,
     METHODS,
     SEVERITIES,
+    SOURCES,
     SQL_MODES,
     STATUSES,
     AnomalyRule,
@@ -262,7 +263,11 @@ def _build_rule(rule_id: str, title: str, block: str, path: str, line_no: int) -
         method=_validate("method", meta.get("method", "rule").lower(), METHODS, rule_id),
         sql_mode=sql_mode,
         status=_validate("status", meta.get("status", "active").lower(), STATUSES, rule_id),
-        source="declared",
+        # READ FROM THE FILE, not hardcoded, so a rule can say where it came from. Everything in
+        # data_anomalies.md omits it and is therefore "declared", exactly as before; only the
+        # Scout's accepted proposals in anomalies/discovered.md carry `source: discovered`, and
+        # that label is what keeps their findings out of the headline numbers downstream.
+        source=_validate("source", meta.get("source", "declared").lower(), SOURCES, rule_id),
         expands_over=expands_over,
         tags=tuple(t.strip() for t in meta.get("tags", "").split(",") if t.strip()),
         body=_strip_sql_fences(body),

@@ -92,6 +92,42 @@ def _write_summary_sheet(wb, state) -> None:
             round(float(row["anomaly_pct"]), 2),
         ])
 
+    # Rules still on trial are listed BELOW the findings above, under their own banner and never
+    # interleaved with them. Their numbers appear in no total on this sheet: a reader sorting
+    # the findings table by "records affected" must not find an unvetted rule at the top of it.
+    discovered = state.get("discovered_ranked") or []
+    if discovered:
+        totals_d = state.get("discovered_totals") or {}
+        ws.append([])
+        ws.append([styled(
+            "ON TRIAL - proposed automatically, accepted for trial, NOT counted in the score "
+            "or in any total above",
+            bold=True,
+        )])
+        ws.append([
+            styled(t, bold=True, colour=_HEADER_FILL)
+            for t in ("Rule", "What was found", "Category", "Severity",
+                      "Records affected", "Of examined", "Share %")
+        ])
+        for row in discovered:
+            ws.append([
+                row["rule_id"],
+                row["title"],
+                row["category"],
+                styled(row["severity"], colour=None),
+                row["anomaly_count"],
+                row["scope_total"],
+                round(float(row["anomaly_pct"]), 2),
+            ])
+        ws.append([
+            styled(
+                f"{totals_d.get('probes_run', 0):,} rule(s) on trial · "
+                f"{totals_d.get('records_flagged', 0):,} record(s) flagged · excluded from the "
+                f"score and every headline figure",
+                bold=True,
+            )
+        ])
+
     # Everything NOT running goes in the same workbook, deliberately. A reader who only opens
     # the spreadsheet must still be able to see which checks produced no answer at all.
     gaps = state.get("empty_scope") or []
@@ -179,7 +215,9 @@ def build(state, path: str | None = None) -> str:
     used: set[str] = {"Summary"}
     sheets = 0
     rows = 0
-    for row in state.get("ranked") or []:
+    # Trial rules get their own sheets too - the affected records are the whole point of running
+    # one - but AFTER the established findings, so the workbook reads in order of trust.
+    for row in (state.get("ranked") or []) + (state.get("discovered_ranked") or []):
         result = results.get(row["rule_id"])
         if result is None or not result.detail_columns:
             continue
