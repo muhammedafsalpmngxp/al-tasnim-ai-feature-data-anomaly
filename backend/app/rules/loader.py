@@ -51,6 +51,10 @@ from app.utils import extract_sql_blocks
 
 log = get_logger()
 
+# THE DOMAIN FILES ARE USER-OWNED. Nothing in this engine writes, generates or reorganises
+# them: business_rules.md, data_anomalies.md and few_shots.md are the operator's control
+# surface and live exactly where they put them. Only the DESCRIPTIONS of the database
+# (schema.txt and the two hint files) are machine-maintained - see app/db/introspect.py.
 _DOMAIN_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "domain"
 )

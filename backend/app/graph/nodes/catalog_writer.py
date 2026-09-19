@@ -85,10 +85,22 @@ def _status(state: CompileState) -> tuple[str, str]:
 
 def catalog_writer_node(state: CompileState) -> dict:
     from app.db.introspect import probe_fingerprint
+    from app.rules.semantics import semantic_fingerprint
 
     status, error = _status(state)
     rule_id = state.get("rule_id", "")
     tables = tuple(state.get("tables", []) or ())
+
+    # The MEASURED MEANING of this probe's tables, recorded from the very hints the author and
+    # the reviewer were shown. Taken from the FULL artefacts in state, never from the pruned
+    # blocks: the pruned copies are cut down per rule, so hashing them would make the
+    # fingerprint depend on how much context a retry happened to be given.
+    meaning = semantic_fingerprint(
+        tables,
+        state.get("schema", ""),
+        state.get("value_hints", ""),
+        state.get("numeric_hints", ""),
+    )
 
     probe = CompiledProbe(
         rule_id=rule_id,
@@ -103,6 +115,10 @@ def catalog_writer_node(state: CompileState) -> dict:
         # What this probe's OWN tables looked like when it was written, so a later change to an
         # unrelated table does not drag it into a recompile it does not need.
         table_fingerprint=probe_fingerprint(tables, state.get("table_signatures") or {}),
+        # What those tables MEANT when it was written - scales, bounds, coded values. Structure
+        # alone cannot see a 0-100 column become 0-1, and that change turns a correct probe
+        # into one that silently reports zero anomalies.
+        semantic_fingerprint=meaning,
         compiled_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         tables=tables,
         grounding_note=state.get("grounding_note", ""),

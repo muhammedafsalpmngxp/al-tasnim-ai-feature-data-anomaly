@@ -103,22 +103,69 @@ def catalog_loader_node(state: RunState) -> dict:
 
     # Structure only - deliberately blind to row counts, so a nightly data load does not
     # invalidate SQL that is still perfectly correct.
+    #
+    # ONE CONNECTION FOR BOTH, on the METADATA budget rather than the probe one, for the same
+    # reason as the compiler: they read the same catalogue, and two separate reads on the
+    # short probe timeout are two chances to lose staleness checking for the whole run.
+    fingerprint, signatures = "", {}
+    conn = None
     try:
-        fingerprint = introspect.structure_fingerprint()
+        from app.db.connection import get_connection
+
+        conn = get_connection(timeout=settings.metadata_timeout)
+        cur = conn.cursor()
+        fingerprint = introspect.structure_fingerprint(cur)
+        signatures = introspect.table_signatures(cur)
     except Exception as exc:  # noqa: BLE001
-        log.warning("probe: structure fingerprint unavailable (%s) - assuming current", exc)
-        fingerprint = ""
-    try:
-        signatures = introspect.table_signatures()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("probe: per-table signatures unavailable (%s)", exc)
-        signatures = {}
+        log.warning(
+            "probe: structure fingerprints unavailable (%s) - every probe is ASSUMED CURRENT "
+            "for this run. Raise ANOMALY_METADATA_TIMEOUT (currently %ss) if this is a timeout.",
+            exc, settings.metadata_timeout,
+        )
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     only = {r.strip().lower() for r in (state.get("only") or [])}
     selected = [
         p for p in catalog.probes.values()
         if not only or p.rule_id.lower() in only
     ]
+
+    # The measured MEANING of a probe's tables, as the database holds it right now. Read from
+    # the cached hint files rather than re-profiled: they are themselves fingerprinted against
+    # the live database, so they are current by the time this node runs, and re-scanning every
+    # numeric column at the start of every detection run would undo the economy the whole
+    # compile/run split exists to provide.
+    #
+    # Unavailable is not fatal. An empty fingerprint compares equal to everything, so a run
+    # with no hints behaves exactly as it did before this check existed - structural signals
+    # only. Refusing to run over a missing cache would be the check doing more harm than the
+    # problem it guards against.
+    try:
+        _hints = (
+            introspect.build_schema_text(),
+            introspect.build_value_hints(),
+            introspect.build_numeric_hints(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("probe: measured hints unavailable (%s) - semantic drift not checked", exc)
+        _hints = ("", "", "")
+
+    _meaning_cache: dict[tuple[str, ...], str] = {}
+
+    def _meaning_of(probe) -> str:
+        if not probe.tables:
+            return ""
+        key = tuple(probe.tables)
+        if key not in _meaning_cache:
+            from app.rules.semantics import semantic_fingerprint
+
+            _meaning_cache[key] = semantic_fingerprint(key, *_hints)
+        return _meaning_cache[key]
 
     # Judged per probe, against the tables it actually reads. A column added to a table this
     # probe never touches is not a reason to distrust - or recompile - its SQL.
@@ -132,6 +179,18 @@ def catalog_loader_node(state: RunState) -> dict:
             continue
         moved, why = catalog_store.structure_moved(probe, fingerprint, signatures)
         if moved:
+            outdated[probe.rule_id] = why
+            continue
+        # A probe can be structurally perfect and still be measuring the wrong thing: a column
+        # that kept its name, type and nullability while its scale moved from 0-100 to 0-1
+        # leaves every structural fingerprint unchanged and turns `>= 100` into a condition
+        # nothing can satisfy. The probe then reports zero anomalies and the report calls the
+        # data clean, which is the most damaging output this engine can produce. Treated as
+        # staleness so it takes the SAME path as every other untrustworthy probe - rebuilt if
+        # the budget allows, refused and reported if not. Never executed on the strength of a
+        # fingerprint that cannot see the problem.
+        drifted, why = catalog_store.semantics_moved(probe, _meaning_of(probe))
+        if drifted:
             outdated[probe.rule_id] = why
 
     stale = bool(outdated)

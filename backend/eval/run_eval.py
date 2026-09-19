@@ -52,6 +52,7 @@ for _s in (sys.stdout, sys.stderr):
 
 from app.config import settings  # noqa: E402
 from app.observability import get_logger, setup_logging  # noqa: E402
+from app.db import identity  # noqa: E402
 from app.rules import catalog as catalog_store  # noqa: E402
 from app.rules.contract import (  # noqa: E402
     check_summary,
@@ -62,7 +63,24 @@ from app.rules.contract import (  # noqa: E402
 
 log = get_logger()
 
-_GOLDEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden.jsonl")
+_EVAL_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _golden_path() -> str:
+    """THIS database's baseline. One file per database, and deliberately no fallback.
+
+    A baseline is a set of RATIOS measured against a particular database. Kept in one shared
+    file it is silently wrong the moment a second database is pointed at: the rule ids are
+    identical across databases - every installation has DQ-D03 and DQ-G01-001 - so the harness
+    would not skip the rows as "unknown probe", it would compare them. A probe correctly
+    flagging 0.2% here would be checked against a band recorded somewhere else and reported as
+    a regression, or, worse, a genuine inversion would land inside the foreign band and pass.
+
+    There is no legacy fallback, for the same reason app.db.identity.read_cache has none:
+    attribution has to be structural, not a promise. An unattributed eval/golden.jsonl from
+    before the split simply stops being read, and `--record` writes this database its own.
+    """
+    return os.path.join(_EVAL_DIR, f"golden.{identity.slug()}.jsonl")
 
 # How far the anomaly share may move before it is treated as a regression rather than as the
 # data changing. Wide on purpose - see the module docstring.
@@ -109,10 +127,10 @@ class Outcome:
 
 
 def load_golden() -> dict[str, dict]:
-    if not os.path.exists(_GOLDEN_PATH):
+    if not os.path.exists(_golden_path()):
         return {}
     out: dict[str, dict] = {}
-    with open(_GOLDEN_PATH, encoding="utf-8") as fh:
+    with open(_golden_path(), encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
             if not line or line.startswith("//"):
@@ -128,7 +146,7 @@ def load_golden() -> dict[str, dict]:
 
 def save_golden(rows: list[dict]) -> None:
     rows.sort(key=lambda r: r["rule_id"])
-    with open(_GOLDEN_PATH, "w", encoding="utf-8") as fh:
+    with open(_golden_path(), "w", encoding="utf-8") as fh:
         fh.write("// Baseline for python -m eval.run_eval. Regenerate with --record after a\n")
         fh.write("// deliberate change to the rules, the schema, or the prompts. One probe per\n")
         fh.write("// line; `share` is anomaly_count / scope_total at the time it was recorded.\n")
@@ -368,7 +386,7 @@ def main() -> int:
     out = Outcome()
 
     print(f"Catalog: {len(catalog.probes)} probe(s) - {catalog.counts()}")
-    print(f"Baseline: {len(golden)} probe(s) in {os.path.relpath(_GOLDEN_PATH)}\n")
+    print(f"Baseline: {len(golden)} probe(s) in {os.path.relpath(_golden_path())}\n")
 
     check_offline(catalog, golden, out)
 
@@ -381,7 +399,7 @@ def main() -> int:
             merged.update({r["rule_id"]: r for r in recorded})
             recorded = list(merged.values())
         save_golden(recorded)
-        print(f"\nRecorded {len(recorded)} probe(s) to {os.path.relpath(_GOLDEN_PATH)}")
+        print(f"\nRecorded {len(recorded)} probe(s) to {os.path.relpath(_golden_path())}")
         return 0
 
     if not args.offline:

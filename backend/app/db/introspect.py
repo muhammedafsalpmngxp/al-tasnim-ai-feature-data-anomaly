@@ -43,6 +43,7 @@ import os
 import re
 
 from app.config import settings
+from app.db import identity
 from app.db.connection import get_connection
 from app.observability import get_logger
 
@@ -101,13 +102,52 @@ def quote_column(col: str) -> str:
     return col
 
 
-_CACHE_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".cache"
-)
-_SCHEMA_PATH = os.path.join(_CACHE_DIR, "schema.txt")
-_FINGERPRINT_PATH = os.path.join(_CACHE_DIR, "schema.fingerprint")
-_VALUE_HINTS_PATH = os.path.join(_CACHE_DIR, "value_hints.txt")
-_NUMERIC_HINTS_PATH = os.path.join(_CACHE_DIR, "numeric_hints.txt")
+_CACHE_DIR = identity.cache_dir()
+
+# ONE SET OF DESCRIPTION FILES PER DATABASE, NOT ONE SET.
+#
+# These four files describe a SPECIFIC database: its tables, the real coded values read out of
+# its lookup tables, the measured scale of its numbers. The catalog was already kept per
+# database; these were not, and the gap was the more dangerous half. Point DB_NAME somewhere
+# else and the fingerprint correctly said "rebuild" - but the rebuild OVERWROTE the previous
+# database's files, so using two databases in rotation re-scanned both every single time, and
+# on a large production database that is minutes of metadata queries and value sampling per
+# switch.
+#
+# Worse, the two halves could disagree. A catalog kept per database sitting beside a schema.txt
+# describing a DIFFERENT one means every probe looks current - its own fingerprint matches -
+# while the schema block shown to the author and the reviewer belongs somewhere else. Keyed on
+# the same identity as the catalog, by the same function, that cannot happen.
+#
+# Resolved through functions rather than constants because the configured database is read at
+# call time: a test that repoints DB_NAME must see the new paths, not the ones that happened to
+# exist when this module was first imported.
+_SCHEMA_STEM = "schema"
+_VALUE_HINTS_STEM = "value_hints"
+_NUMERIC_HINTS_STEM = "numeric_hints"
+
+
+def _schema_path() -> str:
+    return identity.cache_path(_SCHEMA_STEM, "txt")
+
+
+def _fingerprint_path() -> str:
+    return identity.cache_path(_SCHEMA_STEM, "fingerprint")
+
+
+def _value_hints_path() -> str:
+    return identity.cache_path(_VALUE_HINTS_STEM, "txt")
+
+
+def _numeric_hints_path() -> str:
+    return identity.cache_path(_NUMERIC_HINTS_STEM, "txt")
+
+
+def cache_paths() -> tuple[str, ...]:
+    """Every description file for THIS database, for the CLI to show and refresh to delete."""
+    return (
+        _schema_path(), _value_hints_path(), _numeric_hints_path(), _fingerprint_path(),
+    )
 
 
 # ── Visibility filters ─────────────────────────────────────────────────────────
@@ -580,7 +620,7 @@ def structure_fingerprint(cur=None) -> str:
         _structure_signature(cur, h)
         return h.hexdigest()
 
-    conn = get_connection()
+    conn = get_connection(timeout=settings.metadata_timeout)
     try:
         h = hashlib.sha256()
         _structure_signature(conn.cursor(), h)
@@ -603,7 +643,7 @@ def table_signatures(cur=None) -> dict[str, str]:
     overnight keeps its signature, or the daily run stops being nearly free.
     """
     if cur is None:
-        conn = get_connection()
+        conn = get_connection(timeout=settings.metadata_timeout)
         try:
             return table_signatures(conn.cursor())
         finally:
@@ -700,11 +740,7 @@ def missing_tables(tables, signatures: dict[str, str]) -> list[str]:
 
 
 def _read_fingerprint() -> str:
-    try:
-        with open(_FINGERPRINT_PATH, encoding="utf-8") as fh:
-            return fh.read().strip()
-    except OSError:
-        return ""
+    return identity.read_cache(_SCHEMA_STEM, "fingerprint")
 
 
 def _invalidate_hints() -> None:
@@ -712,8 +748,12 @@ def _invalidate_hints() -> None:
 
     Called when the schema fingerprint moves: both hint files describe the same structure, so a
     new table would otherwise appear in schema.txt but never in the hints.
+
+    THIS DATABASE'S copies only. Removing every database's hints because one of them changed
+    would charge a full re-scan to databases that did not move - which is the cost the
+    per-database split exists to remove.
     """
-    for path in (_VALUE_HINTS_PATH, _NUMERIC_HINTS_PATH):
+    for path in (_value_hints_path(), _numeric_hints_path()):
         try:
             if os.path.exists(path):
                 os.remove(path)
@@ -731,12 +771,9 @@ def build_schema_text(use_cache: bool = True) -> str:
     built from. If a table or column is added the fingerprint differs and it rebuilds itself on
     the next run - no one has to remember to run the refresh command.
     """
-    cached = ""
-    if use_cache and os.path.exists(_SCHEMA_PATH):
-        with open(_SCHEMA_PATH, encoding="utf-8") as fh:
-            cached = fh.read().strip()
+    cached = identity.read_cache(_SCHEMA_STEM, "txt") if use_cache else ""
 
-    conn = get_connection()
+    conn = get_connection(timeout=settings.metadata_timeout)
     try:
         cur = conn.cursor()
         if cached:
@@ -768,12 +805,12 @@ def build_schema_text(use_cache: bool = True) -> str:
     # every later run into "no tables exist".
     if not text.strip():
         return text
-    os.makedirs(_CACHE_DIR, exist_ok=True)
-    with open(_SCHEMA_PATH, "w", encoding="utf-8") as fh:
-        fh.write(text)
-    with open(_FINGERPRINT_PATH, "w", encoding="utf-8") as fh:
-        fh.write(fingerprint)
-    log.info("schema: rebuilt from the live database (%d tables)", len(text.split("\nTABLE ")))
+    identity.write_cache(_SCHEMA_STEM, "txt", text)
+    identity.write_cache(_SCHEMA_STEM, "fingerprint", fingerprint)
+    log.info(
+        "schema: rebuilt from the live database for %s (%d tables)",
+        settings.db_name, len(text.split("\nTABLE ")),
+    )
     return text
 
 
@@ -795,13 +832,14 @@ def _is_hint_column(col: str) -> bool:
 
 
 def build_value_hints(use_cache: bool = True) -> str:
-    if use_cache and os.path.exists(_VALUE_HINTS_PATH):
-        with open(_VALUE_HINTS_PATH, encoding="utf-8") as fh:
-            return fh.read().strip()
+    if use_cache:
+        cached = identity.read_cache(_VALUE_HINTS_STEM, "txt")
+        if cached:
+            return cached
     if not settings.allowed_schemas:
         return ""
 
-    conn = get_connection()
+    conn = get_connection(timeout=settings.metadata_timeout)
     try:
         cur = conn.cursor()
         placeholders = ",".join("?" for _ in settings.allowed_schemas)
@@ -859,9 +897,7 @@ def build_value_hints(use_cache: bool = True) -> str:
 
     if not text.strip():
         return text
-    os.makedirs(_CACHE_DIR, exist_ok=True)
-    with open(_VALUE_HINTS_PATH, "w", encoding="utf-8") as fh:
-        fh.write(text)
+    identity.write_cache(_VALUE_HINTS_STEM, "txt", text)
     return text
 
 
@@ -1030,9 +1066,10 @@ def build_numeric_hints(use_cache: bool = True) -> str:
     One aggregate query per table computes every numeric column in a single pass, so the cost
     is one scan per table - paid once, then cached until the structure or the data changes.
     """
-    if use_cache and os.path.exists(_NUMERIC_HINTS_PATH):
-        with open(_NUMERIC_HINTS_PATH, encoding="utf-8") as fh:
-            return fh.read().strip()
+    if use_cache:
+        cached = identity.read_cache(_NUMERIC_HINTS_STEM, "txt")
+        if cached:
+            return cached
     if not settings.allowed_schemas:
         return ""
 
@@ -1162,9 +1199,7 @@ def build_numeric_hints(use_cache: bool = True) -> str:
 
     if not text.strip():
         return text
-    os.makedirs(_CACHE_DIR, exist_ok=True)
-    with open(_NUMERIC_HINTS_PATH, "w", encoding="utf-8") as fh:
-        fh.write(text)
+    identity.write_cache(_NUMERIC_HINTS_STEM, "txt", text)
     return text
 
 
@@ -1178,7 +1213,9 @@ def refresh(verbose: bool = True) -> tuple[str, str, str]:
     the catalog carries its own structure-only fingerprint and decides for itself whether it is
     stale, so a data-only reload never triggers an expensive recompile.
     """
-    for path in (_SCHEMA_PATH, _VALUE_HINTS_PATH, _NUMERIC_HINTS_PATH, _FINGERPRINT_PATH):
+    # THIS database's files only - another database's description is not stale because this one
+    # was refreshed, and deleting it would charge that database a re-scan it never asked for.
+    for path in cache_paths():
         if os.path.exists(path):
             os.remove(path)
             if verbose:

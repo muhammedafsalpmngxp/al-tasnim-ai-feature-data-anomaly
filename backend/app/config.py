@@ -139,6 +139,22 @@ class Settings:
 
     # -- Query execution ---------------------------------------------------------
     query_timeout: int = field(default_factory=lambda: _get_int("ANOMALY_QUERY_TIMEOUT", 60))
+    # Catalogue reads - INFORMATION_SCHEMA and sys.* - get their OWN budget, not the probe one.
+    #
+    # They were sharing query_timeout, and the two have nothing in common. That one bounds a
+    # probe's SUMMARY query, which runs once per probe and should be short; this bounds a
+    # metadata pass that runs a handful of times per compile and is the thing EVERY staleness
+    # guard depends on. Coupling them meant the headroom a slow or permission-limited server
+    # needs for its catalogue could only be bought by also letting every probe run for minutes.
+    #
+    # Observed on a restricted login against a remote server: three metadata calls timed out at
+    # 60s each - a 183-second compile that did no work, with structure fingerprints and
+    # per-table signatures both unavailable, so nothing could be judged stale. Generous by
+    # default because the cost of it expiring is not a slow compile, it is a compile that
+    # cannot tell whether its stored SQL is still valid.
+    metadata_timeout: int = field(
+        default_factory=lambda: _get_int("ANOMALY_METADATA_TIMEOUT", 300)
+    )
     detail_timeout: int = field(default_factory=lambda: _get_int("ANOMALY_DETAIL_TIMEOUT", 600))
     run_concurrency: int = field(
         default_factory=lambda: max(1, _get_int("ANOMALY_RUN_CONCURRENCY", 3))

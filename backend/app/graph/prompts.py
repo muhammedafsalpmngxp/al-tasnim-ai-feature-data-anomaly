@@ -26,6 +26,9 @@ import os
 
 from app.config import settings
 
+# USER-OWNED, MACHINE-READ. These three files are the operator's control surface and nothing in
+# this engine ever writes them. Only the DESCRIPTIONS of the database - schema.txt and the two
+# hint files - are machine-maintained, and they live in .cache, not here.
 _DOMAIN_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "domain"
 )
@@ -554,6 +557,49 @@ Respond with ONLY this JSON on a single line, no prose:
 RULE_VERIFIER_TEMPLATE = RULE_VERIFIER_SYSTEM + "\n\n" + _BR_SLOT
 # The unpruned prompt, for when reference pruning is off and for the self-checks.
 RULE_VERIFIER_SYSTEM = _with_limits(RULE_VERIFIER_TEMPLATE.replace(_BR_SLOT, BUSINESS_RULES))
+
+
+# ── Reloading the domain knowledge ─────────────────────────────────────────────
+# The two large prompts are assembled at import time, which is right: building them once keeps
+# every node's `from app.graph.prompts import X` working unchanged and costs nothing per rule.
+#
+# It stops being right the moment somebody EDITS one of the three domain files while a process
+# is running - a long-lived API server, or a UI for editing them - because the prompts would go
+# on carrying the rulebook as it was at startup. The edit would appear to have been ignored,
+# which is the most confusing possible outcome for the one file a business owner is expected to
+# maintain. So reloading is a supported operation rather than something to remember.
+#
+# THE GENERATION COUNTER IS NOT DECORATION. app/llm.py identifies which agent is calling by the
+# OBJECT IDENTITY of the prompt constant it was handed. Reassigning these names creates new
+# string objects, so a label cache built before a reload would silently stop recognising every
+# agent and log them all as "agent". llm.py reads this counter and rebuilds its cache when it
+# moves, which keeps the identity trick correct across a reload instead of quietly wrong.
+DOMAIN_GENERATION = 0
+
+
+def reload_domain() -> str:
+    """Re-read the three domain files from disk. Returns a short note on what it loaded.
+
+    Only the two prebuilt "unpruned" prompts need rebuilding: author_system() and
+    verifier_system() read the module globals at call time, so they pick up a reload for free.
+    The TEMPLATES are never rebuilt - they carry slots, not content, so they are unaffected by
+    an edit to the files that fill those slots.
+    """
+    global BUSINESS_RULES, FEW_SHOTS, ANOMALY_SQL_AUTHOR_SYSTEM, RULE_VERIFIER_SYSTEM
+    global DOMAIN_GENERATION
+
+    BUSINESS_RULES = _load_domain_file("business_rules.md")
+    FEW_SHOTS = _load_domain_file("few_shots.md")
+    ANOMALY_SQL_AUTHOR_SYSTEM = _with_limits(
+        ANOMALY_SQL_AUTHOR_TEMPLATE.replace(_BR_SLOT, BUSINESS_RULES).replace(
+            _FS_SLOT, FEW_SHOTS
+        )
+    )
+    RULE_VERIFIER_SYSTEM = _with_limits(
+        RULE_VERIFIER_TEMPLATE.replace(_BR_SLOT, BUSINESS_RULES)
+    )
+    DOMAIN_GENERATION += 1
+    return f"{len(BUSINESS_RULES):,} chars of business rules, {len(FEW_SHOTS):,} of examples"
 
 
 def verifier_system(rule_text: str, tags: tuple[str, ...] = ()) -> str:

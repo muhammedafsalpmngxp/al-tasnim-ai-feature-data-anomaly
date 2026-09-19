@@ -27,6 +27,7 @@ from app.graph.build import build_compile_graph
 from app.llm import get_usage_report, start_usage_tracking
 from app.observability import get_logger
 from app.rules import catalog as catalog_store
+from app.rules import semantics
 from app.rules.lockfile import CompileLockError, compile_lock  # noqa: F401 - re-exported
 from app.rules.expand import (
     coverage_summary,
@@ -149,7 +150,17 @@ def _seed_state(
     }
 
 
-_BRACKETED = re.compile(r"\[([^\]]+)\]")
+# A bracketed IDENTIFIER, and only that. `[^\]]+` was too generous: it happily spanned
+# newlines and whole expressions, so a `[` and a `]` that were never a delimited name at all
+# still produced a match. T-SQL forbids `]` inside a delimited identifier (it is escaped `]]`),
+# but nothing forbids a newline, so the length and newline limits here are a deliberate
+# narrowing beyond the grammar - a real column name is short and on one line, and the cost of
+# missing an exotic one is a check that does not fire, while the cost of over-matching is a
+# correct probe rejected.
+_BRACKETED = re.compile(r"\[([^\]\r\n]{1,128})\]")
+
+# A T-SQL string literal, including the doubled-quote escape, and any N prefix.
+_STRING_LITERAL = re.compile(r"N?'(?:[^']|'')*'")
 
 
 def _foreign_columns(sql: str, tables: tuple[str, ...]) -> list[str]:
@@ -175,8 +186,17 @@ def _foreign_columns(sql: str, tables: tuple[str, ...]) -> list[str]:
         known |= {c.name.lower() for c in table.columns}
     if not known:
         return []
+    # STRING LITERALS ARE REMOVED FIRST, and that is not a refinement - without it this check
+    # rejected correct work. A probe's explain_text routinely prints a mathematical interval:
+    #     ' is [', CAST(x.x_min_value AS nvarchar(50)), ', ', ... , '], outside ['
+    # Those brackets are TEXT. The scan matched from the `[` in one literal to the `]` in a
+    # later one, captured every line in between, and reported that whole SQL fragment as a
+    # column name "which exists in the table the query was written against but not in this
+    # one". Fifteen of sixteen numeric_range clones were failed by it in a single compile -
+    # every member of the family except the one the template was authored from, because only
+    # clones pass through here. The probes were fine; the check was wrong.
     return sorted({
-        m.group(1) for m in _BRACKETED.finditer(sql or "")
+        m.group(1) for m in _BRACKETED.finditer(_STRING_LITERAL.sub("''", sql or ""))
         if m.group(1).lower() not in known
     })
 
@@ -186,6 +206,7 @@ def _instantiate(
     template: tuple[str, str] | None,
     fingerprint: str,
     signatures: dict[str, str],
+    hints: tuple[str, str, str] = ("", "", ""),
 ) -> CompiledProbe:
     """Build one family member's probe from the query authored for its family.
 
@@ -244,6 +265,11 @@ def _instantiate(
         rule_hash=rule.rule_hash,
         structure_fingerprint=fingerprint,
         table_fingerprint=introspect.probe_fingerprint(tables, signatures),
+        # A clone gets its OWN semantic fingerprint, over ITS tables - not the author's. The
+        # whole point of a family is that thirty-six probes read thirty-six different places,
+        # and copying the author's fingerprint would mean a scale change in any one of them
+        # either invalidated all of them or none.
+        semantic_fingerprint=semantics.semantic_fingerprint(tables, *hints),
         compiled_at=dt.datetime.now().astimezone().isoformat(timespec="seconds"),
         tables=tables,
         grounding_note=(
@@ -379,6 +405,23 @@ def _compile_rules(
     values = introspect.build_value_hints()
     numbers = introspect.build_numeric_hints()
 
+    # The CURRENT measured meaning of one probe's tables, for the staleness test. Defined here
+    # because this is where the three artefacts are in scope, and computed per probe rather
+    # than once for the database: a lookup being recoded must invalidate the probes that filter
+    # on it and nothing else.
+    #
+    # Cached on the table tuple, because a family's thirty-six members resolve to a handful of
+    # distinct table sets and re-walking the index for each is pure repetition.
+    meaning_cache: dict[tuple[str, ...], str] = {}
+
+    def _meaning_of(probe: CompiledProbe | None) -> str:
+        if probe is None or not probe.tables:
+            return ""
+        key = tuple(probe.tables)
+        if key not in meaning_cache:
+            meaning_cache[key] = semantics.semantic_fingerprint(key, schema, values, numbers)
+        return meaning_cache[key]
+
     rules, errors = _all_rules()
     for problem in errors:
         log.warning("load: %s", problem)
@@ -397,30 +440,44 @@ def _compile_rules(
     if skipped:
         log.info("compile: %d rule(s) are draft or disabled and were not compiled", skipped)
 
-    # The structure-only fingerprint. Its whole purpose is to NOT move when data is reloaded,
-    # so a daily refresh does not trigger a full-cost recompile.
+    # BOTH FINGERPRINTS OVER ONE CONNECTION AND ONE CURSOR.
+    #
+    # They read the same catalogue - INFORMATION_SCHEMA.COLUMNS plus the sys.* key views - and
+    # each used to open its own connection and read it again. On a healthy server that is
+    # merely wasteful; on a slow or permission-limited one it is three independent chances to
+    # time out, and a timeout here is not a slow compile, it is a compile that CANNOT TELL
+    # whether its stored SQL is still valid. Observed: 60s x 3 = a 183-second compile with both
+    # fingerprints unavailable and staleness checking silently switched off.
+    #
+    # Both functions already accept a cursor; nothing needed inventing, only using.
+    fingerprint, signatures = "", {}
+    conn = None
     try:
-        fingerprint = introspect.structure_fingerprint()
-    except Exception as exc:  # noqa: BLE001
-        # Without it nothing can be judged stale, so the safe reading is "everything is", which
-        # is expensive and silent. Say so loudly and reuse what is there instead.
-        log.warning(
-            "compile: the structure fingerprint is unavailable (%s) - compiled probes cannot "
-            "be checked for staleness, so only uncompiled rules will be built", exc,
-        )
-        fingerprint = ""
+        from app.db.connection import get_connection
 
-    # Per-table structure hashes, so a probe records what its OWN tables looked like when it
-    # was written. Unavailable is not fatal: staleness falls back to the whole-database
-    # fingerprint, which is blunter but never wrong in the dangerous direction.
-    try:
-        signatures = introspect.table_signatures()
+        conn = get_connection(timeout=settings.metadata_timeout)
+        cur = conn.cursor()
+        # Structure-only, so it does NOT move when data is reloaded - a daily refresh must not
+        # trigger a full-cost recompile.
+        fingerprint = introspect.structure_fingerprint(cur)
+        # Per-table hashes, so a probe records what its OWN tables looked like. Blunter
+        # fallback is the whole-database fingerprint above.
+        signatures = introspect.table_signatures(cur)
     except Exception as exc:  # noqa: BLE001
+        # Without these nothing can be judged stale, so the safe reading is "everything is",
+        # which is expensive and silent. Say so loudly and reuse what is there instead.
         log.warning(
-            "compile: per-table signatures unavailable (%s) - staleness will be judged over the "
-            "whole database, so unrelated changes will force recompiles", exc,
+            "compile: the structure fingerprints are unavailable (%s) - compiled probes cannot "
+            "be checked for staleness, so only uncompiled rules will be built. If this is a "
+            "timeout, raise ANOMALY_METADATA_TIMEOUT (currently %ss).",
+            exc, settings.metadata_timeout,
         )
-        signatures = {}
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     # The probe SHAPES are a property of THIS ENGINE's contract, not of the business, so they
     # live beside the contract in prompts.py rather than at the top of the file a business
@@ -517,7 +574,8 @@ def _compile_rules(
             family for family, first in authors.items()
             if not any(
                 catalog_store.is_stale(
-                    catalog.get(r.rule_id), r, fingerprint, retry_failed, signatures
+                    catalog.get(r.rule_id), r, fingerprint, retry_failed, signatures,
+                    _meaning_of(catalog.get(r.rule_id)),
                 )[0]
                 for r in runnable if r.family_id == family
             )
@@ -565,7 +623,8 @@ def _compile_rules(
                         continue
                 else:
                     probe = _instantiate(
-                        rule, templates.get(rule.family_id), fingerprint, signatures
+                        rule, templates.get(rule.family_id), fingerprint, signatures,
+                        (schema, values, numbers),
                     )
                     # Substitution being textually clean does not make the result valid SQL.
                     # See _smoke_test: the clone proves it runs, or it is not stored active.
@@ -587,7 +646,8 @@ def _compile_rules(
             existing = catalog.get(rule.rule_id)
             if not force:
                 stale, why = catalog_store.is_stale(
-                    existing, rule, fingerprint, retry_failed, signatures
+                    existing, rule, fingerprint, retry_failed, signatures,
+                    _meaning_of(existing),
                 )
                 if not stale and existing is not None:
                     report.reused.append(rule.rule_id)

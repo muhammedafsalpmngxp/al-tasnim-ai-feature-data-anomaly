@@ -187,6 +187,16 @@ class CompiledProbe:
     # whole-database fingerprint, which is the conservative direction - recompiling something
     # that did not need it costs money, missing something that did costs correctness.
     table_fingerprint: str = ""
+    # The MEANING of the columns this probe reads - measured numeric scales, derived bounds and
+    # the real coded values of the lookups it filters on (app/rules/semantics.py). Every other
+    # fingerprint here is structural and therefore blind to a column that keeps its name, type
+    # and nullability while its scale flips from 0-100 to 0-1: the stored comparison then
+    # silently returns zero anomalies and the report says the data is clean.
+    #
+    # Empty on an entry written before this existed, and empty when it cannot be computed. An
+    # empty fingerprint compares equal to everything, so such a probe is left to the structural
+    # signals exactly as before - a check that could not run must never fail a probe.
+    semantic_fingerprint: str = ""
     compiled_at: str = ""
 
     # Which tables the probe reads, from Grounding. Used to prune the schema block on a wide
@@ -219,6 +229,7 @@ class CompiledProbe:
             "rule_hash": self.rule_hash,
             "structure_fingerprint": self.structure_fingerprint,
             "table_fingerprint": self.table_fingerprint,
+            "semantic_fingerprint": self.semantic_fingerprint,
             "compiled_at": self.compiled_at,
             "tables": list(self.tables),
             "grounding_note": self.grounding_note,
@@ -239,6 +250,7 @@ class CompiledProbe:
             rule_hash=data.get("rule_hash", ""),
             structure_fingerprint=data.get("structure_fingerprint", ""),
             table_fingerprint=data.get("table_fingerprint", ""),
+            semantic_fingerprint=data.get("semantic_fingerprint", ""),
             compiled_at=data.get("compiled_at", ""),
             tables=tuple(data.get("tables") or ()),
             grounding_note=data.get("grounding_note", ""),

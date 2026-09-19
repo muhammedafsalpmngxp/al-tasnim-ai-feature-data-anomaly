@@ -1977,6 +1977,451 @@ def test_compile_is_guarded_by_the_lock() -> None:
     )
 
 
+
+# ── Per-database isolation: description caches and semantic drift ──────────────
+# Both cover the multi-database work, and both guard a SILENT failure: an engine pointed at a
+# new database that reuses another one's description files, or that keeps executing probes
+# whose columns no longer mean what they meant, produces a confident report about the wrong
+# thing - and every count in it looks entirely plausible.
+
+
+def _with_database(name: str, server: str | None = None):
+    """Rebuild Settings against a different database, returning a restore callable.
+
+    Settings is a frozen dataclass read at import, so changing the environment alone is
+    invisible to code already holding it. Every consumer resolves `settings` through a module
+    attribute lookup at CALL time, so rebinding app.config.settings is what actually repoints
+    the engine - and is exactly what a test of per-database behaviour has to do.
+    """
+    import app.config as config
+
+    keys = ("DB_NAME", "DB_SERVER")
+    previous_settings = config.settings
+    previous_env = {k: os.environ.get(k) for k in keys}
+
+    os.environ["DB_NAME"] = name
+    if server is not None:
+        os.environ["DB_SERVER"] = server
+    config.settings = config.Settings()
+
+    def restore() -> None:
+        config.settings = previous_settings
+        for key, value in previous_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    return restore
+
+
+def test_caches_are_keyed_per_database() -> None:
+    """Every cached artefact is named for the database it describes, by ONE definition.
+
+    The catalog grew its own slug before the description files did, and the gap was the
+    dangerous half: a catalog correctly kept per database sitting beside a schema.txt describing
+    a DIFFERENT one means every probe looks current while the schema block shown to the author
+    belonged somewhere else. This asserts the two can never diverge again.
+    """
+    from app.db import identity
+    from app.rules import catalog as catalog_store
+
+    restore = _with_database("AlphaDB")
+    try:
+        alpha_slug = identity.slug()
+        alpha = {
+            "catalog": catalog_store.path(),
+            "schema": identity.cache_path("schema", "txt"),
+            "values": identity.cache_path("value_hints", "txt"),
+            "numbers": identity.cache_path("numeric_hints", "txt"),
+        }
+        check(
+            alpha["catalog"].endswith("anomaly_catalog." + alpha_slug + ".json"),
+            "the catalog path must carry this database's slug, got " + repr(alpha["catalog"]),
+        )
+        check(
+            all(alpha_slug in p for p in alpha.values()),
+            "every cached artefact must be named for the database it describes; "
+            + repr([p for p in alpha.values() if alpha_slug not in p]) + " are not",
+        )
+    finally:
+        restore()
+
+    restore = _with_database("BetaDB")
+    try:
+        beta_slug = identity.slug()
+        check(beta_slug != alpha_slug, "two databases must not share one slug")
+        check(
+            catalog_store.path() != alpha["catalog"],
+            "pointing at another database must not resolve to the same catalog file - that is "
+            "what destroyed the previous database's compile on every switch",
+        )
+        check(
+            identity.cache_path("schema", "txt") != alpha["schema"],
+            "pointing at another database must not resolve to the same schema description",
+        )
+    finally:
+        restore()
+
+    # Identity is server+port+name, not name alone: a restored copy on another host must not
+    # inherit the original's probes, because the hint files hold real values read out of data.
+    restore = _with_database("SameName")
+    try:
+        here = identity.digest()
+    finally:
+        restore()
+    restore = _with_database("SameName", server="some-other-host")
+    try:
+        check(
+            identity.digest() != here,
+            "the same database name on a different server must produce a different identity - "
+            "otherwise a restored copy silently inherits probes calibrated elsewhere",
+        )
+    finally:
+        restore()
+
+
+def test_semantic_drift_is_detected_but_survives_a_data_reload() -> None:
+    """The meaning check must fire on a scale change and stay silent on a nightly load.
+
+    Both halves matter equally. Missing a scale change means a probe comparing a 0-1 column
+    against 100 keeps reporting zero anomalies while the report calls the data clean - the worst
+    output this engine can produce. Firing on a data reload means recompiling everything daily,
+    which is an engine nobody leaves switched on.
+    """
+    from app.rules.semantics import semantic_fingerprint
+
+    schema = (
+        "TABLE dbo.t  -- 1,000 rows\n"
+        "  - id int NOT NULL PK\n"
+        "  - progress numeric\n"
+    )
+    numbers = (
+        "NUMERIC HINTS (MEASURED from the live data)\n"
+        "dbo.t  (1,000 rows)\n"
+        "  - progress: min 0.0, max 1.0, avg 0.26, stdev 0.1, nulls 5% "
+        "| FRACTION_1 (0-1) - MULTIPLY BY 100 TO REPORT A PERCENTAGE\n"
+    )
+    values = "VALUE HINTS (real coded values)\n- dbo.t (code): A; B\n"
+    tables = ("dbo.t",)
+
+    base = semantic_fingerprint(tables, schema, values, numbers)
+    check(bool(base), "a table with measured numeric columns must produce a fingerprint")
+    check(
+        base == semantic_fingerprint(tables, schema, values, numbers),
+        "the fingerprint must be stable for identical input",
+    )
+
+    # A nightly reload: volume moves, meaning does not.
+    reloaded = numbers.replace("(1,000 rows)", "(4,812,506 rows)")
+    reloaded = reloaded.replace("nulls 5%", "nulls 11%").replace("stdev 0.1", "stdev 0.3")
+    check(
+        semantic_fingerprint(tables, schema, values, reloaded) == base,
+        "row counts, null rates and standard deviation must NOT move the fingerprint - a "
+        "signal that moves on every data load would recompile the whole catalog daily",
+    )
+
+    # A real change of meaning.
+    rescaled = numbers.replace("avg 0.26", "avg 61.4").replace(
+        "FRACTION_1 (0-1) - MULTIPLY BY 100 TO REPORT A PERCENTAGE", "PERCENT_100 (0-100)"
+    )
+    check(
+        semantic_fingerprint(tables, schema, values, rescaled) != base,
+        "a column whose measured scale moves from 0-1 to 0-100 MUST move the fingerprint: "
+        "every stored comparison against 1.0 is now wrong, and no structural signal sees it",
+    )
+
+    # A lookup recoded - a probe writes those values in as literals.
+    check(
+        semantic_fingerprint(tables, schema, values.replace("A; B", "A1; B1"), numbers) != base,
+        "recoding a lookup must move the fingerprint: probes filter on those literal values",
+    )
+
+    # Unknowable must never invalidate.
+    check(
+        semantic_fingerprint((), schema, values, numbers) == "",
+        "no tables means no fingerprint, not a hash of emptiness",
+    )
+    check(
+        semantic_fingerprint(("dbo.absent",), schema, values, numbers) == "",
+        "a table that cannot be resolved must yield NO fingerprint rather than one built from "
+        "the columns that happened to resolve - that would read as 'verified unchanged'",
+    )
+
+    from app.rules.catalog import semantics_moved
+    from app.rules.spec import CompiledProbe
+
+    probe = CompiledProbe(rule_id="X", summary_sql="", detail_sql="", tables=tables)
+    check(
+        semantics_moved(probe, base)[0] is False,
+        "a probe compiled before this field existed must never be marked stale by it",
+    )
+    probe.semantic_fingerprint = base
+    check(
+        semantics_moved(probe, "")[0] is False,
+        "an unavailable current fingerprint must never invalidate a probe - a check that could "
+        "not run must not fail the thing it was checking",
+    )
+    check(
+        semantics_moved(probe, "deadbeef")[0] is True,
+        "a moved fingerprint must be reported as staleness",
+    )
+
+
+# ── The user-owned domain files: read-only, and enforced ───────────────────────
+
+# Mutating calls. `open` is judged separately because it is the only one whose mode decides
+# whether the call writes at all, and the domain files are READ through it constantly.
+_MUTATING_CALLS = {
+    "remove", "unlink", "rename", "replace", "rmtree", "mkdir", "makedirs",
+    "copy", "copy2", "copyfile", "copytree", "move",
+    "write_text", "write_bytes", "writelines", "truncate",
+}
+
+
+def _write_mode(call) -> bool:
+    """True when this open() call can modify a file.
+
+    A non-literal mode is treated as a write. The point of the check is to refuse anything it
+    cannot prove is safe, and `open(p, mode)` with a computed mode is exactly that.
+    """
+    import ast
+
+    mode = None
+    if len(call.args) >= 2:
+        mode = call.args[1]
+    for kw in call.keywords:
+        if kw.arg == "mode":
+            mode = kw.value
+    if mode is None:
+        return False  # open(path) is read-only
+    if not isinstance(mode, ast.Constant) or not isinstance(mode.value, str):
+        return True
+    return any(ch in mode.value for ch in "wax+")
+
+
+def test_the_engine_never_writes_a_domain_file() -> None:
+    """business_rules.md, data_anomalies.md and few_shots.md are the USER'S files.
+
+    The engine reads them and must never create, edit, reorganise or delete one. That is not a
+    style preference - it is the ownership boundary the operator set, because these files encode
+    what the business means and a machine cannot be the author of that. In future they are
+    edited through the UI; until then they are edited by hand, and either way the engine's only
+    verb is `read`.
+
+    THIS TEST EXISTS BECAUSE THE PROPERTY WAS TRUE BY HABIT, NOT BY CONSTRUCTION. Nothing in
+    the code stopped a future edit from adding a write, and the one thing that makes such a
+    regression expensive is that it destroys work no rebuild can recover: a generated file can
+    be regenerated, a hand-written business definition cannot.
+
+    Checked two ways, because either alone is escapable:
+
+      STATICALLY  no call site in app/ that can modify a file names the domain directory. This
+                  catches the regression at its source, in the diff that introduces it.
+      BY BYTES    exercising every code path that reads the domain files leaves all of them
+                  byte-identical. This catches a write that arrives through a mechanism the
+                  static half does not model - a helper, a library, a temp-file dance.
+    """
+    import ast
+    import hashlib
+    import pathlib
+
+    domain = pathlib.Path(_BACKEND) / "domain"
+    check(domain.is_dir(), "the domain directory should exist")
+
+    # ── statically ────────────────────────────────────────────────────────────
+    for path in sorted(pathlib.Path(_APP).rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (OSError, SyntaxError):
+            continue  # test_every_module_parses owns that failure; do not report it twice
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+            if name == "open":
+                if not _write_mode(node):
+                    continue
+            elif name not in _MUTATING_CALLS:
+                continue
+            # Every argument, because the path can arrive as any of them.
+            args = " ".join(
+                ast.unparse(a) for a in list(node.args) + [k.value for k in node.keywords]
+            )
+            rel = path.relative_to(_BACKEND).as_posix()
+            check(
+                "domain" not in args.lower(),
+                f"{rel}:{node.lineno} calls {name}() on a path naming the domain directory "
+                f"({args[:120]}). The domain files are user-owned and read-only to this engine.",
+            )
+
+    # ── by bytes ──────────────────────────────────────────────────────────────
+    def snapshot() -> dict[str, str]:
+        return {
+            p.relative_to(domain).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in sorted(domain.rglob("*")) if p.is_file()
+        }
+
+    before = snapshot()
+    check(bool(before), "the domain directory should hold the rule and prompt files")
+    for expected in ("business_rules.md", "data_anomalies.md", "few_shots.md"):
+        check(expected in before, f"domain/{expected} should be present")
+
+    # Everything that touches these files, in the order a real compile touches them.
+    from app.rules.expand import expand_families
+    from app.rules.loader import load_rules
+
+    rules, _errors = load_rules()
+    expand_families(rules)
+    try:
+        from app.graph import prompts
+
+        prompts.reload_domain()
+    except Exception:  # noqa: BLE001 - no LLM stack installed; the loader half still ran
+        pass
+
+    after = snapshot()
+    check(
+        after == before,
+        "reading the domain files changed them: "
+        + ", ".join(
+            sorted(
+                set(before) ^ set(after)
+                or {k for k in before if before[k] != after.get(k)}
+            )
+        ),
+    )
+
+
+def test_a_probe_that_prints_an_interval_keeps_its_columns() -> None:
+    """Brackets inside a string literal are TEXT, not a delimited column name.
+
+    THIS IS A REGRESSION TEST FOR FIFTEEN PROBES LOST IN ONE COMPILE. The clone-safety check in
+    the compiler flags bracketed identifiers that do not exist in the table a family member
+    reads - a genuinely valuable check, because a template that hard-codes a column name gets
+    cloned across the whole family and every copy then fails at the database.
+
+    It was matching brackets inside string literals. A probe's explain_text routinely prints a
+    mathematical interval:
+
+        ' is [', CAST(x.x_min_value AS nvarchar(50)), ', ', ... , '], outside the range ['
+
+    and the scan matched from the opening bracket in one literal to the closing bracket in a
+    later one, captured every line between them, and reported that whole SQL fragment as a
+    missing column. Fifteen of the sixteen numeric_range members failed that way - all of them
+    except the one the template was authored from, because only CLONES pass through the check.
+    The probes were correct; the check was not.
+
+    Both defences are asserted here, because each catches a case the other misses: stripping
+    literals handles an interval printed on ONE line, and refusing to match across a newline
+    handles the multi-line CONCAT that actually occurred. And a real foreign column must still
+    be caught, or the fix would have removed the check instead of correcting it.
+    """
+    from app.compiler import _foreign_columns
+    from app.rules import schema_index
+
+    table = schema_index.Table(
+        name="dbo.plan",
+        columns=[
+            schema_index.Column(name="entity_key", data_type="int"),
+            schema_index.Column(name="progress", data_type="decimal"),
+        ],
+    )
+    original = schema_index.load_index
+    import app.compiler as compiler_module
+
+    compiler_module.load_index = lambda *a, **k: schema_index.SchemaIndex({"dbo.plan": table})
+    try:
+        multi_line = (
+            "SELECT [progress],\n"
+            "    CONCAT(\n"
+            "        'progress is [',\n"
+            "        CAST(x.x_min_value AS nvarchar(50)),\n"
+            "        ', ',\n"
+            "        CAST(x.x_max_value AS nvarchar(50)),\n"
+            "        '], outside the permitted range [',\n"
+            "        CAST(0 AS nvarchar(50)),\n"
+            "        ']'\n"
+            "    ) AS explain_text\n"
+            "FROM dbo.plan AS x"
+        )
+        check(
+            _foreign_columns(multi_line, ("dbo.plan",)) == [],
+            "an interval printed across several lines must not be read as a column name, "
+            f"got {_foreign_columns(multi_line, ('dbo.plan',))!r}",
+        )
+
+        one_line = (
+            "SELECT [progress], CONCAT('range [', CAST(a AS nvarchar(10)), ', ', "
+            "CAST(b AS nvarchar(10)), ']') AS explain_text FROM dbo.plan"
+        )
+        check(
+            _foreign_columns(one_line, ("dbo.plan",)) == [],
+            "an interval printed on one line must not be read as a column name, "
+            f"got {_foreign_columns(one_line, ('dbo.plan',))!r}",
+        )
+
+        # The check must still do its job: a column that really is absent is still reported.
+        hard_coded = "SELECT [progress], [document_name] FROM dbo.plan"
+        check(
+            _foreign_columns(hard_coded, ("dbo.plan",)) == ["document_name"],
+            "a column the template hard-coded, absent from this member's table, must still be "
+            f"caught, got {_foreign_columns(hard_coded, ('dbo.plan',))!r}",
+        )
+    finally:
+        compiler_module.load_index = original
+
+
+def test_the_eval_baseline_is_keyed_per_database() -> None:
+    """A recorded baseline belongs to the database it was measured on, and only that one.
+
+    The rule ids are identical everywhere - every installation has DQ-D03 and DQ-G01-001 - so a
+    shared baseline file does NOT degrade into "unknown probe, skipped". It degrades into
+    comparison against the wrong numbers: a probe correctly flagging 0.2% is checked against a
+    band recorded on a different database and called a regression, or a real inversion lands
+    inside that foreign band and passes silently. The second is the dangerous one, because the
+    whole purpose of the harness is to be believed when it says nothing changed.
+
+    Checked the same way the caches are: two databases must not resolve to one path, and the
+    path must carry the database's identity rather than its bare name, so two servers holding a
+    database of the same name stay separate.
+    """
+    from eval import run_eval
+
+    restore = _with_database("BaselineDbOne", server="server-one.example")
+    try:
+        first = run_eval._golden_path()
+    finally:
+        restore()
+
+    restore = _with_database("BaselineDbTwo", server="server-one.example")
+    try:
+        second = run_eval._golden_path()
+    finally:
+        restore()
+
+    # Same NAME, different SERVER: still two different baselines.
+    restore = _with_database("BaselineDbOne", server="server-two.example")
+    try:
+        same_name_other_server = run_eval._golden_path()
+    finally:
+        restore()
+
+    check(first != second, f"two databases share one baseline file: {first}")
+    check(
+        first != same_name_other_server,
+        "a database of the same name on another server shares one baseline file: " + first,
+    )
+    check(
+        "BaselineDbOne" in os.path.basename(first),
+        f"the baseline filename should name its database, got {os.path.basename(first)}",
+    )
+    check(
+        os.path.basename(first) != "golden.jsonl",
+        "the baseline must not fall back to the unattributed pre-split filename",
+    )
+
+
 def main() -> int:
     tests = [
         ("every module parses and imports", test_every_module_parses),
@@ -2022,6 +2467,12 @@ def main() -> int:
         ("Word report has no blank pages", test_word_report_has_no_blank_pages),
         ("compile is guarded by the lock", test_compile_is_guarded_by_the_lock),
         ("compile lock excludes another process", test_compile_lock_excludes_another_process),
+        ("caches are keyed per database", test_caches_are_keyed_per_database),
+        ("eval baseline is keyed per database", test_the_eval_baseline_is_keyed_per_database),
+        ("domain files are never written", test_the_engine_never_writes_a_domain_file),
+        ("an interval is not a foreign column", test_a_probe_that_prints_an_interval_keeps_its_columns),
+        ("semantic drift detected, reload survived",
+         test_semantic_drift_is_detected_but_survives_a_data_reload),
     ]
     for name, fn in tests:
         before = len(_failures)

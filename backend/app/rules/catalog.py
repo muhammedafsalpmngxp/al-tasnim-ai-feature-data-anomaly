@@ -25,20 +25,17 @@ usually fail again, at full cost, every single run.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import os
-import re
 from dataclasses import dataclass, field
 
+from app.db import identity
 from app.observability import get_logger
 from app.rules.spec import AnomalyRule, CompiledProbe
 
 log = get_logger()
 
-_CACHE_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".cache"
-)
+_CACHE_DIR = identity.cache_dir()
 
 # ONE CATALOG PER DATABASE, NOT ONE CATALOG.
 #
@@ -62,68 +59,29 @@ _CATALOG_STEM = "anomaly_catalog"
 _LEGACY_CATALOG_PATH = os.path.join(_CACHE_DIR, f"{_CATALOG_STEM}.json")
 
 
+# Database identity - the slug, the per-database path and the one-off legacy fallback - now
+# lives in app/db/identity.py, because the rendered description files (schema.txt and the two
+# hint files) are keyed on it too. Two implementations of "which database is this?" is one
+# rename away from a catalog kept per database sitting beside a schema.txt describing another.
 def current_database() -> dict[str, str]:
     """Which database this process is pointed at, as a catalog records it."""
-    from app.config import settings
-
-    return {"name": settings.db_name, "server": settings.db_server}
-
-
-# Matches ONLY a per-database catalog: the slug always ends in the 8-hex identity digest that
-# _slug() appends. Deliberately not "anything with an extra dot in the name" - a hand-made
-# backup like `anomaly_catalog.before-grain-fix.json` sitting in the same directory would be
-# mistaken for a migrated catalog and silently cancel the upgrade path below.
-_PER_DATABASE_NAME = re.compile(
-    rf"^{re.escape(_CATALOG_STEM)}\.[A-Za-z0-9_.-]+-[0-9a-f]{{8}}\.json$"
-)
-
-
-def _slug(database: dict[str, str]) -> str:
-    """A filename-safe, human-readable, COLLISION-FREE key for one database.
-
-    The readable part is for whoever opens .cache and wants to know what they are looking at.
-    The hash is the part that means anything: it covers server, port and name, so a database
-    restored onto a second server under the same name does not quietly share the first one's
-    probes.
-    """
-    from app.config import settings
-
-    identity = f"{settings.db_server}:{settings.db_port}/{settings.db_name}".lower()
-    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
-    readable = re.sub(r"[^A-Za-z0-9_.-]+", "-", database.get("name") or "db").strip("-")[:40]
-    return f"{readable or 'db'}-{digest}"
+    return identity.current_database()
 
 
 def path() -> str:
     """Where THIS database's catalog is written."""
-    return os.path.join(_CACHE_DIR, f"{_CATALOG_STEM}.{_slug(current_database())}.json")
+    return identity.cache_path(_CATALOG_STEM, "json")
 
 
 def _legacy_path() -> str:
     """The pre-split catalog, ONLY while no database has a catalog of its own yet.
 
-    This is the upgrade path, and it is deliberately a one-off. An installation that compiled
-    before the split has one `anomaly_catalog.json` holding real, paid-for work; throwing it
-    away on upgrade would charge the operator a full rebuild for installing a new build.
-    Adopting it cannot make a wrong probe run - database identity is inside every stored
-    fingerprint, so a catalog adopted by the wrong database is judged stale and rebuilt - so the
-    worst case is a recompile that was going to happen anyway.
-
-    THE MOMENT ANY PER-DATABASE CATALOG EXISTS, THIS FILE IS SUPERSEDED and never read again.
-    Without that condition the stale file would be offered to the SECOND database too, and to
-    the third, each time producing a confident "loaded 82 probes" log line about probes written
-    for somewhere else, followed by a full rebuild. Correct, but alarming to read and pointless
-    to compute. It is left on disk rather than deleted: it is somebody's record of a compile,
-    and a cache that erases files on upgrade is a cache people stop trusting.
+    See app/db/identity.legacy_cache_path for why this is a deliberate one-off, and why
+    adopting a file written for another database cannot make a wrong probe run: database
+    identity is inside every stored fingerprint, so an adopted catalog is judged stale and
+    rebuilt. The worst case is a recompile that was going to happen anyway.
     """
-    if not os.path.exists(_LEGACY_CATALOG_PATH):
-        return ""
-    try:
-        if any(_PER_DATABASE_NAME.match(name) for name in os.listdir(_CACHE_DIR)):
-            return ""
-    except OSError:
-        return ""
-    return _LEGACY_CATALOG_PATH
+    return identity.legacy_cache_path(_CATALOG_STEM, "json")
 
 # Bumped when the MEANING of a stored field changes. Without it an older catalog would be
 # loaded and trusted by newer code that reads its fields differently - and the failure would be
@@ -314,18 +272,46 @@ def structure_moved(
     return False, ""
 
 
+def semantics_moved(probe: CompiledProbe, current: str) -> tuple[bool, str]:
+    """(has the MEANING of what this probe reads changed, why).
+
+    A separate signal from structure_moved on purpose, with its own message. The two fail in
+    opposite ways and an operator needs to be able to tell them apart: a structural change is
+    visible - a column was renamed, a query would error - while a semantic change leaves a
+    perfectly valid query quietly measuring the wrong thing. Folding it into "the database
+    structure changed" would hide the more dangerous of the two behind the wording of the safer.
+
+    EITHER SIDE BEING EMPTY MEANS UNKNOWN, AND UNKNOWN NEVER INVALIDATES. `current` is empty
+    when the hints are not available; `probe.semantic_fingerprint` is empty for an entry
+    compiled before this existed, or one whose tables hold nothing measurable. A probe must
+    never be rebuilt - or worse, refused at run time - because a check could not be performed.
+    """
+    if not current or not probe.semantic_fingerprint:
+        return False, ""
+    if current == probe.semantic_fingerprint:
+        return False, ""
+    from app.rules.semantics import describe_drift
+
+    return True, describe_drift(probe.tables)
+
+
 def is_stale(
     probe: CompiledProbe | None,
     rule: AnomalyRule,
     structure_fingerprint: str,
     retry_failed: bool = False,
     table_signatures: dict[str, str] | None = None,
+    semantic_fingerprint: str = "",
 ) -> tuple[bool, str]:
     """(needs recompiling, why). The why is logged, so a recompile is never mysterious.
 
     `table_signatures` narrows the structural test to the tables this probe actually reads.
     Without it the whole-database fingerprint is used, which is correct but blunt: it marks
     every probe stale over a column added to a table none of them touch.
+
+    `semantic_fingerprint` is the CURRENT measured meaning of this probe's tables, computed by
+    the caller (which already holds the hints) via app.rules.semantics. Omitted means the check
+    is skipped, which is the pre-existing behaviour - structure alone.
     """
     if probe is None:
         return True, "not compiled yet"
@@ -334,6 +320,13 @@ def is_stale(
 
     structure_changed, why = structure_moved(probe, structure_fingerprint, table_signatures)
     if structure_changed:
+        return True, why
+
+    # Checked AFTER structure, because a structural change is the more specific diagnosis and
+    # a renamed column usually moves both signals at once - reporting the meaning drifting when
+    # the column simply went would send the reader looking in the wrong place.
+    meaning_changed, why = semantics_moved(probe, semantic_fingerprint)
+    if meaning_changed:
         return True, why
     if probe.status == "failed":
         if retry_failed:

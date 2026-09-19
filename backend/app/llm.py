@@ -33,23 +33,35 @@ def _is_openai() -> bool:
 # is recognised here by OBJECT IDENTITY. This keeps the model trace in one place: no node,
 # prompt or graph code has to change to appear correctly in the log and the usage table.
 _PROMPT_LABELS: dict[int, str] | None = None
+# Which domain generation the cache above was built from. The prompts carrying business rules
+# are REASSIGNED when the domain files are reloaded (app.graph.prompts.reload_domain), which
+# creates new string objects and makes every cached id stale - so a cache built once would
+# silently label every agent "agent" from the first reload onwards. Rebuilding when the
+# generation moves keeps the identity trick honest without asking any node to do anything.
+_LABELS_GENERATION = -1
 
 
 def _agent_label(system: str) -> str:
-    global _PROMPT_LABELS
-    if _PROMPT_LABELS is None:
-        try:
-            from app.graph import prompts as p  # deferred: avoids an import cycle
+    global _PROMPT_LABELS, _LABELS_GENERATION
+    try:
+        from app.graph import prompts as p  # deferred: avoids an import cycle
 
+        generation = p.DOMAIN_GENERATION
+    except Exception:  # noqa: BLE001 - logging must never break a request
+        return "agent"
+
+    if _PROMPT_LABELS is None or generation != _LABELS_GENERATION:
+        try:
             _PROMPT_LABELS = {
                 id(p.GROUNDING_SYSTEM): "grounding",
                 id(p.ANOMALY_SQL_AUTHOR_SYSTEM): "sql_author",
                 id(p.RULE_VERIFIER_SYSTEM): "verifier",
                 id(p.SUMMARIZER_SYSTEM): "summarizer",
             }
+            _LABELS_GENERATION = generation
         except Exception:  # noqa: BLE001 - logging must never break a request
             _PROMPT_LABELS = {}
-    return _PROMPT_LABELS.get(id(system), "agent")
+    return (_PROMPT_LABELS or {}).get(id(system), "agent")
 
 
 def active_model_for(fast: bool) -> str:

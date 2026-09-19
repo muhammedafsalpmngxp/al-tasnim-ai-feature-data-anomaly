@@ -51,6 +51,14 @@ Row counts change every day as data loads. A catalog keyed on the full fingerpri
 
 Each rule also stores a hash of its own markdown, so editing one rule recompiles **that rule only**.
 
+### What the structural fingerprints cannot see
+
+Every signal above is *structural* — names, types, lengths, nullability, keys. None of them notices a change of **meaning**: a progress column that held 0-100 and now holds 0-1 keeps its name, its `numeric` type and its nullability, so the stored `WHERE progress >= 100` is judged current, returns **zero anomalies**, and the report calls the data clean. That is the worst output this engine can produce.
+
+So each probe also stores a **semantic fingerprint** over what its columns *mean*: the measured scale verdict per numeric column, the bounds derived from it, whether a text column holds codes, and the real coded values of the lookups it filters on. It is checked at compile time and again before every run; a probe whose meaning has moved is rebuilt, or refused and reported, never executed.
+
+Only meaning is folded in, never volume — row counts, averages, standard deviation and null rates are all excluded, so a nightly load still costs nothing. Verified on the live hints: row counts, min/max, stdev and null rates leave it unchanged; a `FRACTION_1 → PERCENT_100` reclassification, a recoded lookup, and a text column crossing from "codes" to numeric all move it.
+
 ---
 
 ## Prerequisites
@@ -393,6 +401,37 @@ Detail queries are ordered worst-first, so a cap still shows the rows that matte
 | `business_rules.md` | authoritative business definitions, grain, join quirks |
 | `few_shots.md` | worked question → T-SQL patterns |
 | `data_anomalies.md` | **anomaly definitions in business prose - no SQL. The agent writes the SQL** |
+
+**These three files are USER-OWNED. Nothing in this engine writes, generates, moves or rewrites them.** That is a deliberate boundary, not an omission: they encode what the business means, a judgement no model is entitled to make on its own, and a rule nobody agreed to must never end up in a report. The engine only ever *reads* them.
+
+What the engine *does* maintain is the **description of the database**, and only that:
+
+```
+NEW DATABASE
+     │
+     ▼
+Inspect / profile database
+     │
+     ├── .cache/schema.<db>.txt          ← engine writes
+     ├── .cache/value_hints.<db>.txt     ← engine writes
+     └── .cache/numeric_hints.<db>.txt   ← engine writes
+     +
+     ├── domain/business_rules.md        ← USER OWNED — never touched
+     ├── domain/data_anomalies.md        ← USER OWNED — never touched
+     └── domain/few_shots.md             ← USER OWNED — never touched
+```
+
+### Pointing at a second database
+
+Change `DB_NAME` (and `ALLOWED_SCHEMAS` if needed), then `compile`. What happens:
+
+- the three description files are **re-introspected and cached under this database's name**, so the previous database's copies are kept and switching back does not re-scan;
+- the catalog is per database too (`anomaly_catalog.<db>-<hash>.json`), so a switch no longer destroys the previous compile;
+- the domain files are read exactly as they are. The rules that this database cannot express are retired as `not_applicable` with a stated reason, which is visible in the report.
+
+Identity is `server:port/name`, not `name`: the same database name restored onto another host gets its own cache, because the hint files hold real values read out of the data and probes calibrated on one are not valid on the other.
+
+Editing a domain file while a server is running takes effect without a restart — `app.graph.prompts.reload_domain()` rebuilds the two large prompts from disk.
 
 ### Where SQL is allowed to live
 

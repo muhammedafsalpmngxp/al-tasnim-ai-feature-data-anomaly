@@ -20,10 +20,20 @@ IT FAILS CLOSED. An unreadable verdict is a rejection, not an approval. Defaulti
 way let a malformed reply - a trailing comma is enough - silently turn a rejection into an
 approval, with nothing in the log to say it had happened.
 
-GENERIC PROBES NEVER REACH THIS NODE. Their SQL is rendered deterministically from the
-schema's own declarations, so there is no business judgement in it for a reviewer to add; the
-graph routes them straight to the catalog. That is what keeps two hundred structural probes
-genuinely free.
+EVERY PROBE REACHES THIS NODE, INCLUDING THE FAMILY-EXPANDED STRUCTURAL ONES. An earlier
+design rendered those deterministically from the schema's own declarations and routed them
+straight to the catalog as "generic" probes, on the argument that a foreign-key check carries
+no business judgement for a reviewer to add. It does carry one. Which of two candidate keys is
+the real parent, whether a NULL is a violation or the documented way to say "not applicable",
+and whether an orphan rate of 4% is a defect or just how this table has always been loaded are
+all judgements, and getting them wrong produces a confident number about nothing - exactly the
+failure the rest of this docstring describes. So the bypass was removed and the graph has no
+edge that skips verification; `state["source"]` still records declared vs expanded for the
+report, but it changes no routing.
+
+The cost of that is real and deliberate: a compile pays author and verifier calls for every
+expanded probe, which on a 77-table database is most of them. It is paid once per schema
+change, not per run.
 """
 from __future__ import annotations
 

@@ -10,19 +10,14 @@ below; point the app at another database and the index follows it.
 """
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass, field
 
+from app.db import identity
 from app.observability import get_logger
 
 log = get_logger()
 
-_CACHE_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".cache"
-)
-_SCHEMA_PATH = os.path.join(_CACHE_DIR, "schema.txt")
-_NUMERIC_PATH = os.path.join(_CACHE_DIR, "numeric_hints.txt")
 
 # "TABLE schema.table"
 # "TABLE schema.table", optionally followed by "  -- 21,566 rows" or "  -- EMPTY: 0 rows. ..."
@@ -337,16 +332,19 @@ def load_index(schema_text: str | None = None, numeric_text: str | None = None) 
     engine exists to prevent.
     """
     if schema_text is None:
-        if not os.path.exists(_SCHEMA_PATH):
+        # THIS database's description, resolved at call time - see app/db/identity.py. Naming
+        # the configured database in the error matters: the file is missing FOR THIS DATABASE,
+        # and a bare "schema.txt not found" beside a .cache full of schema.*.txt files reads
+        # like a broken installation rather than a database that has not been introspected.
+        schema_text = identity.read_cache("schema", "txt")
+        if not schema_text:
             raise FileNotFoundError(
-                "schema.txt not found. Run: python -m app.cli introspect"
+                f"No schema description for {identity.current_database().get('name') or '?'}. "
+                "Run: python -m app.cli introspect"
             )
-        with open(_SCHEMA_PATH, encoding="utf-8") as fh:
-            schema_text = fh.read()
 
-    if numeric_text is None and os.path.exists(_NUMERIC_PATH):
-        with open(_NUMERIC_PATH, encoding="utf-8") as fh:
-            numeric_text = fh.read()
+    if numeric_text is None:
+        numeric_text = identity.read_cache("numeric_hints", "txt")
 
     tables = _parse_schema(schema_text)
     if numeric_text:

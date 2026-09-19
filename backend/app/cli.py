@@ -138,33 +138,44 @@ def _cache_dir() -> str:
     return introspect._CACHE_DIR
 
 
-_SHOW_FILES = {
-    "schema": "schema.txt",
-    "values": "value_hints.txt",
-    "numbers": "numeric_hints.txt",
-    "fingerprint": "schema.fingerprint",
+# (stem, extension) as app/db/identity.py names a per-database cache file. NOT literal
+# filenames: every one of these is written per database, so a fixed name would print another
+# database's description - or claim none existed while a full one sat beside it under a
+# different suffix. The catalog is None because it resolves through catalog.path() instead,
+# which is the same rule stated once.
+_SHOW_FILES: dict[str, tuple[str, str] | None] = {
+    "schema": ("schema", "txt"),
+    "values": ("value_hints", "txt"),
+    "numbers": ("numeric_hints", "txt"),
+    "fingerprint": ("schema", "fingerprint"),
     # The compiled SQL itself. Inspectable on purpose: the probes decide what the report says,
     # so being able to read exactly what will run - without a database or a model - is what
     # makes a finding auditable.
-    #
-    # Resolved through catalog.path() rather than named here, because there is one catalog PER
-    # DATABASE and its filename carries which. A fixed name would print another database's
-    # probes, or claim none had been compiled while a full catalog sat beside it.
     "catalog": None,
 }
 
 
 def cmd_show(args) -> int:
     """Print a cached artefact, so what the agents will actually see is inspectable."""
+    from app.db import identity
     from app.rules import catalog as catalog_store
 
     console = _console()
-    name = _SHOW_FILES.get(args.what)
-    path = catalog_store.path() if name is None else os.path.join(_cache_dir(), name)
+    stem = _SHOW_FILES.get(args.what)
+    if stem is None:
+        path = catalog_store.path()
+    else:
+        # THIS database's file only, with no fallback to the unsuffixed pre-split name - the
+        # same rule read_cache() follows, for the same reason. `show` exists to answer "what
+        # will the agents be given for this database?", and printing a file that cannot be
+        # attributed to any database answers a different question while looking like an answer
+        # to that one.
+        path = identity.cache_path(*stem)
     if not os.path.exists(path):
         console.print(
-            f"[yellow]{os.path.basename(path)} does not exist yet.[/] Run: "
-            + ("python -m app.cli compile" if name is None else "python -m app.cli introspect")
+            f"[yellow]{os.path.basename(path)} does not exist yet[/] for "
+            f"{identity.current_database().get('name') or 'this database'}. Run: "
+            + ("python -m app.cli compile" if stem is None else "python -m app.cli introspect")
         )
         return 1
     with open(path, encoding="utf-8") as fh:
@@ -366,17 +377,63 @@ def _compile_dry_run(console, args) -> int:
     from app.rules import catalog as catalog_store
 
     rules, errors = _all_rules()
+
     if args.source:
         rules = [r for r in rules if r.source == args.source]
     if args.rule:
         wanted = {r.strip().lower() for r in args.rule}
         rules = [r for r in rules if r.rule_id.lower() in wanted]
 
+    # BOTH FINGERPRINTS, OVER ONE CONNECTION - the same pair the real compile reads, because a
+    # dry run that judges staleness differently from the compile is not an estimate of it.
+    #
+    # The per-table signatures were missing here, and the whole-database fingerprint alone is
+    # correct but blunt: it marks EVERY probe stale when any one table anywhere has moved. On a
+    # database that had gained a single table since its last compile this printed "77 rules,
+    # ~244 LLM calls" for work the compiler then did in 2 - a thirty-eight-fold overestimate,
+    # produced by the one command whose entire job is to say what something will cost before
+    # the operator commits to it.
+    fingerprint, signatures = "", None
+    conn = None
     try:
-        fingerprint = introspect.structure_fingerprint()
+        from app.db.connection import get_connection
+
+        conn = get_connection(timeout=settings.metadata_timeout)
+        cur = conn.cursor()
+        fingerprint = introspect.structure_fingerprint(cur)
+        signatures = introspect.table_signatures(cur)
     except Exception as exc:  # noqa: BLE001
         console.print(f"[yellow]Structure fingerprint unavailable:[/] {exc}")
-        fingerprint = ""
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    # The measured meaning of a probe's tables, so the estimate also sees a column whose SCALE
+    # moved while its structure held still. Read from the cached hints; unavailable is not
+    # fatal, because an empty fingerprint compares equal to everything.
+    try:
+        _hints = (
+            introspect.build_schema_text(),
+            introspect.build_value_hints(),
+            introspect.build_numeric_hints(),
+        )
+    except Exception:  # noqa: BLE001
+        _hints = ("", "", "")
+
+    _meaning: dict[tuple[str, ...], str] = {}
+
+    def _meaning_of(probe) -> str:
+        if probe is None or not probe.tables:
+            return ""
+        key = tuple(probe.tables)
+        if key not in _meaning:
+            from app.rules.semantics import semantic_fingerprint
+
+            _meaning[key] = semantic_fingerprint(key, *_hints)
+        return _meaning[key]
 
     catalog = catalog_store.load()
     # What each sql_mode costs, matching the graph's own routing: a cloned family member
@@ -389,8 +446,9 @@ def _compile_dry_run(console, args) -> int:
     for rule in rules:
         if not rule.runnable:
             continue
+        probe = catalog.get(rule.rule_id)
         needs, why = catalog_store.is_stale(
-            catalog.get(rule.rule_id), rule, fingerprint, args.retry_failed
+            probe, rule, fingerprint, args.retry_failed, signatures, _meaning_of(probe)
         )
         if args.force:
             needs, why = True, "forced"
