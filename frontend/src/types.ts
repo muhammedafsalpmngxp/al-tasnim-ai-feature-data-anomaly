@@ -51,6 +51,10 @@ export interface RunResult {
   seconds: number
   score: number
   score_basis: string
+  /** WHICH CHECKS the score was computed from. Two runs whose fingerprints differ were not
+   *  measuring the same thing, so the gap between their scores is not a change in the data.
+   *  Empty for runs recorded before this existed - absent means UNKNOWN, never "the same". */
+  rule_set_fingerprint?: string
   summary: string
   totals: Totals
   by_severity: Record<string, number>
@@ -83,6 +87,9 @@ export interface RunRow {
   database?: DatabaseRef
   seconds: number
   score: number
+  /** See RunResult.rule_set_fingerprint. Carried on the history row because the trend chart
+   *  is the place where comparing two incomparable scores actually misleads somebody. */
+  rule_set_fingerprint?: string
   totals: Totals
   by_severity: Record<string, number>
   report_paths: Record<string, string>

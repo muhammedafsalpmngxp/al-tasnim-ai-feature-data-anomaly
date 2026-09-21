@@ -82,7 +82,12 @@ th { color: var(--muted); font-weight: 600; white-space: nowrap; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 tr.clickable:hover { background: #f0f3f9; cursor: pointer; }
 
-.mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 12px; }
+/* Rule IDs (DQ-G06-002 etc.) must stay on one line - without this the browser wraps a long
+   id onto three lines the moment the Title column next to it needs the space, which is what
+   was happening on the Rules table. white-space: nowrap is enough on its own: the column
+   still shrinks to fit the id, it just never breaks it mid-word. */
+.mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 12px;
+  white-space: nowrap; }
 .muted { color: var(--muted); }
 .small { font-size: 11px; }
 .note { color: var(--warn); font-size: 11px; margin-top: 3px; }

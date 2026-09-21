@@ -53,7 +53,18 @@ def proposal_writer_node(state: DiscoverState) -> dict:
         proposal["hash"] = _handle(proposal)
         proposal["database"] = database
 
-    path = discovery_store.save_pending(proposals, state.get("dropped") or [])
+    # Under the decision lock, because this REPLACES the pending list wholesale while an
+    # operator may be deciding on an entry in it. Accept and Reject remove one proposal by
+    # rewriting the same file, so an unlocked overwrite here could put a proposal somebody had
+    # just decided on straight back into the pending list - offering it for decision a second
+    # time, with its id already allocated.
+    #
+    # Nothing else in this graph is locked: the lock is held for the milliseconds of this one
+    # write, never across the model call.
+    from app.rules.lockfile import decision_lock
+
+    with decision_lock():
+        path = discovery_store.save_pending(proposals, state.get("dropped") or [])
     log.info(
         "scout: %d proposal(s) awaiting a decision -> %s", len(proposals), path
     )

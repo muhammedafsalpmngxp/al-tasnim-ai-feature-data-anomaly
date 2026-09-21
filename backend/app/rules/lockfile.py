@@ -1,7 +1,24 @@
-"""Cross-process guard on the compiled catalog.
+"""Cross-process guards on the two shared files that have more than one writer.
 
-WHY THIS EXISTS
----------------
+TWO LOCKS, AND THEY WAIT DIFFERENTLY ON PURPOSE
+-----------------------------------------------
+    compile_lock()   guards .cache/anomaly_catalog.json    FAIL-FAST
+    decision_lock()  guards domain/anomalies/discovered.md WAITS BRIEFLY
+
+The mechanism below is shared; only the waiting policy differs, and that difference is a
+judgement about the work being protected rather than a detail.
+
+A compile runs for 25-40 minutes. Queueing a second one behind it is indistinguishable from a
+hang to the caller watching a progress stream, so a compile that cannot start says so at once.
+
+A decision - Accept, Reject, Promote, Restore - is a few milliseconds of file editing behind a
+button click. Refusing one because another operator clicked at the same moment would be a
+worse answer than simply taking turns, and "try again" for a wait of microseconds is an
+apology for nothing. So decision_lock() blocks, with a short ceiling that exists only so a
+genuinely wedged holder cannot hang a web request for ever.
+
+WHY THE COMPILE LOCK EXISTS
+---------------------------
 `.cache/anomaly_catalog.json` has exactly one writer - `compiler.compile_rules()` - and that
 write is atomic (tmp + os.replace), so the file can never be observed half-written. What it
 CAN be is silently overwritten: two compiles both read the catalog, both write it, and the one
@@ -41,6 +58,27 @@ under it, and then lock an inode no longer reachable by name - while a third pro
 fresh file at that path and locks that. Two holders, both certain they are alone. Leaving one
 long-lived file at a stable path makes that impossible.
 
+WHY THE DECISION LOCK EXISTS
+----------------------------
+`domain/anomalies/discovered.md` is read-modify-written twice by a single Accept: once to
+allocate the next free DQ-S number, and again to append the rule block. Neither step is
+protected by the API's own `threading.Lock`, because that lock is held only for the long jobs
+- a decision is not one. FastAPI runs `def` endpoints in a threadpool, so two operators
+clicking Accept at the same moment really do overlap, and there were two silent outcomes:
+
+  * both reads see DQ-S04 as the highest, so BOTH decisions are written as DQ-S05. The loader
+    keys rules by id, so one of the two simply vanishes;
+  * A reads, B reads, A writes, B writes - and A's decision is gone altogether, from the store
+    whose entire purpose is to be the durable record of what a human decided.
+
+The individual write is atomic (tmp + os.replace), which protects a READER from ever seeing a
+half-file. It does nothing whatever about two writers, and the two problems are often
+confused. This lock is the part that was missing.
+
+It covers the pending list as well, because `take_pending` is the same shape of
+read-modify-write and a discovery run replaces that file wholesale while a decision may be
+removing one entry from it.
+
 WHAT THIS DOES NOT COVER
 ------------------------
 One filesystem. The lock is held on a local file, so it serialises every process on ONE
@@ -56,6 +94,7 @@ import json
 import os
 import socket
 import sys
+import time
 from contextlib import contextmanager
 
 from app.observability import get_logger
@@ -68,6 +107,25 @@ _CACHE_DIR = os.path.join(
 # Beside the catalog it protects, at a stable path. Both facts matter: a lock somewhere else is
 # a lock people forget exists, and a path that varies is not a lock at all.
 LOCK_PATH = os.path.join(_CACHE_DIR, "compile.lock")
+
+# A SEPARATE FILE, not a second range in the compile lock. A decision and a compile guard
+# different things and must not block each other: accepting a proposal while a 35-minute
+# compile is running is perfectly safe - the accepted rule is simply picked up by the NEXT
+# compile - and making the two share a lock would take that away for no benefit.
+#
+# It lives in .cache rather than beside discovered.md because a lockfile is machine state, and
+# domain/ is the operator's own directory. Losing it to a cache wipe costs nothing: the file is
+# recreated on first use, and a wipe cannot happen while a decision is in flight.
+DECISION_LOCK_PATH = os.path.join(_CACHE_DIR, "decision.lock")
+
+# How long a decision waits for another decision before giving up, and how often it retries.
+#
+# The ceiling is not a timeout on the work - the work is a few milliseconds of file editing, so
+# any real contention clears in well under one retry. It is a bound on how long a WEB REQUEST
+# can be made to wait by a holder that has somehow wedged, because a click that never returns
+# is worse than a click that reports a problem.
+_DECISION_WAIT_SECONDS = 10.0
+_DECISION_POLL_SECONDS = 0.05
 
 # The single byte whose lock IS the mutex.
 #
@@ -93,6 +151,22 @@ class CompileLockError(RuntimeError):
     someone else is already compiling". The first needs the rules or the schema looked at; the
     second needs nothing but patience. Raising the same exception type for both makes the API
     and the CLI report a healthy system as broken.
+    """
+
+    def __init__(self, message: str, holder: dict | None = None) -> None:
+        super().__init__(message)
+        self.holder = holder or {}
+
+
+class DecisionLockError(RuntimeError):
+    """A decision could not take the ledger lock within the wait ceiling.
+
+    A DISTINCT TYPE FROM CompileLockError, and not a subclass of it, because the two mean
+    opposite things to a caller. "A compile is already running" is a normal, expected answer
+    that the UI reports calmly and the operator resolves by waiting. This one is not normal: a
+    decision holds the lock for milliseconds, so failing to get it within ten seconds means
+    something is genuinely wrong - a wedged process, or a filesystem that is not behaving -
+    and it should surface as an error, never be retried in a loop.
     """
 
     def __init__(self, message: str, holder: dict | None = None) -> None:
@@ -148,8 +222,14 @@ else:
             pass
 
 
-def _open_lockfile() -> int:
+def _open_lockfile(path: str | None = None) -> int:
     """The lockfile's descriptor, creating the file only if it is not already there.
+
+    `path=None` MEANS "resolve LOCK_PATH NOW", and it has to be written that way rather than as
+    a `path: str = LOCK_PATH` default. A default argument is bound once, when the function is
+    defined, so the default would capture whatever LOCK_PATH pointed at on import and ignore
+    every later reassignment of it - which is exactly how the lock tests redirect this at a
+    temporary file. Late binding keeps the module global authoritative.
 
     O_CREAT|O_EXCL is used FIRST rather than a `if not exists: create` check, because two
     processes can both pass that check and both believe they created it. Exclusive creation is
@@ -157,11 +237,12 @@ def _open_lockfile() -> int:
     on. Losing that race is not an error - it only means the file already exists, which is the
     normal case after the first ever compile - so it falls through to opening it.
     """
-    os.makedirs(_CACHE_DIR, exist_ok=True)
+    path = path or LOCK_PATH
+    os.makedirs(os.path.dirname(path) or _CACHE_DIR, exist_ok=True)
     try:
-        return os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        return os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
     except FileExistsError:
-        return os.open(LOCK_PATH, os.O_RDWR)
+        return os.open(path, os.O_RDWR)
 
 
 def _read_holder(fd: int) -> dict:
@@ -198,7 +279,10 @@ def _describe(holder: dict) -> str:
     pid, host = holder.get("pid"), holder.get("hostname")
     started = holder.get("started_at")
     if not pid:
-        return "another process is compiling"
+        # Shared by both locks, so it must not name either one's work. "another process is
+        # compiling" was accurate when only the compile lock existed; said by a decision it
+        # would send the reader looking for a compile that is not running.
+        return "holder unknown"
     where = f"pid {pid}" + (f" on {host}" if host else "")
     return f"{where}" + (f", started {started}" if started else "")
 
@@ -239,3 +323,57 @@ def compile_lock():
         except OSError:
             pass
         log.info("lock: compile lock released (pid %d)", os.getpid())
+
+
+@contextmanager
+def decision_lock():
+    """Hold the discovery-ledger lock for the duration of the block.
+
+    WAITS, unlike compile_lock - see the module docstring for why the two differ. Contention
+    here is measured in milliseconds, so in practice this never sleeps at all; the retry loop
+    exists for the rare simultaneous click and the ceiling for a holder that has wedged.
+
+    NOT REENTRANT, and that is a real constraint on callers rather than a caveat. The whole
+    decision must be taken inside ONE of these blocks - allocate the id, remove the proposal
+    from the pending list, and append the rule block - because splitting it into two locked
+    steps would put the gap this exists to close straight back between them. The primitives in
+    app/rules/discoveries.py are therefore deliberately lock-FREE: they compose, and taking the
+    lock inside them would deadlock the moment one called another (take_pending calls
+    save_pending) or a caller wrapped a pair of them.
+
+    Released by leaving the block - on success, on failure, and on an exception - and by the
+    kernel if this process is killed while inside it.
+    """
+    fd = _open_lockfile(DECISION_LOCK_PATH)
+    deadline = time.monotonic() + _DECISION_WAIT_SECONDS
+    got = _try_lock(fd)
+    waited = False
+    while not got and time.monotonic() < deadline:
+        waited = True
+        time.sleep(_DECISION_POLL_SECONDS)
+        got = _try_lock(fd)
+
+    if not got:
+        holder = _read_holder(fd)
+        os.close(fd)
+        raise DecisionLockError(
+            "Another decision has held the discovery ledger for more than "
+            f"{_DECISION_WAIT_SECONDS:.0f}s ({_describe(holder)}). A decision normally takes "
+            "milliseconds, so this means a process is stuck rather than that the system is "
+            "busy - check for a hung worker before retrying.",
+            holder,
+        )
+
+    _write_holder(fd)
+    if waited:
+        # Logged only when it actually happened, so the log is silent in the normal case and
+        # says something real when two operators genuinely collided.
+        log.info("lock: decision lock acquired after waiting (pid %d)", os.getpid())
+    try:
+        yield
+    finally:
+        _unlock(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass

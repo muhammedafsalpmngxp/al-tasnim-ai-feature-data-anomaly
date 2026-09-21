@@ -43,6 +43,10 @@ class RunState(TypedDict, total=False):
     # ── Scorer (deterministic) ──
     score: float                  # 0-100, higher is cleaner
     score_basis: str              # how the number was derived, for the report to state
+    # WHICH CHECKS the number was derived FROM, as a short hash. Two runs whose fingerprints
+    # differ were not measuring the same thing, so the difference between their scores is not
+    # a change in the data. See scorer._rule_set_fingerprint.
+    rule_set_fingerprint: str
     totals: dict[str, Any]        # headline counts
     by_severity: dict[str, int]
     by_category: list[dict[str, Any]]

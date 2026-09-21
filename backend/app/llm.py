@@ -41,8 +41,19 @@ _PROMPT_LABELS: dict[int, str] | None = None
 _LABELS_GENERATION = -1
 
 
-def _agent_label(system: str) -> str:
+def _agent_label(system: str, label: str = "") -> str:
+    """Which agent made this call.
+
+    AN EXPLICIT LABEL WINS, and it has to be available for prompts the identity trick cannot
+    see. Recognising an agent by `id(system)` works only while every node passes a prompt
+    CONSTANT, and the Scout's system prompt is BUILT PER CALL - scout_system(max_proposals)
+    formats a template, so it is a new string object every time and can never match a cached
+    id. The Scout therefore appeared in the usage table and the log as the anonymous "agent",
+    which is precisely the wrong answer for the one node whose whole cost is a single call.
+    """
     global _PROMPT_LABELS, _LABELS_GENERATION
+    if label:
+        return label
     try:
         from app.graph import prompts as p  # deferred: avoids an import cycle
 
@@ -69,13 +80,13 @@ def active_model_for(fast: bool) -> str:
     return settings.fast_model if fast else settings.active_model
 
 
-def _log_call(system: str, fast: bool, elapsed: float) -> None:
+def _log_call(system: str, fast: bool, elapsed: float, label: str = "") -> None:
     try:
         model = active_model_for(fast)
         # Only label it "fast" when a DISTINCT fast model is really configured - otherwise the
         # log would claim a cheap tier that does not exist.
         tier = " (fast)" if fast and model != settings.active_model else ""
-        get_logger().info("llm: %s -> %s%s in %.1fs", _agent_label(system), model, tier, elapsed)
+        get_logger().info("llm: %s -> %s%s in %.1fs", _agent_label(system, label), model, tier, elapsed)
     except Exception:  # noqa: BLE001
         pass
 
@@ -99,7 +110,7 @@ def start_usage_tracking() -> None:
     _usage.calls = []
 
 
-def _record_usage(system: str, fast: bool, resp) -> None:
+def _record_usage(system: str, fast: bool, resp, label: str = "") -> None:
     """Append one call's usage. Never raises - accounting must not break a run."""
     try:
         calls = getattr(_usage, "calls", None)
@@ -110,7 +121,7 @@ def _record_usage(system: str, fast: bool, resp) -> None:
         usage = getattr(resp, "usage_metadata", None) or {}
         calls.append(
             {
-                "agent": _agent_label(system),
+                "agent": _agent_label(system, label),
                 "model": active_model_for(fast),
                 "input": usage.get("input_tokens") or 0,
                 "output": usage.get("output_tokens") or 0,
@@ -194,6 +205,7 @@ def chat_structured(
     schema: type,
     temperature: float = 0.0,
     fast: bool = False,
+    label: str = "",
 ):
     """One-shot call that returns an INSTANCE of `schema`, or None if that was not possible.
 
@@ -216,36 +228,77 @@ def chat_structured(
     messages = [SystemMessage(content=system), HumanMessage(content=user)]
     from app.tracing import enabled as _tracing_on
 
-    cfg = {"run_name": _agent_label(system)} if _tracing_on() else None
+    cfg = {"run_name": _agent_label(system, label)} if _tracing_on() else None
     start = time.perf_counter()
 
-    def _call(temp):
-        return get_llm(temp, fast).with_structured_output(schema).invoke(messages, config=cfg)
+    # include_raw=True RETURNS THE ENVELOPE AS WELL AS THE PARSED OBJECT, and that is the whole
+    # reason it is asked for here.
+    #
+    # Without it, with_structured_output hands back only the parsed instance - the token counts
+    # live on the response it was parsed from, and that response is discarded before this
+    # function sees it. Every call down this path therefore cost real money and reported none
+    # of it. The Scout made that visible: its single model call logged "0 LLM call(s)" and
+    # contributed nothing to the usage table, and as more nodes move to structured output the
+    # gap between the usage report and the actual bill would only widen.
+    #
+    # The shape becomes {"raw": AIMessage, "parsed": obj | None, "parsing_error": exc | None},
+    # and a parse failure arrives as a VALUE rather than an exception - so the failure handling
+    # below has to cover both.
+    def _call(temp, include_raw: bool):
+        model = get_llm(temp, fast).with_structured_output(schema, include_raw=include_raw)
+        return model.invoke(messages, config=cfg)
+
+    def _attempt(temp):
+        """The call, degrading to the plain shape if this provider cannot do include_raw.
+
+        Not every integration accepts the argument. Losing token accounting is a far smaller
+        loss than losing structured output altogether, so an unsupported argument falls back to
+        exactly the behaviour this function had before - never to the text path.
+        """
+        try:
+            return _call(temp, True), True
+        except TypeError as exc:
+            get_logger().debug("llm: include_raw unsupported (%s) - usage will not be recorded", exc)
+            return _call(temp, False), False
 
     try:
-        result = _call(temperature)
+        envelope, has_raw = _attempt(temperature)
     except Exception as exc:  # noqa: BLE001
         # Same temperature quirk the text path handles: some reasoning models reject a
         # non-default value and must be called without one.
         if _is_openai() and "temperature" in str(exc).lower():
             try:
-                result = _call(None)
+                envelope, has_raw = _attempt(None)
             except Exception as inner:  # noqa: BLE001
-                log.warning("llm: structured output unavailable (%s) - falling back", inner)
+                get_logger().warning("llm: structured output unavailable (%s) - falling back", inner)
                 return None
         else:
-            log.warning("llm: structured output unavailable (%s) - falling back", exc)
+            get_logger().warning("llm: structured output unavailable (%s) - falling back", exc)
             return None
 
-    _log_call(system, fast, time.perf_counter() - start)
-    # Usage is not recorded here: with_structured_output returns the PARSED object, not the
-    # response envelope that carries the token counts, so there is nothing to read. The call is
-    # still counted in the log line above. Attributing zero tokens would be worse than omitting
-    # it - the usage report would quietly under-report the cost of every review.
-    return result
+    _log_call(system, fast, time.perf_counter() - start, label)
+
+    if not has_raw:
+        return envelope
+
+    raw = (envelope or {}).get("raw")
+    parsed = (envelope or {}).get("parsed")
+    error = (envelope or {}).get("parsing_error")
+
+    # RECORDED EVEN WHEN THE PARSE FAILED. The tokens were spent either way, and a failed
+    # structured call is precisely the expensive case worth seeing in the usage table - it is
+    # about to be retried down the text path, so the run pays for it twice.
+    if raw is not None:
+        _record_usage(system, fast, raw, label)
+
+    if error is not None or parsed is None:
+        get_logger().warning("llm: structured output could not be parsed (%s) - falling back", error)
+        return None
+    return parsed
 
 
-def chat(system: str, user: str, temperature: float = 0.0, fast: bool = False) -> str:
+def chat(system: str, user: str, temperature: float = 0.0, fast: bool = False,
+         label: str = "") -> str:
     """One-shot system+user call, returning the raw text content."""
     messages = [SystemMessage(content=system), HumanMessage(content=user)]
     # Names the span after the agent making the call, so a trace reads
@@ -256,7 +309,7 @@ def chat(system: str, user: str, temperature: float = 0.0, fast: bool = False) -
 
     # None when tracing is off, which is exactly invoke()'s default - so the disabled path is
     # byte-identical to the pre-Langfuse call.
-    cfg = {"run_name": _agent_label(system)} if _tracing_on() else None
+    cfg = {"run_name": _agent_label(system, label)} if _tracing_on() else None
     start = time.perf_counter()
     try:
         resp = get_llm(temperature, fast).invoke(messages, config=cfg)
@@ -266,6 +319,6 @@ def chat(system: str, user: str, temperature: float = 0.0, fast: bool = False) -
             resp = get_llm(None, fast).invoke(messages, config=cfg)
         else:
             raise
-    _log_call(system, fast, time.perf_counter() - start)
-    _record_usage(system, fast, resp)
+    _log_call(system, fast, time.perf_counter() - start, label)
+    _record_usage(system, fast, resp, label)
     return resp.content if isinstance(resp.content, str) else str(resp.content)

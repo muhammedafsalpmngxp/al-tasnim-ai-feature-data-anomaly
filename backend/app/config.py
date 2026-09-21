@@ -205,6 +205,23 @@ class Settings:
     saturation_floor: int = field(
         default_factory=lambda: _get_int("ANOMALY_SATURATION_FLOOR", 50)
     )
+    # The share above which a probe is treated as NEARLY saturated - same defect as a fully
+    # saturated one, one row short of tripping the check for it.
+    #
+    # The hard rule above tests `count == scope` EXACTLY, so a probe reporting 6,054 of 6,055
+    # sails through it, and the summarizer's caveat - which tests the same equality - stays
+    # silent too. The reader is then told "99.98% of your data is broken" as a measured
+    # percentage, when the scope is almost certainly the anomaly restated rather than a real
+    # denominator. That is the exact outcome the saturation rule exists to prevent.
+    #
+    # ADVISORY, NEVER A REJECTION, and that is the difference from the exact case. 99.98% can
+    # be genuine where 100% essentially cannot: a table really can be almost entirely wrong
+    # while a handful of correct rows prove the scope is a real population. So it goes to the
+    # Verifier to adjudicate, and into the report as a caveat - it never refuses a probe on its
+    # own. Set to 1.0 to disable it and restore exact-equality behaviour.
+    near_saturation_share: float = field(
+        default_factory=lambda: _get_float("ANOMALY_NEAR_SATURATION_SHARE", 0.95)
+    )
     # How close a probe's scope may come to a table's full row count before its de-duplication
     # is judged to have done nothing. Not zero: a probe legitimately drops rows with a NULL
     # measure, and the case that prompted this read 110,181 against 110,184 rows. Raise it if a

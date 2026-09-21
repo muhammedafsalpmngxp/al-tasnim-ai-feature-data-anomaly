@@ -30,10 +30,11 @@ from typing import Any, Iterator
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from app.config import settings
 from app.observability import get_logger, setup_logging
+from app.rules.lockfile import DecisionLockError
 
 log = get_logger()
 
@@ -121,6 +122,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(DecisionLockError)
+def _decision_lock_busy(_request, exc: DecisionLockError):
+    """A wedged ledger lock is a 503, not a 500.
+
+    Registered once rather than wrapped around each of the three decision endpoints: they all
+    reach the same lock through app.discovery, and a try/except repeated three times is three
+    chances for the fourth endpoint to be added without one. 503 because the request was not
+    wrong - nothing about it would have failed a moment earlier or will fail a moment later -
+    so a client is right to show it as "temporarily unavailable" rather than as a bad request.
+    """
+    log.warning("api: a decision could not take the ledger lock - %s", exc)
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 @app.on_event("startup")
@@ -510,6 +525,13 @@ async def run_endpoint(
             "by_severity": summary.by_severity,
             "summary": final.get("summary", ""),
             "ranked": final.get("ranked") or [],
+            # The live stream carries the same fields the stored result does. They were absent
+            # here too, so a trial finding was invisible both immediately after the run and
+            # afterwards - the UI section for it had nothing to render either way.
+            "discovered_ranked": final.get("discovered_ranked") or [],
+            "discovered_totals": final.get("discovered_totals") or {},
+            "score_basis": final.get("score_basis", ""),
+            "rule_set_fingerprint": summary.rule_set_fingerprint,
             "empty_scope": final.get("empty_scope") or [],
             "not_running": final.get("not_running") or [],
             "report_paths": summary.report_paths,

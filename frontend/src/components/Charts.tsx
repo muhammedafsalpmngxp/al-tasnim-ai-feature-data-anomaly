@@ -97,6 +97,31 @@ export function CategoryBar({ findings }: { findings: Finding[] }) {
 export function ScoreTrend({ runs }: { runs: RunRow[] }) {
   // Oldest first, so the line reads left to right as time passes.
   const ordered = [...runs].reverse()
+
+  // WHERE THE SET OF CHECKS CHANGED, so a step in the line is not read as a step in the data.
+  //
+  // The score is a weighted mean over the scored checks. Promote a rule off probation, accept
+  // a discovered one, or re-grade a severity, and the line moves with the data untouched -
+  // indistinguishable, on the chart alone, from quality getting worse overnight. Discovery
+  // turns that from a rare event into a routine one.
+  //
+  // MARKED, NOT SMOOTHED OVER. Rescaling old scores onto the new rule set would mean inventing
+  // comparable numbers from findings the history no longer holds, and a plausible fabricated
+  // trend is worse than a visible break. So the boundary is drawn and the reader decides.
+  //
+  // A missing fingerprint means UNKNOWN, never "the same as its neighbour": runs recorded
+  // before the field existed are not claimed to be comparable with anything, so a boundary is
+  // drawn wherever a known fingerprint meets a different one, and never between two blanks.
+  const boundaries = ordered
+    .map((run, i) => {
+      if (i === 0) return null
+      const previous = ordered[i - 1].rule_set_fingerprint || ''
+      const current = run.rule_set_fingerprint || ''
+      if (!previous || !current || previous === current) return null
+      return i
+    })
+    .filter((i): i is number => i !== null)
+
   const ref = useChart(
     {
       grid: { left: 8, right: 16, top: 16, bottom: 8, containLabel: true },
@@ -118,14 +143,43 @@ export function ScoreTrend({ runs }: { runs: RunRow[] }) {
           lineStyle: { color: '#1f3864', width: 2 },
           itemStyle: { color: '#1f3864' },
           areaStyle: { color: 'rgba(31,56,100,0.08)' },
+          // Drawn on the series rather than as its own series so it cannot appear in the
+          // legend or the tooltip as though it were a measurement.
+          markLine: {
+            silent: true,
+            symbol: 'none',
+            label: {
+              formatter: 'checks changed',
+              color: '#8a6d1f',
+              fontSize: 10,
+              position: 'insideEndTop',
+            },
+            lineStyle: { color: '#c9a227', type: 'dashed', width: 1 },
+            data: boundaries.map((i) => ({ xAxis: i })),
+          },
         },
       ],
     },
-    [JSON.stringify(ordered.map((r) => [r.run_id, r.score]))],
+    [
+      JSON.stringify(
+        ordered.map((r) => [r.run_id, r.score, r.rule_set_fingerprint || '']),
+      ),
+    ],
   )
 
   if (ordered.length < 2) {
     return <p className="muted">At least two runs are needed before a trend means anything.</p>
   }
-  return <div ref={ref} style={{ height: 220 }} />
+  return (
+    <>
+      <div ref={ref} style={{ height: 220 }} />
+      {boundaries.length > 0 && (
+        <p className="muted small">
+          A dashed line marks a run where the set of checks changed. The score either side of
+          one is not measuring the same thing, so a step there is not by itself a change in
+          data quality.
+        </p>
+      )}
+    </>
+  )
 }

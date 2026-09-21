@@ -2835,6 +2835,371 @@ def test_a_rule_on_trial_is_never_counted_as_an_established_check() -> None:
           f"on_trial={on_trial}); it must count as neither")
 
 
+# ── 30. Two decisions at once cannot collide or lose one ───────────────────────
+
+def test_concurrent_decisions_never_collide_or_vanish() -> None:
+    """Two people clicking Accept at the same moment must both be recorded, with distinct ids.
+
+    THE BUG THIS PINS. Allocating an id and appending the rule block were two separate
+    read-modify-writes of discovered.md, guarded by nothing. FastAPI runs `def` endpoints in a
+    threadpool, so two clicks genuinely overlap, and there were two silent outcomes:
+
+      * both reads saw the same highest id, so BOTH decisions were written as the same DQ-S
+        number - the loader keys rules by id, so one of the two simply disappeared;
+      * A read, B read, A wrote, B wrote - and A's decision was gone from the file whose only
+        purpose is to be the durable record of what a human decided.
+
+    Neither failed, logged, or left a mark. Threads rather than processes because the bug was a
+    threadpool bug, and the lock has to hold within one process as well as across several -
+    test_compile_lock_excludes_another_process already covers the cross-process half.
+
+    THE ASSERTIONS ARE ABOUT OUTCOMES, NOT ABOUT THE LOCK. Nothing here mentions locking: any
+    implementation that makes every decision survive with its own id passes.
+    """
+    import tempfile
+    import threading
+
+    from app.rules import discoveries as store
+
+    DECIDERS = 8
+
+    with tempfile.TemporaryDirectory() as tmp:
+        original_path, original_dir = store.DISCOVERED_PATH, store.DISCOVERED_DIR
+        original_pending = store.pending_path
+        store.DISCOVERED_DIR = tmp
+        store.DISCOVERED_PATH = os.path.join(tmp, "discovered.md")
+        store.pending_path = lambda: os.path.join(tmp, "pending.json")
+        try:
+            proposals = [
+                {
+                    "title": f"Proposal number {i}",
+                    "what_is_wrong": "Something is wrong.",
+                    "why_it_matters": "It matters.",
+                    "how_to_detect": "Detect it.",
+                    "do_not_flag": "Nothing.",
+                    "category": "Reference integrity", "severity": "high", "entity": "row",
+                    "hash": f"hash{i}",
+                }
+                for i in range(DECIDERS)
+            ]
+            store.save_pending(proposals)
+
+            from app.discovery import accept
+
+            # Released together, so the threads contend instead of running in single file. A
+            # staggered start would let each one finish before the next began and the test
+            # would pass against the broken code.
+            start = threading.Event()
+            decided: list = []
+            errors: list = []
+
+            def decide(index: int) -> None:
+                start.wait(timeout=30)
+                try:
+                    decided.append(accept(f"hash{index}", status="probation"))
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{type(exc).__name__}: {exc}")
+
+            threads = [threading.Thread(target=decide, args=(i,)) for i in range(DECIDERS)]
+            for thread in threads:
+                thread.start()
+            start.set()
+            for thread in threads:
+                thread.join(timeout=60)
+
+            check(not errors, f"a concurrent decision raised: {errors[:3]}")
+
+            recorded = store.decided()
+            ids = [row["rule_id"] for row in recorded]
+
+            check(
+                len(recorded) == DECIDERS,
+                f"{DECIDERS} proposals were accepted at once but {len(recorded)} survived in "
+                "the ledger - a decision a person made was silently overwritten by another",
+            )
+            check(
+                len(set(ids)) == len(ids),
+                f"two accepted rules were given the SAME id ({ids}) - the loader keys rules by "
+                "id, so one of them disappears from the catalog with nothing reporting it",
+            )
+            titles = {row["title"] for row in recorded}
+            check(
+                len(titles) == DECIDERS,
+                f"only {len(titles)} distinct proposals reached the ledger out of {DECIDERS}",
+            )
+            # The pending list is the other read-modify-write, and it must be emptied exactly
+            # once per decision rather than reverting to an earlier copy of itself.
+            check(
+                store.load_pending() == [],
+                f"{len(store.load_pending())} proposal(s) are still pending after every one "
+                "was decided - a decided proposal would be offered for decision twice",
+            )
+        finally:
+            store.DISCOVERED_PATH, store.DISCOVERED_DIR = original_path, original_dir
+            store.pending_path = original_pending
+
+
+# ── 31. A nearly saturated probe is qualified, not quoted ──────────────────────
+
+def test_a_nearly_saturated_probe_is_still_qualified() -> None:
+    """99.98% must be caveated. Only 100% was, and one row was enough to escape it.
+
+    Both the hard rule and the summarizer's caveat tested `count == scope` EXACTLY, so a probe
+    reporting 6,054 of 6,055 passed through unremarked and its percentage was printed beside
+    genuinely measured ones. That is the defect the saturation rule exists to catch, stated
+    with more confidence than the 100% case would have been allowed.
+
+    ADVISORY, NOT A REFUSAL, and the test insists on that distinction: unlike exact saturation,
+    a very high share can be a true measurement, so this must reach the Verifier and the report
+    without ever failing a probe on its own.
+    """
+    from app.rules.contract import nearly_saturated, sanity_concerns, saturation_problems
+
+    # The floor applies here too: a small population really can be almost entirely bad.
+    check(
+        not nearly_saturated(4, 5),
+        "4 of 5 was treated as near-saturation - a five-row population genuinely can be almost "
+        "entirely bad, which is why the floor exists",
+    )
+    check(
+        nearly_saturated(6054, 6055),
+        "6,054 of 6,055 was NOT treated as near-saturation - one row short of the exact rule "
+        "is the case this check exists for",
+    )
+    check(
+        not nearly_saturated(6055, 6055),
+        "exact saturation was reported as NEAR saturation - the two have different wording "
+        "and the exact rule must keep ownership of its own case",
+    )
+    check(
+        not nearly_saturated(940, 1000),
+        "94% was treated as near-saturation, which is far too eager to be useful",
+    )
+
+    values = {"scope_total": 6055, "anomaly_count": 6054, "anomaly_pct": 99.98}
+    concerns = sanity_concerns(values)
+    check(
+        any("nearly every row" in c for c in concerns),
+        "a nearly saturated probe raised no concern, so the Verifier is never asked about the "
+        "one thing most likely to be wrong with it",
+    )
+    check(
+        not saturation_problems(values),
+        "near-saturation was turned into a hard REFUSAL - it is adjudicated, not enforced, "
+        "because a 99.98% finding can be real",
+    )
+
+    # AND THE READER HAS TO BE TOLD, NOT ONLY THE REVIEWER. The advisory above reaches the
+    # Verifier at compile time; this is the separate path that reaches whoever reads the
+    # report months later, and it was the half that was missing for exact saturation too.
+    import ast
+
+    path = os.path.join(_APP, "graph", "nodes", "summarizer.py")
+    source = open(path, encoding="utf-8").read()
+    body = ast.get_source_segment(source, next(
+        n for n in ast.walk(ast.parse(source))
+        if isinstance(n, ast.FunctionDef) and n.name == "summarizer_node"
+    ))
+    check(
+        "nearly_saturated(" in body,
+        "the summarizer never identifies findings that flagged ALMOST their whole scope, so a "
+        "99.98% figure is handed to the writer as a plain measured percentage",
+    )
+    check(
+        "QUALIFY THESE FIGURES" in body,
+        "the summarizer is not told to qualify a near-saturated share",
+    )
+    check(
+        'row["anomaly_count"] == row["scope_total"]' in body,
+        "the EXACT saturation caveat was lost while adding the near-saturation one - the two "
+        "are separate lists on purpose and both must survive",
+    )
+
+
+# ── 32. A score carries the rule set it was computed from ──────────────────────
+
+def test_a_score_records_which_checks_produced_it() -> None:
+    """Two scores are only comparable when the same checks produced them.
+
+    The score is a weighted mean over the scored checks, so it moves when the DATA changes and
+    equally when the SET OF CHECKS changes. On a trend chart those are indistinguishable:
+    promote one rule off probation and the line steps exactly as it would if quality had
+    fallen overnight. Discovery turns that from rare into routine, because every Accept and
+    every Promote changes the denominator.
+
+    The fingerprint does not repair the break - it MARKS it, and the chart draws a boundary.
+    Inventing a rescaled historical score from findings the runs no longer hold would be worse
+    than admitting two points cannot be compared.
+    """
+    from types import SimpleNamespace as Row
+
+    from app.graph.nodes.scorer import _rule_set_fingerprint
+
+    def rule(severity: str):
+        return Row(severity=severity, scored=True)
+
+    results = [Row(rule_id="DQ-A01"), Row(rule_id="DQ-B02")]
+    rules = {"DQ-A01": rule("high"), "DQ-B02": rule("low")}
+    baseline = _rule_set_fingerprint(results, rules)
+
+    check(bool(baseline), "a run over real checks produced no fingerprint at all")
+    check(
+        _rule_set_fingerprint(list(reversed(results)), rules) == baseline,
+        "the fingerprint changed when the probes ran in a different order - execution order "
+        "varies between runs, so every point would be marked as a break and the marker would "
+        "be ignored within a week",
+    )
+    check(
+        _rule_set_fingerprint(
+            results + [Row(rule_id="DQ-S01")], {**rules, "DQ-S01": rule("medium")}
+        ) != baseline,
+        "promoting a discovered rule into the score did NOT move the fingerprint - the step it "
+        "causes in the trend line would be read as the data getting worse",
+    )
+    check(
+        _rule_set_fingerprint(results, {**rules, "DQ-A01": rule("critical")}) != baseline,
+        "re-grading a rule's severity did not move the fingerprint. Severity IS the weight, so "
+        "a re-grade changes the score with the data untouched - the same defect as adding a "
+        "rule",
+    )
+    check(
+        _rule_set_fingerprint([], {}) == "",
+        "a run that scored nothing still claimed a rule set",
+    )
+
+    # It has to SURVIVE to the history file, or the chart never sees it.
+    from app.runner import RunSummary
+
+    revived = RunSummary.from_json(
+        RunSummary(run_id="r", started_at="t", seconds=1.0, score=90.0,
+                   rule_set_fingerprint=baseline).to_json()
+    )
+    check(
+        revived.rule_set_fingerprint == baseline,
+        "the fingerprint does not survive a round trip through the run history, so the trend "
+        "chart can never draw the boundary",
+    )
+    # Runs recorded before the field existed must read as UNKNOWN, never as "the same as the
+    # current one" - the rule `database` already follows, and for the same reason.
+    check(
+        RunSummary.from_json({"run_id": "old", "score": 90}).rule_set_fingerprint == "",
+        "an old run without a fingerprint was given one, asserting a comparability nobody "
+        "measured",
+    )
+
+
+# ── 33. A structured call reports what it cost ─────────────────────────────────
+
+def test_structured_calls_are_counted_in_the_usage_report() -> None:
+    """A call that spends tokens must appear in the usage table.
+
+    with_structured_output returns the PARSED object; the token counts live on the response it
+    was parsed from, which used to be discarded before app.llm ever saw it. Every structured
+    call therefore cost real money and reported none of it - the Scout made this visible by
+    logging "0 LLM call(s)" for a run that had just made one. As more nodes move to structured
+    output the usage report drifts further from the actual bill.
+
+    THE FALLBACK MATTERS AS MUCH AS THE FIX. Not every provider accepts include_raw, and losing
+    token accounting is a far smaller loss than losing structured output - so an unsupported
+    argument must degrade to exactly the old behaviour, never to the text path.
+    """
+    from pydantic import BaseModel
+
+    import app.llm as llm
+
+    class Verdict(BaseModel):
+        ok: bool
+
+    class Response:
+        usage_metadata = {"input_tokens": 1234, "output_tokens": 56}
+
+    class Bound:
+        def __init__(self, include_raw: bool, parses: bool) -> None:
+            self.include_raw, self.parses = include_raw, parses
+
+        def invoke(self, _messages, config=None):
+            if not self.include_raw:
+                return Verdict(ok=True)
+            if self.parses:
+                return {"raw": Response(), "parsed": Verdict(ok=True), "parsing_error": None}
+            return {"raw": Response(), "parsed": None, "parsing_error": ValueError("bad json")}
+
+    class Model:
+        def __init__(self, supports: bool, parses: bool) -> None:
+            self.supports, self.parses = supports, parses
+
+        def with_structured_output(self, _schema, include_raw=False):
+            if include_raw and not self.supports:
+                raise TypeError("unexpected keyword argument 'include_raw'")
+            return Bound(include_raw, self.parses)
+
+    original = llm.get_llm
+    try:
+        def use(supports: bool, parses: bool = True, label: str = ""):
+            llm.get_llm = lambda t=0.0, fast=False: Model(supports, parses)
+            llm.start_usage_tracking()
+            result = llm.chat_structured("system", "user", Verdict, label=label)
+            return result, llm.get_usage_report(), llm.usage_call_count()
+
+        result, usage, calls = use(supports=True)
+        check(
+            result is not None and result.ok,
+            "a supported structured call no longer returns the parsed object",
+        )
+        check(
+            calls == 1,
+            f"a structured call was counted {calls} time(s) instead of once - the Scout's "
+            "single call reported '0 LLM call(s)' while costing real money",
+        )
+        check(
+            bool(usage) and usage[0]["input"] == 1234 and usage[0]["output"] == 56,
+            f"a structured call's tokens were not recorded ({usage}) - the usage report "
+            "under-states the cost of every node that uses structured output",
+        )
+
+        result, usage, calls = use(supports=False)
+        check(
+            result is not None and result.ok,
+            "a provider that cannot do include_raw lost structured output ALTOGETHER. Losing "
+            "the token counts is a far smaller loss than falling back to parsing free text, "
+            "which is the failure mode structured output exists to remove",
+        )
+
+        result, usage, calls = use(supports=True, parses=False)
+        check(
+            result is None,
+            "an unparseable structured reply was returned as though it had parsed",
+        )
+        check(
+            calls == 1 and bool(usage),
+            "a structured call that FAILED to parse recorded no usage. The tokens were spent "
+            "either way, and this is the expensive case worth seeing - it is about to be "
+            "retried down the text path, so the run pays for it twice",
+        )
+
+        # An explicitly named agent must be attributed to itself. The Scout's prompt is built
+        # per call, so app.llm's id-based labelling cannot recognise it, and its cost lands
+        # under the anonymous "agent" - the wrong answer for the one node whose entire cost is
+        # a single call.
+        _result, usage, _calls = use(supports=True, label="scout")
+        check(
+            bool(usage) and usage[0]["agent"] == "scout",
+            "an explicitly labelled call was not attributed to itself in the usage table",
+        )
+    finally:
+        llm.get_llm = original
+
+    # The Scout must actually pass that label, or the fix above is unreachable.
+    scout_source = open(
+        os.path.join(_APP, "graph", "nodes", "scout.py"), encoding="utf-8"
+    ).read()
+    check(
+        'label="scout"' in scout_source,
+        "the Scout does not name itself when calling the model, so its cost appears in the "
+        "usage table as the anonymous 'agent'",
+    )
+
+
 def main() -> int:
     tests = [
         ("every module parses and imports", test_every_module_parses),
@@ -2897,6 +3262,14 @@ def main() -> int:
          test_a_refused_rule_disappears_from_everything_that_lists_rules),
         ("a rule on trial is never counted as established",
          test_a_rule_on_trial_is_never_counted_as_an_established_check),
+        ("two decisions at once never collide or vanish",
+         test_concurrent_decisions_never_collide_or_vanish),
+        ("a nearly saturated probe is still qualified",
+         test_a_nearly_saturated_probe_is_still_qualified),
+        ("a score records which checks produced it",
+         test_a_score_records_which_checks_produced_it),
+        ("structured calls are counted in the usage report",
+         test_structured_calls_are_counted_in_the_usage_report),
     ]
     for name, fn in tests:
         before = len(_failures)

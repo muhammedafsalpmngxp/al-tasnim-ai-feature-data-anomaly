@@ -42,6 +42,8 @@ can re-do from the table beside it.
 """
 from __future__ import annotations
 
+import hashlib
+
 from app.graph.run_state import RunState
 from app.observability import get_logger
 from app.config import settings
@@ -104,6 +106,51 @@ def _is_scored(rule) -> bool:
     return bool(getattr(rule, "scored", True))
 
 
+def _rule_set_fingerprint(results: list, rules: dict) -> str:
+    """Which checks this score was computed from, as one short stable hash.
+
+    WHY THE TREND NEEDS THIS
+    ------------------------
+    The score is a weighted mean over the scored checks, so it moves when the DATA changes and
+    equally when the SET OF CHECKS changes. Those are completely different events and the
+    chart cannot tell them apart: promote one probation rule that finds a real problem, and
+    the line steps down exactly as it would if the data had got worse overnight. Somebody then
+    explains a measurement change to a business audience as a decline in quality.
+
+    Discovery makes this go from rare to routine. Every Accept and every Promote changes the
+    denominator, so without a marker the history would accumulate steps that look like
+    regressions and nobody could reconstruct which were which after the fact.
+
+    IT MARKS THE BREAK; IT DOES NOT TRY TO REPAIR IT. Rescaling old scores onto the new rule
+    set would mean recomputing history from findings the runs no longer hold, and inventing a
+    comparable number is worse than admitting two points are not comparable. So the run simply
+    records what it measured, and the chart draws the boundary.
+
+    WHAT GOES IN, AND WHAT DELIBERATELY DOES NOT
+    --------------------------------------------
+    Rule id and severity, for every scored probe SELECTED to run - including ones that failed.
+      * SEVERITY because it is the WEIGHT. Re-grading a rule from low to critical changes the
+        score with no change in the data, which is the same defect as adding a rule.
+      * SELECTED, not succeeded, so an intermittent database timeout does not mark a break: the
+        intended measurement was the same, and a probe that failed is already reported as a
+        failure. Judging by what succeeded would flag most points as incomparable and the
+        marker would be ignored, which costs more than the precision gains.
+
+    NOT the compiled SQL. A rule rebuilt against a moved column is still the same question
+    being asked, and hashing the SQL would break the trend on every routine recompile.
+    """
+    parts = []
+    for result in results:
+        rule = rules.get(result.rule_id)
+        parts.append(f"{result.rule_id}:{_severity_of(rule)}")
+    # Sorted so execution order - which varies - cannot change the fingerprint.
+    joined = "|".join(sorted(parts))
+    # Truncated: this is an equality marker for a human-readable log line and a chart boundary,
+    # never a security claim, and 12 hex characters make an accidental collision irrelevant at
+    # the scale of one database's run history.
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:12] if parts else ""
+
+
 def scorer_node(state: RunState) -> dict:
     every_result = state.get("results") or []
     rules = state.get("rules") or {}
@@ -113,6 +160,9 @@ def scorer_node(state: RunState) -> dict:
     # runs over the discovered half - rather than by a second, drifting implementation.
     results = [r for r in every_result if _is_scored(rules.get(r.rule_id))]
     probation = [r for r in every_result if not _is_scored(rules.get(r.rule_id))]
+
+    # WHAT THE SCORE WAS COMPUTED FROM, as one short hash - see _rule_set_fingerprint.
+    fingerprint = _rule_set_fingerprint(results, rules)
 
     # Both sides of the weighted mean. A clean rule contributes 0 to the numerator and its full
     # weight to the denominator - which is what makes a clean check actually raise the score,
@@ -202,8 +252,10 @@ def scorer_node(state: RunState) -> dict:
     }
 
     log.info(
-        "score: %.1f/100 - %d rule(s) with findings, %s record(s) flagged of %s examined",
-        score, len(ranked), f"{flagged:,}", f"{examined:,}",
+        "score: %.1f/100 over %d scored check(s) [set %s] - %d rule(s) with findings, "
+        "%s record(s) flagged of %s examined",
+        score, len(results), fingerprint or "none", len(ranked), f"{flagged:,}",
+        f"{examined:,}",
     )
     if empty_scope:
         log.warning(
@@ -222,6 +274,10 @@ def scorer_node(state: RunState) -> dict:
     return {
         "score": round(score, 1),
         "score_basis": SCORE_BASIS,
+        # Travels with the score everywhere it goes, so nothing downstream has to recompute it
+        # - and so two runs can never be compared without the means to know whether they are
+        # comparable being right beside them.
+        "rule_set_fingerprint": fingerprint,
         "totals": totals,
         "by_severity": by_severity,
         "by_category": sorted(

@@ -73,6 +73,18 @@ class RunSummary:
     # one" anywhere - an unlabelled point could be from any database, and guessing is how the
     # mixing this prevents would come straight back.
     database: dict[str, str] = field(default_factory=dict)
+    # WHICH CHECKS PRODUCED THIS SCORE.
+    #
+    # The sibling of `database` above, and it exists for the same reason. That field stops the
+    # chart drawing a line between two different SUBJECTS; this one stops it drawing an
+    # unbroken line between two different MEASUREMENTS. Promote a rule off probation and the
+    # score steps - not because the data moved, but because the set of checks it averages did.
+    #
+    # Empty for runs recorded before this field existed, and - as with `database` - absent is
+    # never read as "the same as the current one". An unlabelled point could have been scored
+    # over any rule set, so the chart treats the boundary beside it as unknown rather than
+    # asserting continuity it cannot support.
+    rule_set_fingerprint: str = ""
 
     def to_json(self) -> dict:
         return {
@@ -80,6 +92,7 @@ class RunSummary:
             "score": self.score, "totals": self.totals, "by_severity": self.by_severity,
             "report_paths": self.report_paths, "llm_calls": self.llm_calls,
             "error": self.error, "database": self.database,
+            "rule_set_fingerprint": self.rule_set_fingerprint,
         }
 
     @classmethod
@@ -95,6 +108,7 @@ class RunSummary:
             llm_calls=int(data.get("llm_calls") or 0),
             error=data.get("error", ""),
             database=data.get("database") or {},
+            rule_set_fingerprint=data.get("rule_set_fingerprint") or "",
         )
 
     def same_database_as(self, database: dict[str, str]) -> bool:
@@ -171,11 +185,20 @@ def _save_results(run_id: str, final: dict, summary: RunSummary) -> None:
         "seconds": summary.seconds,
         "score": summary.score,
         "score_basis": final.get("score_basis", ""),
+        # Beside score_basis, which says HOW the number was derived; this says WHAT FROM.
+        "rule_set_fingerprint": summary.rule_set_fingerprint,
         "summary": final.get("summary", ""),
         "totals": final.get("totals") or {},
         "by_severity": final.get("by_severity") or {},
         "by_category": final.get("by_category") or [],
         "ranked": final.get("ranked") or [],
+        # PERSISTED SEPARATELY, never merged into `ranked`. The scorer computes these and the
+        # UI has a section for them, but nothing was writing them to the result file - so
+        # every trial finding was discarded the moment the run ended, and the "rules on trial"
+        # section could never populate from a stored run. Probation is only meaningful if what
+        # a rule on trial found can actually be looked at.
+        "discovered_ranked": final.get("discovered_ranked") or [],
+        "discovered_totals": final.get("discovered_totals") or {},
         "empty_scope": final.get("empty_scope") or [],
         "not_running": final.get("not_running") or [],
         "report_paths": summary.report_paths,
@@ -279,6 +302,7 @@ def run_detection(
         llm_calls=int(final.get("llm_calls") or 0),
         error=error or str(final.get("report_error") or ""),
         database=current_database(),
+        rule_set_fingerprint=str(final.get("rule_set_fingerprint") or ""),
     )
     _record(summary)
     _save_results(run_id, final, summary)

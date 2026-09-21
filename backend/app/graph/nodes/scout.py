@@ -131,7 +131,10 @@ def scout_node(state: DiscoverState) -> dict:
 
     data = None
     try:
-        result = chat_structured(system, user, ScoutResult, temperature=0.2)
+        # NAMED EXPLICITLY. scout_system() formats a template, so its prompt is a new
+        # string every call and app.llm's id-based labelling cannot recognise it - without
+        # this the Scout's cost lands in the usage table under the anonymous "agent".
+        result = chat_structured(system, user, ScoutResult, temperature=0.2, label="scout")
         if result is not None:
             data = result.model_dump()
     except Exception as exc:  # noqa: BLE001 - a provider failure is not a finding
@@ -142,7 +145,7 @@ def scout_node(state: DiscoverState) -> dict:
 
     if data is None:
         try:
-            raw = chat(system, user, temperature=0.2)
+            raw = chat(system, user, temperature=0.2, label="scout")
         except Exception as exc:  # noqa: BLE001
             log.warning("scout: the call failed (%s)", exc)
             return {"proposals": [], "llm_calls": spent, "scout_error": (

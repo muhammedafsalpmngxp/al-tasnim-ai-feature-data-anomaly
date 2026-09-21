@@ -333,6 +333,30 @@ def _as_int(value: Any) -> int | None:
         return None
 
 
+def nearly_saturated(count: int | None, scope: int | None) -> bool:
+    """Is this probe's scope so nearly all anomalies that the percentage means little?
+
+    SHARED BY THE GATE AND THE SUMMARY ON PURPOSE. The exact-saturation case was tested in two
+    places with two copies of `count == scope`, and the near case would have been two copies of
+    a threshold comparison - which drift. One predicate means a probe flagged to the reviewer
+    is the same probe caveated in the report, always.
+
+    Returns False below ANOMALY_SATURATION_FLOOR for the same reason the hard rule does: 4 of 5
+    is a legitimate small population, not a broken denominator.
+    """
+    from app.config import settings
+
+    if not scope or count is None or scope < settings.saturation_floor:
+        return False
+    if count >= scope:
+        return False  # the EXACT case, which has its own stronger wording everywhere
+    return (count / scope) >= settings.near_saturation_share
+
+
+# Private alias used inside sanity_concerns, kept so the public name reads well at call sites.
+_nearly_saturated = nearly_saturated
+
+
 def sanity_concerns(values: dict[str, Any], detail_row_count: int | None = None) -> list[str]:
     """Advisory observations about a probe's NUMBERS. Never fails a rule by itself.
 
@@ -365,6 +389,22 @@ def sanity_concerns(values: dict[str, Any], detail_row_count: int | None = None)
                 f"every row in scope is flagged ({count} of {scope}). Occasionally real, but "
                 "usually means the condition is inverted, the scale is wrong (comparing a 0-1 "
                 "fraction against 100), or the filter belongs in the scope rather than the test."
+            )
+        elif scope > 0 and _nearly_saturated(count, scope):
+            # ONE ROW SHORT OF THE CHECK ABOVE, and until this existed that was enough to pass
+            # unremarked. The hard rule and the summarizer's caveat both test `count == scope`
+            # exactly, so 6,054 of 6,055 was reported as a plain measured percentage - the same
+            # defect as full saturation, stated with more confidence than 100% would have been.
+            #
+            # Deliberately NOT worded as certainty. Unlike the exact case, a very high share
+            # really can be a true measurement, so this asks the reviewer to confirm the scope
+            # is a population rather than telling them it is not.
+            concerns.append(
+                f"nearly every row in scope is flagged ({count} of {scope}, "
+                f"{100.0 * count / scope:.2f}%). Confirm that scope_total is a real population "
+                "and not the anomaly restated with a handful of rows escaping it - at this "
+                "share the percentage usually measures how the scope was selected rather than "
+                "how much is wrong. If the scope IS the right population, say so and leave it."
             )
 
     # SUMMARY and DETAIL are two separate queries and can drift apart - especially a hand-pinned

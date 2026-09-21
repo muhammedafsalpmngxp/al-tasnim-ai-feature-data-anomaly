@@ -20,6 +20,7 @@ from app.observability import get_logger
 from app.rules import discoveries as discovery_store
 from app.rules.expand import expand_families
 from app.rules.loader import load_rules
+from app.rules.lockfile import decision_lock
 
 log = get_logger()
 
@@ -111,15 +112,24 @@ def accept(proposal_hash: str, status: str = "probation") -> dict:
     if status not in ("probation", "active"):
         raise ValueError(f"a proposal can be accepted into probation or active, not {status!r}")
 
-    proposal = discovery_store.take_pending(proposal_hash)
-    if proposal is None:
-        return {}
+    # ONE LOCK AROUND THE WHOLE DECISION - see decision_lock's docstring. Taking the proposal,
+    # allocating the id and appending the block are three reads and three writes of two shared
+    # files, and every boundary between them was a place where a second operator's click could
+    # interleave: two Accepts could allocate the SAME id (one rule then silently replaces the
+    # other in the loader), or one could append over the other's write and lose a human
+    # decision outright from the file whose only job is to be the durable record of one.
+    with decision_lock():
+        proposal = discovery_store.take_pending(proposal_hash)
+        if proposal is None:
+            return {}
 
-    # Allocated HERE, at the moment of decision, and never when the proposal was made. Two
-    # databases can each hold a pending list, and ids handed out at proposal time would collide
-    # the moment the second one was accepted.
-    rule_id = discovery_store.next_id()
-    discovery_store.append(discovery_store.render(proposal, rule_id, status))
+        # Allocated HERE, at the moment of decision, and never when the proposal was made. Two
+        # databases can each hold a pending list, and ids handed out at proposal time would
+        # collide the moment the second one was accepted. The lock is what makes reading the
+        # file at the point of writing to it actually sufficient.
+        rule_id = discovery_store.next_id()
+        discovery_store.append(discovery_store.render(proposal, rule_id, status))
+
     log.info("scout: %s accepted as %s - %s", rule_id, status, proposal.get("title", ""))
     return {"rule_id": rule_id, "title": proposal.get("title", ""), "status": status}
 
@@ -132,14 +142,18 @@ def reject(proposal_hash: str, reason: str = "") -> dict:
     proposes the same refused idea every run until they stop reading the list. Written here it
     is durable, and it is fed back into both the Scout's prompt and the deterministic filter.
     """
-    proposal = discovery_store.take_pending(proposal_hash)
-    if proposal is None:
-        return {}
+    # Locked for exactly the same reason as accept(): a rejection is written into the same
+    # ledger, takes an id from the same counter, and is just as much a human decision to lose.
+    with decision_lock():
+        proposal = discovery_store.take_pending(proposal_hash)
+        if proposal is None:
+            return {}
 
-    rule_id = discovery_store.next_id()
-    discovery_store.append(
-        discovery_store.render(proposal, rule_id, "rejected", reason=reason)
-    )
+        rule_id = discovery_store.next_id()
+        discovery_store.append(
+            discovery_store.render(proposal, rule_id, "rejected", reason=reason)
+        )
+
     log.info("scout: %s rejected - %s", rule_id, reason or "no reason given")
     return {"rule_id": rule_id, "title": proposal.get("title", ""), "status": "rejected"}
 
@@ -153,7 +167,11 @@ def set_status(rule_id: str, status: str, reason: str = "") -> bool:
     """
     if status not in ("active", "probation", "rejected", "disabled"):
         raise ValueError(f"unsupported status {status!r}")
-    changed = discovery_store.set_status(rule_id, status, reason)
+    # set_status is a read-modify-write of the whole ledger, so it needs the lock even though
+    # it allocates no id: Promote landing between another decision's read and its write would
+    # be undone by that write, and the rule would quietly still be on probation afterwards.
+    with decision_lock():
+        changed = discovery_store.set_status(rule_id, status, reason)
     if changed:
         log.info("scout: %s -> %s%s", rule_id, status, f" ({reason})" if reason else "")
     return changed

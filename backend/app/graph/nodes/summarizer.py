@@ -133,6 +133,28 @@ def summarizer_node(state: RunState) -> dict:
         row for row in ranked
         if row.get("scope_total") and row["anomaly_count"] == row["scope_total"]
     ]
+    # NEARLY saturated, kept as its OWN list rather than folded into the one above. Both need a
+    # caveat, but not the same one: with no denominator at all the count cannot be quoted as a
+    # proportion of anything, whereas at 99.98% the proportion exists and is merely unlikely to
+    # mean what it appears to. Merging them would force one wording to cover both and overstate
+    # the weaker case - the summary would call a possibly-real 99.98% finding unmeasurable.
+    from app.rules.contract import nearly_saturated
+
+    near = [
+        row for row in ranked
+        if nearly_saturated(row.get("anomaly_count"), row.get("scope_total"))
+    ]
+    if near:
+        named = ", ".join(
+            f"{r['title']} ({r['anomaly_count']:,} of {r['scope_total']:,})" for r in near[:5]
+        )
+        parts.append(
+            f"QUALIFY THESE FIGURES: {len(near)} check(s) flagged almost everything they "
+            f"examined - {named}. A share this high usually means the scope was selected by "
+            "the same condition being tested, so the percentage describes the selection rather "
+            "than the extent of the problem. Give the count if you mention one, and say the "
+            "proportion needs confirming; do not lead with the percentage."
+        )
     if saturated:
         named = ", ".join(f"{r['title']} ({r['anomaly_count']:,})" for r in saturated[:5])
         parts.append(
