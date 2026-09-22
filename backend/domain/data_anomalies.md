@@ -916,8 +916,10 @@ Never flag: Tasks missing either date, or where either is the known placeholder 
 Wrong: Work was recorded as complete before the plan said it should even begin.
 Matters: Either the work was logged against the wrong task, or the plan was written after the
   fact. Both make the schedule a record of neither intention nor outcome.
-Detect: Look at tasks where both the actual finish and the planned start are known. Flag those
-  finishing before they were due to start. Severity is the size of the gap in days.
+Detect: Judge one row per task, at the task's business key — collapse its history to its
+  current record first, the same way every other task-level check in this file does. Then, for
+  tasks where both the actual finish and the planned start are known, flag those finishing
+  before they were due to start. Severity is the size of the gap in days.
 Never flag: Tasks missing either date, or carrying the placeholder value.
 ---
 

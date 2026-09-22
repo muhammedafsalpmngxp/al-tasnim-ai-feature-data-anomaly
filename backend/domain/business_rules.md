@@ -110,6 +110,36 @@ WBS but a task whose WBS is unknown, so it adds a phantom +1. One real well has 
 unmapped tasks; that expression reports 22. Give both figures: "21 WBS; 2 tasks not mapped to one."
 Never count the per-TASK rows for a per-WBS question either — that same well returns 90 task rows.
 
+**Does an activity_id exist at all** — a DIFFERENT, NARROWER question than the WBS chain above,
+answered with a DIFFERENT table. The chain above resolves a task all the way to its WBS group
+and crew; this is only "is the derived activity_id a real, known activity" — for example, to
+flag a task whose activity cannot be identified at all, before asking what its WBS is.
+
+⚠ FOR THAT QUESTION, USE `dbo.activity_codes_norms.activity_id` DIRECTLY. NEVER the
+`mapping_master` → `activity_master_csv` chain above for this — that chain answers "what is this
+activity's WBS/crew", not "is this a real activity", and going through it for existence alone
+UNDER-COUNTS badly: `mapping_master.Activity_ID` itself only matches a fraction of task-derived
+activity ids, before the second hop is even reached. Compared directly, no lookup table, no CAST
+(the column is already `nvarchar`):
+
+```sql
+-- "how many tasks cannot be traced to a known activity" — the FULL correct shape:
+WITH derived AS (
+    SELECT DISTINCT task_code,
+           LEFT(task_code, NULLIF(CHARINDEX('-', task_code), 0) - 1) AS activity_id
+    FROM well.task_daily
+)
+SELECT d.task_code,
+       CASE WHEN n.activity_id IS NULL THEN 1 ELSE 0 END AS untraceable
+FROM derived AS d
+LEFT JOIN dbo.activity_codes_norms AS n ON n.activity_id = d.activity_id
+```
+
+Measured: 631 of 931 distinct task activity ids match this way (67.8%). The remainder is a
+genuine gap in the data, not a join defect — do not treat an unmatched activity_id as 100%
+untraceable, and do not report near-100% here: that number is wrong by construction if it
+appears, because it means the wrong table was joined.
+
 ## 4. Milestone deadlines
 
 Every deadline is derived from a date in §2. For a milestone that **has** an actual date column,
