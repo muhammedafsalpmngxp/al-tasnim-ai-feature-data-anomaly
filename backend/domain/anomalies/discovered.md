@@ -29,18 +29,14 @@ alone, and deleting this one reverts every machine-proposed rule in a single ste
 - discovered_from: AlTasnimBI
 - decided: 2026-09-19
 
-**What is wrong**
-A crew-type composition record may refer to an employee type absent from the employee-type reference list. The association can therefore describe a workforce category that the business cannot identify.
-
-**Why it matters**
-Crew composition, staffing requirements and workforce reporting can be understated or assigned to the wrong category. Invalid employee types may also disappear from downstream joins.
-
-**How to detect**
-For every crew-type employee association, confirm that its employee type exists in the employee-type reference list. Flag non-blank associations with no matching employee type.
-
-**Do NOT flag**
-Do not flag a valid employee type that is inactive or no longer used, provided it remains in the reference list. Do not treat an employee type as missing merely because no individual employee currently uses it.
-
+Wrong: A crew-type composition record names an employee type that is not in the employee-type
+  reference list.
+Matters: Crew composition and workforce reporting are understated or put in the wrong category,
+  and invalid types drop out of downstream joins.
+Detect: For every crew-type employee association, require its employee type to exist in the
+  reference list. Flag non-blank associations with no match.
+Never flag: A valid type that is inactive or no longer used but still in the reference list. A
+  type that no individual employee currently uses.
 ---
 
 ## RULE DQ-S02 - Crew equipment assignment names equipment that does not exist
@@ -57,18 +53,14 @@ Do not flag a valid employee type that is inactive or no longer used, provided i
 - discovered_from: AlTasnimBI
 - decided: 2026-09-21
 
-**What is wrong**
-A crew-to-equipment assignment may name an equipment item that is absent from the equipment register. The assignment would look valid while referring to no usable equipment record.
-
-**Why it matters**
-Equipment availability, crew capability and resource planning can be overstated or attributed to the wrong crew. Maintenance and allocation work may also be missed.
-
-**How to detect**
-For every non-blank equipment assignment, confirm that the named equipment exists in the equipment register. Report assignments with no matching equipment.
-
-**Do NOT flag**
-Do not flag historical assignments if the equipment register is intentionally limited to currently managed equipment, or if the business confirms that the assignment uses a separate equipment source.
-
+Wrong: A crew-to-equipment assignment names an equipment item that is not in the equipment
+  register.
+Matters: Equipment availability, crew capability and resource planning are overstated or
+  attributed to the wrong crew, and maintenance and allocation work is missed.
+Detect: For every non-blank equipment assignment, require the named equipment to exist in the
+  equipment register. Report assignments with no match.
+Never flag: Historical assignments where the register intentionally holds only currently managed
+  equipment, or where the business confirms the assignment uses a separate equipment source.
 ---
 
 ## RULE DQ-S03 - Well progress record is attached to a well that does not exist
@@ -84,18 +76,14 @@ Do not flag historical assignments if the equipment register is intentionally li
 - discovered_from: AlTasnimBI
 - decided: 2026-09-21
 
-**What is wrong**
-A progress update may identify a well that is absent from the well register. The progress record then cannot be reliably attributed to a real well.
-
-**Why it matters**
-Well-level construction and completion reporting can include orphan progress, omit genuine well progress, or show incorrect cumulative performance to PDO and Al Tasnim.
-
-**How to detect**
-For every progress record with a well identifier, confirm that the identifier exists in the authoritative well register. Report unmatched identifiers, after treating repeated weekly history as separate progress records rather than duplicate wells.
-
-**Do NOT flag**
-Do not flag a progress record while the well register is being loaded for the same reporting cycle, or where the business confirms that the progress source contains a separate well population.
-
+Wrong: A progress update identifies a well that is not in the well register.
+Matters: Well-level construction and completion reporting includes orphan progress, omits
+  genuine well progress, or shows incorrect cumulative performance to PDO and Al Tasnim.
+Detect: For every progress record with a well identifier, require a match in the authoritative
+  well register. Treat repeated weekly history as separate progress records, not duplicate
+  wells.
+Never flag: A progress record while the well register is being loaded for the same reporting
+  cycle, or where the business confirms the progress source holds a separate well population.
 ---
 
 ## RULE DQ-S04 - Schedule record is attached to an unknown well
@@ -111,18 +99,13 @@ Do not flag a progress record while the well register is being loaded for the sa
 - discovered_from: AlTasnimBI
 - decided: 2026-09-21
 
-**What is wrong**
-A schedule snapshot may name a well that cannot be found in the well register. Planned work from that snapshot becomes unassignable at well level.
-
-**Why it matters**
-Schedule dates, planned progress and delivery forecasts may be attributed to no well, distorting readiness and delay reporting.
-
-**How to detect**
-For each schedule record with a well identifier, confirm that the identifier exists in the authoritative well register. Report unmatched identifiers and retain multiple dated snapshots as history.
-
-**Do NOT flag**
-Do not flag records for a separately managed planning population until the business confirms that the schedule source is required to cover the PDO well register.
-
+Wrong: A schedule snapshot names a well that cannot be found in the well register.
+Matters: Schedule dates, planned progress and delivery forecasts are attributed to no well,
+  distorting readiness and delay reporting.
+Detect: For each schedule record with a well identifier, require a match in the authoritative
+  well register. Retain multiple dated snapshots as history.
+Never flag: A separately managed planning population, until the business confirms the schedule
+  source is required to cover the PDO well register.
 ---
 
 ## RULE DQ-S05 - Engineering task plan points to a project that cannot be found
@@ -138,18 +121,15 @@ Do not flag records for a separately managed planning population until the busin
 - discovered_from: AlTasnimBI
 - decided: 2026-09-21
 
-**What is wrong**
-An engineering task-plan record may contain a project identifier with no matching project record. The task remains present but cannot be placed within the project structure.
-
-**Why it matters**
-Project-level planning, progress rollups and responsibility reporting can silently exclude those tasks or assign them to the wrong project.
-
-**How to detect**
-For every non-blank project identifier in the engineering task plan, confirm a match in the authoritative project register. Report unmatched identifiers and evaluate distinct task identities rather than counting history rows as separate tasks.
-
-**Do NOT flag**
-Do not flag imported or archived task plans if their project identifiers intentionally refer to a retired system, or until the business confirms which project register is authoritative.
-
+Wrong: An engineering task-plan record carries a project identifier with no matching project
+  record.
+Matters: Project-level planning, progress rollups and responsibility reporting silently exclude
+  those tasks or assign them to the wrong project.
+Detect: For every non-blank project identifier in the engineering task plan, require a match in
+  the authoritative project register. Judge distinct task identities, not history rows.
+Never flag: Imported or archived task plans whose project identifiers intentionally refer to a
+  retired system, or anything here until the business confirms which project register is
+  authoritative.
 ---
 
 ## RULE DQ-S06 - Revenue record names a task that cannot be found
@@ -165,18 +145,15 @@ Do not flag imported or archived task plans if their project identifiers intenti
 - discovered_from: AlTasnimBI
 - decided: 2026-09-21
 
-**What is wrong**
-A revenue record may refer to a task code absent from the engineering task plan. Revenue is then not traceable to a planned task.
-
-**Why it matters**
-Planned and actual purpose values, PMS reporting and financial attribution can be omitted or attached to the wrong work.
-
-**How to detect**
-Confirm each non-blank revenue task reference matches a task in the authoritative engineering task plan, using the business-defined task identity. Report unmatched revenue records.
-
-**Do NOT flag**
-Do not flag revenue for approved standalone adjustments, legacy tasks retained after plan closure, or another revenue source until the business confirms that every revenue record must originate from the engineering task plan.
-
+Wrong: A revenue record names a task code that is not in the engineering task plan.
+Matters: Planned and actual purpose values, PMS reporting and financial attribution are omitted
+  or attached to the wrong work.
+Detect: Require each non-blank revenue task reference to match a task in the authoritative
+  engineering task plan, using the business-defined task identity. Report unmatched revenue
+  records.
+Never flag: Approved standalone adjustments, legacy tasks retained after plan closure, or
+  another revenue source, until the business confirms every revenue record must originate from
+  the engineering task plan.
 ---
 
 ## RULE DQ-S07 - Engineering record names a well that cannot be found
@@ -192,18 +169,15 @@ Do not flag revenue for approved standalone adjustments, legacy tasks retained a
 - discovered_from: AlTasnimBI
 - decided: 2026-09-21
 
-**What is wrong**
-An engineering record may contain a well identifier that is absent from the well-priority register used to identify engineering wells. The design record cannot then be tied to a recognised well.
-
-**Why it matters**
-Design status, document readiness and engineering delays may be omitted from well reporting or attributed to the wrong well, affecting delivery decisions.
-
-**How to detect**
-For every non-blank well identifier on an engineering record, confirm a match in the authoritative engineering-well register. Report unmatched identifiers while preserving the record history.
-
-**Do NOT flag**
-Do not flag records for intentionally archived, prospective or non-well engineering documents, or until the business confirms that the engineering-well register is the required authority for this source.
-
+Wrong: An engineering record carries a well identifier that is absent from the well-priority
+  register used to identify engineering wells.
+Matters: Design status, document readiness and engineering delays are omitted from well
+  reporting or attributed to the wrong well, affecting delivery decisions.
+Detect: For every non-blank well identifier on an engineering record, require a match in the
+  authoritative engineering-well register. Preserve the record history.
+Never flag: Intentionally archived, prospective or non-well engineering documents, or anything
+  here until the business confirms the engineering-well register is the required authority for
+  this source.
 ---
 
 ## RULE DQ-S08 - Task is attached to a project that cannot be found
@@ -219,18 +193,16 @@ Do not flag records for intentionally archived, prospective or non-well engineer
 - discovered_from: AlTasnimBI
 - decided: 2026-09-21
 
-**What is wrong**
-A task carries a project identifier for which no project record exists. The project reference cannot be resolved because the project register contains no matching record.
-
-**Why it matters**
-Project-level progress, ownership, scheduling and reporting cannot reliably place the task in the correct project. Tasks may disappear from project dashboards or be attributed to the wrong work package.
-
-**How to detect**
-For each non-blank task project identifier, require a matching project in the project register. Report identifiers with no match.
-
-**Do NOT flag**
-Do not flag blank project identifiers here; they are a separate completeness issue. Exclude explicitly retained historical or test tasks only if the business has identified them as outside the active project register.
-
+Wrong: A task carries a project identifier for which the project register holds no matching
+  record.
+Matters: Project-level progress, ownership, scheduling and reporting cannot place the task in
+  the correct project, so tasks vanish from project dashboards or land on the wrong work
+  package.
+Detect: For each non-blank task project identifier, require a matching project in the project
+  register. Report identifiers with no match.
+Never flag: Blank project identifiers, which are a separate completeness issue. Retained
+  historical or test tasks, only where the business has identified them as outside the active
+  project register.
 ---
 
 ## RULE DQ-S09 - Revenue record has no step classification
@@ -246,16 +218,14 @@ Do not flag blank project identifiers here; they are a separate completeness iss
 - discovered_from: AlTasnimBI
 - decided: 2026-09-21
 
-**What is wrong**
-Step classification is absent from 71% of revenue records. Those records cannot be assigned to a defined revenue step.
-
-**Why it matters**
-Revenue and PMS reporting by step cannot reconcile to the full revenue population. Management may compare incomplete categories or mistake unclassified revenue for zero activity.
-
-**How to detect**
-For revenue records that represent an applicable revenue step, require a non-blank step classification and a matching defined step. Report the missing classifications separately from invalid classifications.
-
-**Do NOT flag**
-Do not flag records for which the business confirms that step classification is genuinely not applicable, such as summary or adjustment records. That exception must be identified by an agreed record type; do not infer it from the blank value alone.
-
+Wrong: Step classification is absent from 71% of revenue records, so those records cannot be
+  assigned to a defined revenue step.
+Matters: Revenue and PMS reporting by step cannot reconcile to the full revenue population, so
+  management compares incomplete categories or reads unclassified revenue as zero activity.
+Detect: For revenue records that represent an applicable revenue step, require a non-blank step
+  classification matching a defined step. Report missing classifications separately from invalid
+  ones.
+Never flag: Records the business confirms are genuinely not applicable, such as summary or
+  adjustment records. That exception must come from an agreed record type, never inferred from
+  the blank value alone.
 ---

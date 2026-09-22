@@ -276,19 +276,25 @@ def render(proposal: dict, rule_id: str, status: str, reason: str = "") -> str:
     lines.append(f"- decided: {dt.date.today().isoformat()}")
     if proposal.get("tags"):
         lines.append(f"- tags: {_clean(proposal['tags'])}")
+    # THE COMPACT FOUR LINES, not four bold headings with blank lines between them.
+    #
+    # The fields and their MEANING are unchanged - `Never flag:` is still binding on the
+    # Verifier, and the Author still reads all four. Only the layout is shorter: one labelled
+    # line each instead of a heading, a blank line and a paragraph. Measured on the rules
+    # already in this file, that removes about a third of the block before a single word of
+    # prose is cut, and what is left reads like notes a person would actually write.
+    #
+    # `Never flag:` rather than `Do NOT flag:` keeps the imperative force in fewer characters.
+    # The label was NOT softened to something like "Skip" on purpose: the Verifier is told to
+    # treat this field as binding, and a weaker word invites a weaker reading of it.
     lines += [
         "",
-        "**What is wrong**",
-        _clean(proposal.get("what_is_wrong")),
-        "",
-        "**Why it matters**",
-        _clean(proposal.get("why_it_matters")),
-        "",
-        "**How to detect**",
-        _clean(proposal.get("how_to_detect")),
-        "",
-        "**Do NOT flag**",
-        _clean(proposal.get("do_not_flag")) or "Nothing specific has been excluded yet.",
+        f"Wrong: {_clean(proposal.get('what_is_wrong'))}",
+        f"Matters: {_clean(proposal.get('why_it_matters'))}",
+        f"Detect: {_clean(proposal.get('how_to_detect'))}",
+        "Never flag: " + (
+            _clean(proposal.get("do_not_flag")) or "Nothing has been excluded yet."
+        ),
         "",
         "---",
     ]

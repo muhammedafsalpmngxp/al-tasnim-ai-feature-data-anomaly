@@ -3200,6 +3200,77 @@ def test_structured_calls_are_counted_in_the_usage_report() -> None:
     )
 
 
+# ── 34. Both rule layouts mean the same thing ──────────────────────────────────
+
+def test_both_rule_layouts_are_understood() -> None:
+    """A rule written in the short layout must carry exactly what the long one did.
+
+    The four fields were originally four bold headings with a paragraph under each. They are
+    now four labelled lines, which removed about 28% of the lines in data_anomalies.md without
+    changing a word of any rule. THE PARSER NEVER READ EITHER FORM - `body` is the prose below
+    the metadata, kept verbatim - so what actually has to hold is:
+
+      * every rule still parses, in whichever layout it is written;
+      * the Author and Verifier prompts describe BOTH spellings, because rules in the two
+        styles sit side by side in the same file and will for as long as anybody leaves an old
+        one alone;
+      * `Never flag:` is still stated as BINDING. It is the field that stops a check reporting
+        thousands of false findings, and a relabelled field that quietly lost its force would
+        not fail anything - it would just make worse SQL.
+    """
+    from app.graph import prompts
+    from app.rules import discoveries as store
+    from app.rules.loader import load_rules
+
+    rules, errors = load_rules()
+    check(not errors, f"the rule files no longer parse cleanly: {errors[:3]}")
+    check(len(rules) > 50, f"only {len(rules)} rules parsed - the files look truncated")
+
+    # Every rule must still carry all four fields, in ONE of the two layouts.
+    pairs = [("What is wrong", "Wrong:"), ("Why it matters", "Matters:"),
+             ("How to detect", "Detect:"), ("Do NOT flag", "Never flag:")]
+    for rule in rules:
+        body = rule.body or ""
+        for long_form, short_form in pairs[:3]:  # the first three are never optional
+            check(
+                f"**{long_form}**" in body or short_form in body,
+                f"{rule.rule_id} states neither '{long_form}' nor '{short_form}' - the "
+                "Author is given a rule with a field missing entirely",
+            )
+
+    # The Author has to be told how to read both, or half the file becomes unreadable to it.
+    contract = prompts.ANOMALY_FILE_CONTRACT
+    for token in ("What is wrong", "Wrong:", "Why it matters", "Matters:",
+                  "How to detect", "Detect:", "Do NOT flag", "Never flag:"):
+        check(
+            token in contract,
+            f"the anomaly-file contract never mentions {token!r}, so a rule written in that "
+            "layout is handed to the Author with nothing explaining the field",
+        )
+    check(
+        "BINDING" in contract.upper(),
+        "the contract no longer states that the exclusion field is binding - an exclusion "
+        "treated as advice is how a check comes back with thousands of false findings",
+    )
+
+    # And the Scout must WRITE the short layout, or discovered.md drifts back to the long one.
+    rendered = store.render(
+        {"title": "t", "what_is_wrong": "w", "why_it_matters": "m",
+         "how_to_detect": "d", "do_not_flag": "n", "category": "c",
+         "severity": "high", "entity": "row"},
+        "DQ-S99", "probation",
+    )
+    for short_form in ("Wrong:", "Matters:", "Detect:", "Never flag:"):
+        check(
+            short_form in rendered,
+            f"a newly accepted proposal is not written with {short_form!r}",
+        )
+    check(
+        "**What is wrong**" not in rendered,
+        "the Scout still writes the long layout, so every accepted proposal re-introduces it",
+    )
+
+
 def main() -> int:
     tests = [
         ("every module parses and imports", test_every_module_parses),
@@ -3270,6 +3341,7 @@ def main() -> int:
          test_a_score_records_which_checks_produced_it),
         ("structured calls are counted in the usage report",
          test_structured_calls_are_counted_in_the_usage_report),
+        ("both rule layouts are understood", test_both_rule_layouts_are_understood),
     ]
     for name, fn in tests:
         before = len(_failures)

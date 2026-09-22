@@ -20,7 +20,16 @@ FILE FORMAT
     - tags: a, b, c
     - <anything else>: becomes a {{placeholder}} usable in the SQL below
 
-    **What is wrong** ... **Why it matters** ... **How to detect** ... **Do NOT flag** ...
+    Wrong: ...        the defect itself
+    Matters: ...      the consequence to the business
+    Detect: ...       the logic in words, no SQL
+    Never flag: ...   the exclusions, binding on the Verifier
+
+    (The older layout - **What is wrong** / **Why it matters** / **How to detect** /
+    **Do NOT flag**, each as a bold heading with a paragraph under it - means exactly the same
+    and is still read. NOTHING HERE PARSES EITHER FORM: the prose below the metadata is kept
+    verbatim as `body` and handed to the Author and the Verifier, which is why both layouts
+    work without a parser change and why rules in the two styles can sit side by side.)
 
     ```sql summary
     ...exactly one row...

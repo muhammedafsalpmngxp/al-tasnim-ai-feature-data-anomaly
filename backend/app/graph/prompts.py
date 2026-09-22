@@ -244,12 +244,26 @@ Each anomaly is stated in business language, on purpose. It says WHAT is wrong a
 matters; it does not say which tables or columns to use, and it must not be expected to. You
 resolve the business terms against the SCHEMA block, the measured hints and the BUSINESS RULES.
 
-  - "What is wrong" is the condition to detect.
-  - "Why it matters" is the consequence. Use it to judge what evidence a reader needs.
-  - "How to detect" is the logic in words - which business concepts to compare, and how.
-  - "Do NOT flag" is the exclusion list. Treat it as binding: it exists because that case is
-    either legitimate, or already reported by a different check, and reporting one record under
-    two checks inflates every total in the report.
+Four fields carry the rule. They appear in one of two layouts and BOTH MEAN EXACTLY THE SAME
+THING - older rules use a bold heading with the text beneath it, newer ones use one short
+labelled line. Read whichever is present; never treat the short form as less considered, and
+never expect a field to be longer than one sentence.
+
+    **What is wrong**   or  Wrong:        the condition to detect.
+    **Why it matters**  or  Matters:      the consequence. Use it to judge what evidence a
+                                          reader needs in the detail rows.
+    **How to detect**   or  Detect:       the logic in words - which business concepts to
+                                          compare, and at what grain.
+    **Do NOT flag**     or  Never flag:   the exclusion list. TREAT IT AS BINDING in either
+                                          spelling: it exists because that case is either
+                                          legitimate, or already reported by a different check,
+                                          and reporting one record under two checks inflates
+                                          every total in the report.
+
+A SHORT RULE IS NOT AN UNDERSPECIFIED ONE. These descriptions are written deliberately tight -
+one sentence per field is the target, not a sign that something was left out. Everything the
+rule means is in those sentences plus its metadata; if a business term in them is not defined
+in the BUSINESS RULES, that is a genuine gap to report, not a licence to invent a definition.
 
 A value stated in the anomaly's own metadata - a deadline in days, a placeholder date, a
 minimum sample - is STATED BY THE BUSINESS, not invented, and you may use it as a literal.
@@ -510,8 +524,10 @@ decision, or wait.
 WHAT TO CHECK, using the schema and hints you are given - do not guess:
 1. EXISTENCE - every table and column referenced is in the SCHEMA block. Never name one that
    is not in the block you were given.
-2. INTENT - the condition actually expresses the rule's "How to detect", and honours every
-   "Do NOT flag" exclusion. An exclusion silently dropped is a defect even though the query runs.
+2. INTENT - the condition actually expresses the rule's "How to detect" (written as
+   `Detect:` in a short-form rule), and honours every "Do NOT flag" / `Never flag:` exclusion.
+   The two spellings are the same field and carry the same weight; an exclusion silently
+   dropped is a defect even though the query runs.
 3. SCOPE vs ANOMALY - scope_total counts what was examined, not what was flagged.
 4. GRAIN - a table marked MANY ROWS PER is aggregated or de-duplicated.
 5. SCALE - every numeric comparison matches the column's MEASURED scale in the hints. A 0-1
@@ -729,15 +745,26 @@ THE RULES, IN THE ORDER THEY MATTER
    do not resolve it yourself. Either leave it alone, or propose it and say plainly in
    `do_not_flag` what has to be confirmed first.
 
+WRITE IT SHORT. ONE SENTENCE PER FIELD unless a second genuinely adds something.
+
+This is the hardest instruction here, and it is not about saving money. A rule is read by a
+person deciding whether to accept it, and re-read months later by whoever is asked why a
+finding exists - and a paragraph of careful hedging is worse for both than one plain sentence.
+Long prose also measurably HURTS the check that gets built from it: the business definitions
+attached to a rule are chosen by word overlap, and padding dilutes the subject until the very
+section defining it is dropped. Say the thing once, in the fewest words that stay precise, and
+stop. Do not restate the title. Do not explain why the field exists.
+
 FOR EACH PROPOSAL, WRITE
 - title            one line, in business words. What is wrong, not how to find it.
-- what_is_wrong    one or two sentences. The defect itself.
-- why_it_matters   the consequence to the business. Which numbers become wrong, and for whom.
+- what_is_wrong    ONE sentence. The defect itself, not its consequence.
+- why_it_matters   ONE sentence. Which numbers become wrong, and for whom.
                    If the honest answer is "not much", do not propose it.
-- how_to_detect    the logic in words: which business facts to compare, and how. No SQL.
-- do_not_flag      the cases that are legitimate and must be excluded. Think hard here - this is
-                   what separates a usable check from one that reports thousands of false
-                   findings on its first run.
+- how_to_detect    ONE or two sentences: which business facts to compare, and at what grain.
+                   No SQL.
+- do_not_flag      the legitimate cases to exclude, as a short list rather than prose. Think
+                   hard about WHAT to exclude - that is what separates a usable check from one
+                   reporting thousands of false findings - then write it briefly.
 - category         reuse a category already in use where one fits.
 - severity         critical, high, medium or low - judged by the consequence, not the volume.
 - entity           the thing one finding is about: well, task, project, activity, employee, row.

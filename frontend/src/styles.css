@@ -75,6 +75,25 @@ nav button.active { color: var(--navy); border-bottom-color: var(--navy); }
 .metric.bad  .big { color: var(--bad); }
 
 .warn-card { border-left: 4px solid var(--warn); }
+/* A run that crashed. Same shape as .warn-card so it reads as part of the same family, in the
+   stronger colour because this is not an advisory - the numbers under it mean nothing. */
+.error-card { border-left: 4px solid var(--bad); }
+.error-card h2 { color: var(--bad); }
+.error-detail {
+  /* The raw exception, wrapped rather than clipped: the useful half of a Python traceback is
+     usually the end of the line, and a single-line overflow hides exactly that. */
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  background: #fdf2f2;
+  border: 1px solid #f3cdcd;
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin: 8px 0;
+  max-height: 220px;
+  overflow: auto;
+}
 
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }

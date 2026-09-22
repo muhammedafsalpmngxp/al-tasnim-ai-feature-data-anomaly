@@ -143,7 +143,10 @@ export interface RuleDetail {
 // The one heavy operation this server is running, as anybody may read it - not only the tab
 // that started it. `elapsed` is computed SERVER-side; the client's clock is not the server's.
 export interface JobSnapshot {
-  job: 'compile' | 'run'
+  /** 'discover' belongs here too: the API reports it (app/api/main.py streams the job under
+   *  that name), and leaving it out of the union made the UI fall through to calling a
+   *  discovery run a "detection run". */
+  job: 'compile' | 'run' | 'discover'
   started_at: string
   elapsed: number
   done: number

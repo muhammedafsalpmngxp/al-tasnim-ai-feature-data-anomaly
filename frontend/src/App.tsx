@@ -151,6 +151,22 @@ function Actions({
   // answer, reached by closing a tab.
   const adopted = !active && !!serverJob
   const shownKind = active || serverJob?.job || ''
+  // What to CALL the running job, in the words the operator used to start it.
+  //
+  // This was a two-way choice - compile, or else "detection run" - written when those were the
+  // only two jobs. Discovery is a third, so pressing Run discovery reported "detection run
+  // already in progress" while the stage beside it read `context_builder`, which is a Discover
+  // node. The reader is told their run is something it is not, and the one clue that it isn't
+  // is a node name only somebody who knows the graph would recognise.
+  //
+  // A lookup rather than a nested ternary, so adding a fourth job is one line here and cannot
+  // silently inherit another job's name.
+  const JOB_NAMES: Record<string, string> = {
+    compile: 'compile',
+    run: 'detection run',
+    discover: 'discovery run',
+  }
+  const shownKindName = JOB_NAMES[shownKind] || 'job'
   const shownDone = active ? done : serverJob?.done ?? 0
   const shownTotal = active ? total : serverJob?.total ?? 0
   const shownElapsed = active ? elapsed : Math.round(serverJob?.elapsed ?? 0)
@@ -240,7 +256,7 @@ function Actions({
                   real and already under way, not that their own click went astray. */}
               {adopted && (
                 <span className="muted">
-                  {' '}— {shownKind === 'compile' ? 'compile' : 'detection run'} already in
+                  {' '}— {shownKindName} already in
                   progress, started {serverJob?.started_at?.slice(11, 16)}
                 </span>
               )}
@@ -919,6 +935,30 @@ export default function App() {
           </p></section>}
           {run && (
             <>
+              {/* A RUN THAT CRASHED MUST SAY SO, ABOVE ITS OWN NUMBERS.
+                  The run record has carried `error` all along and the API sends it; nothing
+                  rendered it. A run that died partway is still the LATEST run, so it became
+                  the dashboard - and a crash is indistinguishable from a healthy database
+                  when it is drawn as a score of 0 over 0 records examined with "no summary
+                  was written". Observed exactly that: an ImportError left every tile at zero
+                  and the screen offered no hint that anything had failed, let alone what.
+                  The zeros are left visible beneath this rather than hidden, because they ARE
+                  what the run recorded - they simply must not be read as a measurement. */}
+              {run.error && (
+                <section className="card error-card">
+                  <h2>This run did not finish</h2>
+                  <p>
+                    The figures below are not a measurement of your data — the run stopped
+                    before it could examine anything. Fix the cause and press{' '}
+                    <strong>Run detection</strong> again.
+                  </p>
+                  <pre className="error-detail">{run.error}</pre>
+                  <p className="muted small">
+                    An error naming a Python import or module usually means the server is
+                    running code older than the files on disk — restart it and retry.
+                  </p>
+                </section>
+              )}
               <section className="cards">
                 <div className={'card metric ' + scoreClass(run.score)}>
                   <span className="big">{run.score}</span>
