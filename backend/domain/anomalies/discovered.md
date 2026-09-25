@@ -229,3 +229,23 @@ Never flag: Records the business confirms are genuinely not applicable, such as 
   adjustment records. That exception must come from an agreed record type, never inferred from
   the blank value alone.
 ---
+
+## RULE DQ-S10 - Master well is absent from the engineering priority register
+
+- category: Reference integrity
+- severity: medium
+- entity: well
+- method: rule
+- sql_mode: authored
+- status: active
+- source: discovered
+- evidence: The engineering priority register contains 802 rows and its well identifier has no declared relationship to the priority source, while the master well register contains 841 rows (OBS-030).
+- discovered_from: AlTasnimBI
+- decided: 2026-09-25
+
+Wrong: A master well has no corresponding record in the engineering priority register.
+Matters: Engineering priority and delivery reporting can exclude wells that exist in the central well population.
+Detect: Compare distinct wells in the master well register with distinct wells in the engineering priority register and report master wells without a match.
+Never flag: wells intentionally outside engineering-priority scope; confirm that the engineering priority register is intended to cover every master well before flagging
+
+---
