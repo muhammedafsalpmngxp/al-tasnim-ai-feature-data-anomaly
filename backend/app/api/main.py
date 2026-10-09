@@ -161,15 +161,57 @@ def health() -> dict:
     return {"ok": ok, "database": message, "model": settings.active_model}
 
 
+_RULES_CACHE: dict[str, Any] = {"key": None, "rules": {}}
+
+
+def _rules_inputs_key() -> tuple:
+    """When each file the rule set is built from last changed: the domain folder, and the
+    cached schema and hints the families expand over. Same key = same rules."""
+    from app.db import identity
+
+    paths = [
+        os.path.join(folder, name)
+        for folder, _dirs, files in os.walk(settings.domain_dir)
+        for name in files
+    ]
+    cache = identity.cache_dir()
+    if os.path.isdir(cache):
+        # Top level only, and not the compiled catalog: probes are not an input to the rules,
+        # and the catalog is rewritten after every compiled rule.
+        paths += [
+            os.path.join(cache, name) for name in os.listdir(cache)
+            if not name.startswith("anomaly_catalog") and not name.endswith(".lock")
+        ]
+    stamps = []
+    for full in paths:
+        try:
+            if os.path.isfile(full):
+                stamps.append((full, os.path.getmtime(full)))
+        except OSError:
+            pass
+    return tuple(sorted(stamps))
+
+
 def _rules_by_id() -> dict:
-    """Every rule the loader can see, by id. Never raises - a status call must always answer."""
+    """Every rule the loader can see, by id. Never raises - a status call must always answer.
+
+    Reused until a rule, schema or hints file changes. The dashboard polls status every few
+    seconds while work runs, and rebuilding the rule set each time printed the whole loader
+    and expansion trace into the terminal on every poll, burying the compile's own messages.
+    """
     try:
+        key = _rules_inputs_key()
+        if key and key == _RULES_CACHE["key"]:
+            return _RULES_CACHE["rules"]
+
         from app.rules.expand import expand_families
         from app.rules.loader import load_rules
 
         rules, _ = load_rules()
         rules, _ = expand_families(rules)
-        return {r.rule_id: r for r in rules}
+        _RULES_CACHE["rules"] = {r.rule_id: r for r in rules}
+        _RULES_CACHE["key"] = key
+        return _RULES_CACHE["rules"]
     except Exception:  # noqa: BLE001 - a broken rule file must not blank the whole dashboard
         return {}
 
@@ -403,6 +445,30 @@ def download_report(run_id: str, fmt: str):
         "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     }[fmt]
     return FileResponse(path, media_type=media, filename=os.path.basename(path))
+
+
+@app.get("/api/runs/{run_id}/summary-xlsx", dependencies=[Depends(require_api_key)])
+def download_summary_xlsx(run_id: str):
+    """The one-sheet Summary Excel: one row per anomaly, with two sample records.
+
+    Built on request from files the run already wrote (see app/report/summary_xlsx.py), so the
+    run itself and its full Excel and Word reports are untouched. The run id is checked against
+    the run history first, and the output path is built here - never taken from the URL.
+    """
+    from app.report import summary_xlsx
+    from app.runner import history
+
+    if not any(r.run_id == run_id for r in history()):
+        raise HTTPException(status_code=404, detail=f"No run {run_id!r}")
+    try:
+        path = summary_xlsx.build(run_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(
+        path,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        filename=os.path.basename(path),
+    )
 
 
 # ── Streaming operations ────────────────────────────────────────────────────────

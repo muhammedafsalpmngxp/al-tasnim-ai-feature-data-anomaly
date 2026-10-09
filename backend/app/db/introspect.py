@@ -58,7 +58,7 @@ SECRET_COLUMN_MARKERS = (
 # Bumped whenever _render() changes the TEXT it emits for an unchanged database. The cache is
 # keyed on a fingerprint of the live STRUCTURE, so without this a rendering change would keep
 # serving the old cached text forever - the database has not changed, so nothing else notices.
-_RENDER_VERSION = "5-anomaly-row-counts-on-table-line"
+_RENDER_VERSION = "6-text-numeric-ignores-blanks"
 
 # T-SQL reserved keywords. A column whose NAME is one of these MUST be written [bracketed] or
 # the query fails to parse - and the error is misleading: SQL Server reports "Incorrect syntax
@@ -1263,9 +1263,13 @@ def build_numeric_hints(use_cache: bool = True) -> str:
                 ]
             for c in textish:
                 q = f"[{c}]"
+                # Blank text is no value at all, and it must not count as a number: SQL Server
+                # reads TRY_CAST('' AS float) as 0, so a mostly-blank email or GUID column
+                # measured as "numeric" and every real entry in it was then reported as broken.
+                filled = f"NULLIF(LTRIM(RTRIM(CAST({q} AS nvarchar(max)))), N'')"
                 parts += [
-                    f"COUNT({q})",
-                    f"SUM(CASE WHEN {q} IS NOT NULL AND TRY_CAST({q} AS float) IS NULL "
+                    f"COUNT({filled})",
+                    f"SUM(CASE WHEN {filled} IS NOT NULL AND TRY_CAST({filled} AS float) IS NULL "
                     f"THEN 1 ELSE 0 END)",
                 ]
 

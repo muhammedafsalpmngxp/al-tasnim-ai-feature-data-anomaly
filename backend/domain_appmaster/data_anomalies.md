@@ -67,6 +67,9 @@ Matters: The hook-up deadline is planned from the expected rig-off date until th
 Detect: Examine wells with an actual rig-on date and no actual rig-off date. Flag those with no
   expected rig-off date.
 Never flag: Wells the rig has already left, and wells it has not reached yet.
+Tables: the well master `AppMasterDB.dbo.WellMonitoringReportOptimizedVersions`, LATEST `WeekNumber` only — never `WMR` or `WMR_Historical_Well_Master`; `actual_rig_on_date`, `actual_rig_off_date`,
+  `[exp.rig_off_location_sap_data]` (expected rig-off, bracketed).
+Measured: 1 of 13 wells currently on the rig.
 ---
 
 ## RULE DQ-W03 - Rig left the well before it arrived
@@ -85,6 +88,8 @@ Matters: Drilling duration comes out negative, and every lifecycle report that o
 Detect: Examine wells holding both actual dates. Flag those where rig-off is earlier than rig-on.
   No threshold: a rig cannot leave before it arrives.
 Never flag: Wells missing either date — those are separate checks.
+Tables: the well master `AppMasterDB.dbo.WellMonitoringReportOptimizedVersions`, LATEST `WeekNumber` only; `actual_rig_on_date` and `actual_rig_off_date` (both `date`).
+Measured: 0 of 504 wells holding both dates.
 ---
 
 ## RULE DQ-W04 - Rig left the well but was never recorded as arriving
@@ -102,6 +107,8 @@ Matters: The rig cannot have left a well it never came on to. Drilling duration 
   variance on rig-on cannot be worked out for this well.
 Detect: Flag wells with an actual rig-off date whose actual rig-on date is absent.
 Never flag: Wells with neither date.
+Tables: the well master `AppMasterDB.dbo.WellMonitoringReportOptimizedVersions`, LATEST `WeekNumber` only; `actual_rig_on_date` and `actual_rig_off_date` (both `date`).
+Measured: 0 of 504 wells with a rig-off date.
 ---
 
 ## RULE DQ-W05 - Hook-up completed before the rig left the well
@@ -277,6 +284,8 @@ Detect: Examine every well in the well master. Flag those with no classification
   on the PDO well id.
 Never flag: Classification entries for wells that are not in the well master — a different
   question.
+Tables: the well master `AppMasterDB.dbo.WellMonitoringReportOptimizedVersions`, LATEST `WeekNumber` only — never `WMR` or `WMR_Historical_Well_Master`, against `AppMasterDB.dbo.Well_Classification`,
+  matched on `pdo_well_id` in both, trimmed.
 Measured: 110 of 918 wells.
 ---
 
@@ -287,7 +296,7 @@ Measured: 110 of 918 wells.
 - entity: well
 - method: rule
 - sql_mode: authored
-- status: active
+- status: draft
 - tags: well master, project
 
 Wrong: A well in the well master has no project, or names a project that is not in the project
@@ -298,6 +307,8 @@ Detect: Examine every well. Flag it when its project is absent, or when no proje
   matches it — comparing the project ids as text, trimmed and case-insensitively (business rules
   §8). Say which of the two cases applies.
 Never flag: Nothing else — every well belongs to a project.
+Draft because: the well master's `project_id` is EMPTY in every row of all 41 versions (measured
+  2026-10-09), so this rule would flag all 918 wells. Re-activate once the source fills it.
 ---
 
 ## RULE DQ-W15 - A milestone date was removed after being recorded
@@ -317,9 +328,14 @@ Matters: An event that has happened cannot un-happen. A disappearing date usuall
   overwrite from a stale source, and it makes a finished well look unfinished again.
 Detect: For each well, compare each version with the immediately preceding version. Flag each
   occasion where an actual milestone date goes from present to blank, naming the date and the
-  version. Use the history table, never the current well master.
+  version. The history IS the well master's earlier versions: every `WeekNumber` of
+  `AppMasterDB.dbo.WellMonitoringReportOptimizedVersions`, compared with `LAG()` over `WeekNumber`
+  partitioned by `pdo_well_id` (business rules §4). Never `WMR_Historical_Well_Master`.
 Never flag: Expected dates, which legitimately change and disappear. A date changing from one
   value to another — that is a correction, a different question.
+Tables: actual dates `actual_rig_on_date`, `actual_rig_off_date`, `actual_pegged_date`,
+  `flaf_issue_date`, `[actual_eng._completion_date]` — all `date`, bracket the dotted one.
+Measured: 148 wells, over all 41 versions.
 ---
 
 ## RULE DQ-W16 - Well progress went backwards between weekly versions
@@ -339,6 +355,10 @@ Matters: Physical progress does not go backwards. A drop is a data overwrite or 
 Detect: For each well, compare overall progress with the preceding version. Flag decreases, with
   the size of the drop as the severity. Progress is a 0–1 fraction (business rules §3).
 Never flag: Versions where either value is blank.
+Tables: every `WeekNumber` of `AppMasterDB.dbo.WellMonitoringReportOptimizedVersions` — never the raw `WMR`
+  import. Overall progress is `over_all_progress_percentages`; `LAG()` over `WeekNumber`
+  partitioned by `pdo_well_id`.
+Measured: 510 drops on 317 wells, over all 41 versions.
 ---
 
 # GROUP B — Pegging sheet and FLAF deadlines
@@ -400,6 +420,9 @@ Matters: The location must be pegged and built before the rig can come on. A peg
 Detect: Examine wells with both dates. Flag those where the pegging date is later than the actual
   rig-on date.
 Never flag: Wells missing either date.
+Tables: the well master `AppMasterDB.dbo.WellMonitoringReportOptimizedVersions`, LATEST `WeekNumber` only — never `WMR` or `WMR_Historical_Well_Master`; `actual_pegged_date` and `actual_rig_on_date`
+  (both `date`) — no other table is needed.
+Measured: 4 of 311 wells holding both dates.
 ---
 
 # GROUP T — Daily task records
@@ -444,6 +467,10 @@ Detect: Judge each task on its current record. Flag tasks whose well is blank, m
   or not purely numeric.
 Never flag: Tasks belonging to a Yard project — a yard is not a well and uses a placeholder well
   id by design (business rules §8).
+Tables: `AppMasterDB.dbo.task_daily` (current record per `task_code`, `well_id`, `project_id`). The
+  project type is `AppMasterDB.dbo.ProjectIDs.Type`; join `LOWER(LTRIM(RTRIM(ProjectIDs.ID)))` to
+  `LOWER(CAST(task_daily.project_id AS nvarchar(100)))` and exclude `Type = 'Yard'`. A task whose
+  project is not in the register is NOT a Yard task.
 ---
 
 ## RULE DQ-T03 - Task names a well the well master does not know
@@ -462,6 +489,9 @@ Matters: The work is real but the well it was done on is invisible to the well-l
 Detect: Take the distinct wells named by tasks. Flag each well with no matching well-master entry,
   and say how many tasks name it. Severity is the number of tasks.
 Never flag: Yard projects and tasks with no well (DQ-T02).
+Tables: `AppMasterDB.dbo.task_daily.well_id` against the well master's `pdo_well_id` in
+  `AppMasterDB.dbo.WellMonitoringReportOptimizedVersions`, LATEST `WeekNumber` only, compared as trimmed text. Yard = `AppMasterDB.dbo.ProjectIDs.Type = 'Yard'`, joined
+  `LOWER(LTRIM(RTRIM(ProjectIDs.ID)))` = `LOWER(CAST(task_daily.project_id AS nvarchar(100)))`.
 Measured: 188 of 800 distinct wells.
 ---
 
@@ -818,6 +848,9 @@ Matters: Tasks of that activity resolve to no WBS group and no crew group, so th
 Detect: Examine mapping records with a new activity code. Flag those whose code has no match in
   the activity master. Use the NEW code (business rules §10).
 Never flag: Records whose new code is blank or `#N/A` (DQ-R04).
+Tables: `AppMasterDB.dbo.MappingMaster.New_Activity_Code` against
+  `AppMasterDB.dbo.ActivityMasterCSV.ACTIVITY_CODE`, both trimmed. One row per mapping record.
+Measured: 52 of 512 mapping records (49 of 223 distinct codes). Near-100% means the wrong join.
 ---
 
 ## RULE DQ-R06 - Project id in the register carries stray spaces
@@ -982,7 +1015,10 @@ Detect: Take every well id from the three priority lists (engineering database).
   no matching well-master entry (operations database), naming its list and well name. Convert the
   numeric ids to text to compare (business rules §2).
 Never flag: Wells in the well master that are not on a priority list — the lists are a subset.
-Measured: 188 of 365 listed wells.
+Tables: `AppMasterEngDB.dbo.EngWellPriority_Nimr`, `_Amal`, `_Marmul` (`[Well ID]`) against
+  the well master `AppMasterDB.dbo.WellMonitoringReportOptimizedVersions`, LATEST `WeekNumber` only — never `WMR` or `WMR_Historical_Well_Master`, matched on `pdo_well_id`
+  as trimmed text.
+Measured: 189 of 366 listed wells.
 ---
 
 ## RULE DQ-X02 - Engineering plan names a well the well master does not know
@@ -1003,6 +1039,9 @@ Detect: Use the latest load of the engineering task plan, activity rows only. Ta
   the code (the text after the first dash). Flag each distinct well with no well-master entry, with
   the number of activities.
 Never flag: Codes with no dash, which carry no well id.
+Tables: `AppMasterEngDB.dbo.EngineeringTaskPlan` (`code`, latest load) against
+  the well master `AppMasterDB.dbo.WellMonitoringReportOptimizedVersions`, LATEST `WeekNumber` only — never `WMR` or `WMR_Historical_Well_Master`, matched on `pdo_well_id`
+  as trimmed text.
 ---
 
 ## RULE DQ-X03 - Expected rig-on date disagrees with the SAP drilling sequence
@@ -1046,6 +1085,10 @@ Detect: Take the wells on the three priority lists with an AFC target date earli
   Match each to the well master. Flag those with no engineering finish date. Severity is the days
   past the target.
 Never flag: Wells with no AFC target date, and wells not in the well master (DQ-X01).
+Tables: `AppMasterEngDB.dbo.EngWellPriority_Nimr`, `_Amal`, `_Marmul` (`[Well ID]`, `[AFC Target Date]`)
+  against the well master `AppMasterDB.dbo.WellMonitoringReportOptimizedVersions`, LATEST `WeekNumber` only, matched on `pdo_well_id` as trimmed text. The engineering
+  finish date is `engineering_actual_finish_date` (`date`) in the well master.
+Measured: 24 of 166 matched priority wells past target.
 ---
 
 ## RULE DQ-X05 - Engineering document register names a well the well master does not know

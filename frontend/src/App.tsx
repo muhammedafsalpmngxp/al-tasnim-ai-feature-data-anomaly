@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { api, downloadReport, stream } from './api/client'
+import { api, downloadReport, downloadSummary, stream } from './api/client'
 import { CategoryBar, SEVERITY_COLOURS, ScoreTrend, SeverityDonut } from './components/Charts'
 import type {
   DatabaseRef,
@@ -349,6 +349,37 @@ function FindingsTable({ run, onPick }: { run: RunResult; onPick: (id: string) =
 // Exposed deliberately. The probes decide what the report says, so being able to read precisely
 // what executes is what makes a finding auditable instead of something taken on trust.
 
+// Copies a block of SQL. navigator.clipboard needs a secure origin (https or localhost); on a
+// plain-http LAN address it is missing, so a hidden textarea + execCommand is the fallback.
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false)
+  const copy = async () => {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text)
+      } else {
+        const area = document.createElement('textarea')
+        area.value = text
+        area.style.position = 'fixed'
+        area.style.opacity = '0'
+        document.body.appendChild(area)
+        area.select()
+        document.execCommand('copy')
+        area.remove()
+      }
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      setCopied(false)
+    }
+  }
+  return (
+    <button className="secondary copy-btn" onClick={copy} disabled={!text}>
+      {copied ? 'Copied' : 'Copy'}
+    </button>
+  )
+}
+
 function RuleDrawer({ id, onClose }: { id: string; onClose: () => void }) {
   const [rule, setRule] = useState<RuleDetail | null>(null)
   const [error, setError] = useState('')
@@ -383,9 +414,15 @@ function RuleDrawer({ id, onClose }: { id: string; onClose: () => void }) {
                   <p><strong>Reviewer:</strong> {rule.compiled.verifier_note}</p>
                 )}
                 {rule.compiled.error && <p className="error">{rule.compiled.error}</p>}
-                <h3>Summary query</h3>
+                <div className="row-between">
+                  <h3>Summary query</h3>
+                  <CopyButton text={rule.compiled.summary_sql} />
+                </div>
                 <pre className="sql">{rule.compiled.summary_sql}</pre>
-                <h3>Detail query</h3>
+                <div className="row-between">
+                  <h3>Detail query</h3>
+                  <CopyButton text={rule.compiled.detail_sql} />
+                </div>
                 <pre className="sql">{rule.compiled.detail_sql}</pre>
               </>
             ) : (
@@ -1025,6 +1062,27 @@ export default function App() {
                         </button>
                       ) : null,
                     )}
+                  </div>
+                </div>
+              </section>
+
+              <section className="card">
+                <div className="row-between">
+                  <div>
+                    <h2>Summary Excel</h2>
+                    <p className="muted">
+                      One sheet, one row per anomaly: why it is an anomaly, the tables and
+                      columns checked, the affected row count and two sample records.
+                    </p>
+                  </div>
+                  <div>
+                    <button
+                      onClick={() =>
+                        downloadSummary(run.run_id).catch((e) => setError(String(e)))
+                      }
+                    >
+                      Download Summary Excel
+                    </button>
                   </div>
                 </div>
               </section>

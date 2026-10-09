@@ -15,3 +15,24 @@ alone, and deleting this one reverts every machine-proposed rule in a single ste
   cannot propose the same idea again.
 
 ---
+
+## RULE DQ-S01 - Design tracker has unreadable remaining-days values
+
+- category: Coding consistency
+- severity: high
+- entity: row
+- method: rule
+- sql_mode: authored
+- status: rejected
+- reason: withdrawn after trial
+- source: discovered
+- evidence: 93 of 895 non-blank remaining-days values (10.4%) cannot be read as a number.
+- discovered_from: AppMasterDB+AppMasterEngDB
+- decided: 2026-10-09
+
+Wrong: Some design-tracker remaining-days values are text that cannot be interpreted as a number.
+Matters: Remaining-time and delivery-risk calculations silently exclude affected engineering records.
+Detect: Require every non-blank remaining-days value to be numerically readable before calculating days remaining or aggregating delivery risk.
+Never flag: blank values; formally documented nonnumeric status values
+
+---

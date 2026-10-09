@@ -148,9 +148,14 @@ def code_of(sql: str) -> str:
     return blank_literals(strip_comments(sql))
 
 
+_BRACKETED = re.compile(r"\[[^\]]*(?:\]\][^\]]*)*\]")
+
+
 def _division_problems(sql: str, which: str) -> list[str]:
     problems: list[str] = []
-    bare = code_of(sql)
+    # A bracketed identifier is a name, not code: [Locals/Expats] is a column, not a division.
+    # Blanked to the same length so the NULLIF window still measures real distances.
+    bare = _BRACKETED.sub(lambda m: "[" + "x" * (len(m.group(0)) - 2) + "]", code_of(sql))
     for m in _DIVISION.finditer(bare):
         window = bare[m.start(): m.start() + _NULLIF_WINDOW]
         if "nullif" in window.lower():

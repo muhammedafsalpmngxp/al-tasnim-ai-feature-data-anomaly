@@ -211,3 +211,6 @@ pre.prose { font-family: inherit; font-size: 13px; background: #fbfbfd; }
   .job-fill { transition: none; }
   .job-fill.indeterminate { animation: none; width: 100%; opacity: 0.35; }
 }
+
+/* Copy button beside each SQL block in the rule drawer. */
+button.copy-btn { padding: 4px 12px; font-size: 12px; }

@@ -3298,6 +3298,24 @@ def test_only_configured_databases_may_be_read() -> None:
         check(bool(foreign_databases(sql)), f"out-of-scope SQL allowed: {sql}")
 
 
+def test_a_slash_inside_a_column_name_is_not_a_division() -> None:
+    """[Locals/Expats] is a column name; only a real / needs a NULLIF guard."""
+    from app.rules.contract import _division_problems
+
+    check(
+        not _division_problems("SELECT LTRIM(e.[Locals/Expats]) AS n FROM dbo.e", "SUMMARY"),
+        "a slash inside a bracketed column name was read as an unguarded division",
+    )
+    check(
+        bool(_division_problems("SELECT a.x / a.y AS r FROM dbo.a", "SUMMARY")),
+        "a real division without NULLIF is no longer caught",
+    )
+    check(
+        not _division_problems("SELECT a.x / NULLIF(a.[b/c], 0) AS r FROM dbo.a", "SUMMARY"),
+        "a guarded division over a bracketed name was refused",
+    )
+
+
 def main() -> int:
     tests = [
         ("every module parses and imports", test_every_module_parses),
@@ -3370,6 +3388,8 @@ def main() -> int:
          test_structured_calls_are_counted_in_the_usage_report),
         ("both rule layouts are understood", test_both_rule_layouts_are_understood),
         ("only configured databases may be read", test_only_configured_databases_may_be_read),
+        ("a slash inside a column name is not a division",
+         test_a_slash_inside_a_column_name_is_not_a_division),
     ]
     for name, fn in tests:
         before = len(_failures)

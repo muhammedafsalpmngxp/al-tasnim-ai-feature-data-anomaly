@@ -55,6 +55,7 @@ export const api = {
   run: (id: string) => get<RunResult>(`/api/runs/${encodeURIComponent(id)}`),
   reportUrl: (runId: string, fmt: 'xlsx' | 'docx') =>
     `${BASE}/api/runs/${encodeURIComponent(runId)}/report/${fmt}`,
+  summaryUrl: (runId: string) => `${BASE}/api/runs/${encodeURIComponent(runId)}/summary-xlsx`,
 
   // ── Discovery ──
   // Reading the list is a plain GET; running the Scout streams, so it goes through stream()
@@ -91,6 +92,25 @@ export async function downloadReport(runId: string, fmt: 'xlsx' | 'docx'): Promi
   const a = document.createElement('a')
   a.href = url
   a.download = `data-quality-${runId}.${fmt}`
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
+/**
+ * Download the one-sheet Summary Excel - one row per anomaly with two sample records. Built by
+ * the API on request from what the run already stored; fetched as a blob for the same reason
+ * as downloadReport.
+ */
+export async function downloadSummary(runId: string): Promise<void> {
+  const res = await fetch(api.summaryUrl(runId), { headers: headers() })
+  if (!res.ok) throw new Error(`${res.status}: could not download the summary Excel`)
+  const blob = await res.blob()
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `data-quality-summary-${runId}.xlsx`
   document.body.appendChild(a)
   a.click()
   a.remove()

@@ -361,6 +361,12 @@ def compile_rules(
         return _compile_rules(only, force, retry_failed, source, progress)
 
 
+def _save_catalog(catalog) -> None:
+    """The ONLY catalog write in this module - called from inside _compile_rules, so always
+    under the compile lock: after each rule as a checkpoint, and once at the end."""
+    catalog_store.save(catalog)
+
+
 def _compile_rules(
     only: list[str] | None = None,
     force: bool = False,
@@ -582,9 +588,23 @@ def _compile_rules(
         }
         authors = {f: r for f, r in authors.items() if f not in current}
 
+    saved_at_calls = report.llm_calls
     for index, rule in enumerate(runnable, 1):
         if progress is not None:
             progress(index - 1, total, rule.rule_id)
+
+        # CHECKPOINT what the rules before this one cost model calls to build. Otherwise the
+        # catalog is written only at the end, and a compile cut short - a closed window, a
+        # sleeping laptop, a VPN drop that kills the process - loses every probe it had already
+        # paid for. Each probe carries its own fingerprints, so a partial catalog is judged
+        # probe by probe exactly like a complete one: what was saved is reused, the rest is
+        # "not compiled yet". Free clones are not worth a write each; they follow the next one.
+        if report.llm_calls != saved_at_calls:
+            saved_at_calls = report.llm_calls
+            try:
+                _save_catalog(catalog)
+            except Exception as exc:  # noqa: BLE001 - a checkpoint must never stop the compile
+                log.warning("compile: checkpoint save failed (%s) - continuing", exc)
 
         # A member of a family being re-authored this run: wait for its template, then clone.
         if rule.is_expanded and rule.family_id in authors:
@@ -723,7 +743,7 @@ def _compile_rules(
 
     catalog.structure_fingerprint = fingerprint
     catalog.compiled_at = dt.datetime.now().astimezone().isoformat(timespec="seconds")
-    catalog_store.save(catalog)
+    _save_catalog(catalog)
 
     report.seconds = time.perf_counter() - started
     report.usage = get_usage_report()
