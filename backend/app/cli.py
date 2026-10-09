@@ -50,9 +50,19 @@ def cmd_check(_args) -> int:
     cfg.add_column("Setting")
     cfg.add_column("Value", overflow="fold")
     cfg.add_row("database", f"{settings.db_name} @ {settings.db_server}:{settings.db_port}")
+    if settings.multi_database:
+        cfg.add_row(
+            "also in scope",
+            ", ".join(settings.databases[1:]) + " [dim](three-part names: db.schema.table)[/]",
+        )
     cfg.add_row("user", settings.db_user or "[red]not set[/]")
     cfg.add_row("driver", settings.db_driver or "(auto-detect)")
     cfg.add_row("allowed schemas", ", ".join(settings.allowed_schemas) or "[red]none set[/]")
+    cfg.add_row(
+        "included tables",
+        f"{len(settings.included_tables)} listed" if settings.included_tables
+        else "(all tables in the allowed schemas)",
+    )
     cfg.add_row("excluded tables", ", ".join(settings.excluded_tables) or "(none)")
     cfg.add_row("excluded columns", ", ".join(settings.excluded_columns) or "(none)")
     cfg.add_row("llm provider", settings.llm_provider)
@@ -69,6 +79,11 @@ def cmd_check(_args) -> int:
         f"excel {settings.export_max_rows:,}",
     )
     cfg.add_row("timeouts", f"summary {settings.query_timeout}s / detail {settings.detail_timeout}s")
+    cfg.add_row(
+        "domain files",
+        os.path.relpath(settings.domain_dir)
+        + ("" if os.path.isdir(settings.domain_dir) else "  [red](directory not found)[/]"),
+    )
     console.print(cfg)
 
     if not settings.db_server or not settings.db_name:
@@ -90,12 +105,62 @@ def cmd_check(_args) -> int:
         return 1
     console.print(f"[green]OK[/]: {message}")
 
+    problems = _check_scope(console)
+
     if settings._is_openai and not settings.openai_api_key:
         console.print(
             "[yellow]Note:[/] OPENAI_API_KEY is blank. `check` and `introspect` work without "
             "it; `compile` and `run` will not."
         )
-    return 0
+    return 1 if problems else 0
+
+
+def _check_scope(console) -> int:
+    """Every database reachable, every INCLUDED_TABLES entry matching a real table.
+
+    Metadata only. Both failures are SILENT everywhere else: an unreachable extra database or a
+    misspelt included table simply contributes no tables, and the report then reads as a clean
+    bill of health for data nobody looked at. This is the one place they are said out loud.
+    """
+    from app.db import introspect
+    from app.db.connection import get_connection
+
+    problems = 0
+    conn = get_connection(timeout=settings.metadata_timeout)
+    try:
+        cur = conn.cursor()
+        for db in settings.databases[1:]:
+            cur.execute("SELECT DB_ID(?), HAS_DBACCESS(?)", db, db)
+            db_id, access = cur.fetchone()
+            if db_id is None:
+                console.print(f"[red]{db}[/]: no such database on this server")
+                problems += 1
+            elif not access:
+                console.print(f"[red]{db}[/]: exists, but this login cannot open it")
+                problems += 1
+            else:
+                console.print(f"[green]OK[/]: {db} is readable through three-part names")
+        if problems:
+            return problems
+        visible = introspect._fetch_columns(cur)
+    finally:
+        conn.close()
+
+    per_db: dict[str, int] = {}
+    for name in visible:
+        db = introspect.split_name(name)[0] or settings.db_name
+        per_db[db] = per_db.get(db, 0) + 1
+    console.print(
+        f"[green]OK[/]: {len(visible)} table(s) visible - "
+        + ", ".join(f"{db}: {n}" for db, n in per_db.items())
+    )
+    for entry in introspect.unmatched_included(visible):
+        console.print(
+            f"[red]INCLUDED_TABLES[/]: {entry!r} matches no visible table - it would NOT be "
+            "checked. Check the spelling, ALLOWED_SCHEMAS and EXCLUDED_TABLES."
+        )
+        problems += 1
+    return problems
 
 
 def cmd_introspect(args) -> int:
@@ -115,7 +180,7 @@ def cmd_introspect(args) -> int:
         return 1
 
     console.print(
-        f"Introspecting [bold]{settings.db_name}[/] on {settings.db_server} "
+        f"Introspecting [bold]{settings.database_label}[/] on {settings.db_server} "
         f"(schemas: {', '.join(settings.allowed_schemas)})"
     )
     console.print(
@@ -293,7 +358,7 @@ def cmd_compile(args) -> int:
         return 2
 
     console.print(
-        f"Compiling against [bold]{settings.db_name}[/] "
+        f"Compiling against [bold]{settings.database_label}[/] "
         f"(budget: {settings.max_compile_calls} LLM calls, "
         f"main model {settings.active_model})"
     )

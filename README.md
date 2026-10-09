@@ -366,9 +366,30 @@ Everything lives in `backend/.env` — see `.env.example`, which documents every
 
 ### Table scope
 
-`ALLOWED_SCHEMAS`, `EXCLUDED_TABLES`, `EXCLUDED_COLUMNS` are the only control over visibility. Secret-looking columns (`password`, `token`, `secret`, `apikey`, `credential`) are always hidden and need no configuration.
+`ALLOWED_SCHEMAS`, `INCLUDED_TABLES`, `EXCLUDED_TABLES`, `EXCLUDED_COLUMNS` are the only control over visibility. Secret-looking columns (`password`, `token`, `secret`, `apikey`, `credential`) are always hidden and need no configuration.
+
+`INCLUDED_TABLES` is an allow-list: blank means every table in `ALLOWED_SCHEMAS`; set, only the listed tables exist as far as the engine is concerned. `EXCLUDED_TABLES` still applies on top and always wins. `python -m app.cli check` names any entry that matches no table, because a misspelt entry is a table you believe is checked and is not.
 
 Scope here is deliberately **wider** than a chatbot's over the same database: more tables means more declared foreign keys to check for orphans, and more pairs of sources that are supposed to agree with each other. Cross-source disagreement is a high-value anomaly family and it is invisible when only one of the two sources is in scope.
+
+### Several databases at once
+
+`DB_EXTRA_NAMES` adds further databases **on the same server**, read through the same login:
+
+```
+DB_NAME=AppMasterDB
+DB_EXTRA_NAMES=AppMasterEngDB
+INCLUDED_TABLES=AppMasterDB.dbo.task_daily,AppMasterEngDB.dbo.EngineeringTaskPlan,...
+DOMAIN_DIR=domain_appmaster
+```
+
+Every table name then becomes three-part — `database.schema.table` — in the schema description, the prompts, the catalog and the reports, so one probe can join across databases and check that they agree. Catalogue reads go through `[database].sys.*`, on the one connection probes also use. The validator refuses any query reaching a database that is not listed (including `[db]..[t]` and linked-server forms), whatever the login could otherwise see.
+
+Blank `DB_EXTRA_NAMES` is the single-database engine **byte for byte**: same names, same fingerprints, same catalog. A multi-database scope is its own identity (`AppMasterDB+AppMasterEngDB`), with its own caches, catalog and run history.
+
+### Domain folder per database family
+
+`DOMAIN_DIR` (default `domain`) picks the folder holding the three user-owned files. `domain/` describes the AlTasnimBI warehouse; `domain_appmaster/` describes AppMasterDB + AppMasterEngDB, whose column names, join quirks and scales differ (for example its activity master is keyed on the *new* activity codes, and its well-master progress columns are 0–1 fractions). Switching database families is one line.
 
 ### Model tiers
 

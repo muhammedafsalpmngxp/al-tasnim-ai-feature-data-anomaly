@@ -49,13 +49,29 @@ _UNSAFE = re.compile(
 # A schema-qualified table reference. The dot is required on purpose: a bare word after FROM or
 # JOIN is virtually always a CTE name or a subquery alias, and the author is told to always
 # schema-qualify a real table, so this flags a genuine reference and never a CTE.
-_TABLE_REF = re.compile(r"\b(?:FROM|JOIN)\s+(\w+\.\w+)", re.IGNORECASE)
+#
+# The optional third part is a DATABASE-qualified name (database.schema.table), which is how
+# every table is spelled when DB_EXTRA_NAMES puts several databases in scope. Without it the
+# pattern captured "database.schema" and reported a correct query as naming an unknown table.
+_TABLE_REF = re.compile(r"\b(?:FROM|JOIN)\s+(\w+\.\w+(?:\.\w+)?)", re.IGNORECASE)
+
+# A dotted chain of identifiers - bare or [bracketed] - such as db.schema.table, [db]..[t] or
+# server.db.schema.table. Used only to find WHICH DATABASE a reference reaches; see
+# foreign_databases().
+_IDENT = r"(?:\[[^\]]*\]|[A-Za-z_#@][\w#@$]*)"
+_CHAIN = re.compile(
+    rf"(?<![\w\]\.#@$])({_IDENT}(?:\s*\.\s*(?:{_IDENT})?)+)(\s*\()?"
+)
 # "TABLE schema.table" lines in the rendered schema block.
 _TABLE_DECL = re.compile(r"^TABLE (\S+)", re.MULTILINE)
 
 
-def _scrub(sql: str) -> str:
+def _scrub(sql: str, keep_identifiers: bool = False) -> str:
     """Blank out string literals, bracketed identifiers and comments in ONE pass.
+
+    `keep_identifiers` leaves [bracketed] names intact - for the database check, which must see
+    [OtherDb].[dbo].[t] exactly as written, since brackets are the easy way to dodge a check
+    that only reads bare words.
 
     Only this inspection copy is scrubbed; what actually runs is always the original text.
 
@@ -107,7 +123,7 @@ def _scrub(sql: str) -> str:
         if ch == "[":
             end = sql.find("]", i + 1)
             if end != -1:
-                out.append("[x]")
+                out.append(sql[i:end + 1] if keep_identifiers else "[x]")
                 i = end + 1
                 continue
 
@@ -146,6 +162,61 @@ def is_read_only(sql: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _split_chain(chain: str) -> list[str]:
+    """Split a dotted name on the dots OUTSIDE brackets: [a.b].c is two parts, not three."""
+    parts: list[str] = []
+    buf: list[str] = []
+    inside = False
+    for ch in chain:
+        if ch == "[":
+            inside = True
+        elif ch == "]":
+            inside = False
+        if ch == "." and not inside:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    parts.append("".join(buf))
+    return [p.strip().strip("[]").strip().lower() for p in parts]
+
+
+def foreign_databases(sql: str) -> list[str]:
+    """Database-qualified references reaching OUTSIDE the configured databases.
+
+    A probe may read DB_NAME and DB_EXTRA_NAMES and nothing else. The login running probes can
+    often see more than that - master, msdb, another application's database - and a model that
+    was shown three-part names for two databases can write one for a third. That read would not
+    modify anything, but it would put another system's data into a shared report, which is the
+    same leak the _UNSAFE list exists to stop.
+
+    Checked on the SQL text, bracket-aware, never on what the database happens to allow:
+
+      * four or more parts (server.db.schema.table) is a linked server or a four-part column
+        reference - always refused;
+      * three parts must start with a database in scope, or with an allowed schema (the legal
+        schema.table.column form of a column reference).
+
+    A chain followed by "(" is a call - a method such as col.value(...) as often as a function -
+    and is not judged here; reading through a function in another database still needs that
+    database to be one this login can open.
+    """
+    from app.config import settings
+
+    databases = {d.lower() for d in settings.databases}
+    schemas = set(settings.allowed_schemas)
+    found: list[str] = []
+    for chain, call in _CHAIN.findall(_scrub(sql, keep_identifiers=True)):
+        if call.strip():
+            continue
+        parts = _split_chain(chain)
+        if len(parts) >= 4:
+            found.append(chain.strip())
+        elif len(parts) == 3 and parts[0] not in databases and parts[0] not in schemas:
+            found.append(chain.strip())
+    return list(dict.fromkeys(found))
+
+
 def unknown_tables(sql: str, schema_text: str) -> list[str]:
     """Schema-qualified tables the query references that the schema block does not declare.
 
@@ -173,6 +244,14 @@ def validator_node(state: CompileState) -> dict:
         ok, reason = is_read_only(sql)
         if not ok:
             problems.append(f"{which}: {reason}")
+            continue
+        outside = foreign_databases(sql)
+        if outside:
+            problems.append(
+                f"{which} reads {', '.join(outside)}, which is outside the databases in scope. "
+                f"A probe may read only the tables listed in the SCHEMA block, spelled exactly "
+                f"as they are listed there."
+            )
             continue
         unknown = unknown_tables(sql, state.get("schema_block", ""))
         if unknown:

@@ -44,7 +44,7 @@ def current_database() -> dict[str, str]:
     """Which database this process is pointed at, as a run records it."""
     from app.config import settings
 
-    return {"name": settings.db_name, "server": settings.db_server}
+    return {"name": settings.database_label, "server": settings.db_server}
 
 
 @dataclass

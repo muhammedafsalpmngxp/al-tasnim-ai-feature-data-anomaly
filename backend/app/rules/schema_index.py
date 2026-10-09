@@ -147,7 +147,7 @@ class NumericStat:
 
 @dataclass
 class Table:
-    name: str  # schema.table
+    name: str  # schema.table, or database.schema.table when several databases are in scope
     columns: list[Column] = field(default_factory=list)
     foreign_keys: list[ForeignKey] = field(default_factory=list)
     duplicate_key: str | None = None
@@ -156,7 +156,9 @@ class Table:
 
     @property
     def schema(self) -> str:
-        return self.name.partition(".")[0]
+        # The part before the table name: the first of two, or the middle of three.
+        parts = self.name.split(".")
+        return parts[-2] if len(parts) >= 2 else ""
 
     @property
     def pk_columns(self) -> list[str]:

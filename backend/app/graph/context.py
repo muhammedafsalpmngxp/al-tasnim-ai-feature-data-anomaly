@@ -150,7 +150,9 @@ def _resolve(blocks: dict[str, str], names: list[str]) -> set[str]:
     by_lower = {t.lower(): t for t in blocks}
     by_bare: dict[str, list[str]] = {}
     for t in blocks:
-        by_bare.setdefault(t.partition(".")[2].lower(), []).append(t)
+        # rpartition, not partition: the bare name is the LAST part, whether the table is
+        # spelled schema.table or database.schema.table. Identical for a two-part name.
+        by_bare.setdefault(t.rpartition(".")[2].lower(), []).append(t)
 
     resolved: set[str] = set()
     for raw in names or []:

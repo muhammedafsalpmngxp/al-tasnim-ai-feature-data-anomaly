@@ -8,6 +8,8 @@ app at a different database is a config change, never a code change.
 from __future__ import annotations
 
 import os
+import re
+import sys
 from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
@@ -43,6 +45,36 @@ def _get_float(name: str, default: float) -> float:
 def _csv(name: str, default: str = "") -> tuple[str, ...]:
     """Comma-separated setting, lowercased and blank-stripped."""
     return tuple(s.strip().lower() for s in _get(name, default).split(",") if s.strip())
+
+
+# A database name the engine can put into a three-part table name without quoting. Deliberately
+# narrower than what SQL Server accepts: every reader of schema.txt and every SQL check in this
+# engine treats a table name as dotted WORD characters, so a name with a space, a dot or a
+# bracket would be split wrongly everywhere downstream - silently, as a table that "does not
+# exist". Refusing it here, loudly, is the only place that failure can be made visible.
+_DB_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _db_names(name: str) -> tuple[str, ...]:
+    """Comma-separated database names. Case is KEPT - it is what the report shows."""
+    out: list[str] = []
+    for raw in _get(name).split(","):
+        value = raw.strip()
+        if not value:
+            continue
+        if not _DB_NAME_RE.match(value):
+            print(
+                f"[config] {name}: ignoring {value!r} - only letters, digits and underscore are "
+                f"supported in an additional database name",
+                file=sys.stderr,
+            )
+            continue
+        if value.lower() not in {o.lower() for o in out}:
+            out.append(value)
+    return tuple(out)
+
+
+_BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 
@@ -116,6 +148,15 @@ class Settings:
     db_driver: str = field(default_factory=lambda: _get("DB_DRIVER"))
     db_encrypt: str = field(default_factory=lambda: _get("DB_ENCRYPT", "yes"))
     db_trust_cert: str = field(default_factory=lambda: _get("DB_TRUST_CERT", "yes"))
+    # Further databases ON THE SAME SERVER, reached through the same login with three-part names
+    # (database.schema.table). Blank - the default - is the original single-database engine,
+    # byte for byte: no name changes, no fingerprint changes, no recompile.
+    #
+    # Set, it switches every table name the engine produces to the three-part form, for EVERY
+    # database including DB_NAME. One form throughout is what lets a probe join across them -
+    # which is the point: two databases that are supposed to agree about the same wells are a
+    # high-value anomaly family that neither database can show on its own.
+    db_extra_names: tuple[str, ...] = field(default_factory=lambda: _db_names("DB_EXTRA_NAMES"))
 
     # -- Table scope -------------------------------------------------------------
     # The ONLY control over what the engine can see. Deliberately wider than a chatbot's scope:
@@ -124,8 +165,41 @@ class Settings:
     allowed_schemas: tuple[str, ...] = field(
         default_factory=lambda: _csv("ALLOWED_SCHEMAS", "dbo")
     )
+    # An ALLOW-list. Blank (the default) means every table in ALLOWED_SCHEMAS, exactly as before.
+    # Set, ONLY the tables named here are visible - to introspection, to the agents and to every
+    # probe. EXCLUDED_TABLES still applies on top of it, and exclusion always wins.
+    included_tables: tuple[str, ...] = field(default_factory=lambda: _csv("INCLUDED_TABLES"))
     excluded_tables: tuple[str, ...] = field(default_factory=lambda: _csv("EXCLUDED_TABLES"))
     excluded_columns: tuple[str, ...] = field(default_factory=lambda: _csv("EXCLUDED_COLUMNS"))
+
+    # Where the three user-owned domain files live, relative to backend/. Each database family
+    # needs its own business rules - column names, join quirks and measured facts differ - so
+    # pointing the engine somewhere else is a one-line change instead of an overwrite.
+    domain_dir_setting: str = field(default_factory=lambda: _get("DOMAIN_DIR", "domain"))
+
+    @property
+    def databases(self) -> tuple[str, ...]:
+        """Every database in scope, DB_NAME first."""
+        out = [self.db_name] if self.db_name else []
+        for name in self.db_extra_names:
+            if name.lower() not in {o.lower() for o in out}:
+                out.append(name)
+        return tuple(out)
+
+    @property
+    def multi_database(self) -> bool:
+        """True when table names are three-part. False keeps the original two-part engine."""
+        return len(self.databases) > 1
+
+    @property
+    def database_label(self) -> str:
+        """How the database scope is named in caches, run history and reports."""
+        return "+".join(self.databases) if self.multi_database else self.db_name
+
+    @property
+    def domain_dir(self) -> str:
+        path = self.domain_dir_setting or "domain"
+        return path if os.path.isabs(path) else os.path.join(_BACKEND_DIR, path)
 
     # -- Row-volume control ------------------------------------------------------
     # FOUR separate caps because they solve four different problems. `sample_rows` is the only

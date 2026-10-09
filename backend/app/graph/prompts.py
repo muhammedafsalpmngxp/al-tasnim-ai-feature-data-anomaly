@@ -29,9 +29,8 @@ from app.config import settings
 # USER-OWNED, MACHINE-READ. These three files are the operator's control surface and nothing in
 # this engine ever writes them. Only the DESCRIPTIONS of the database - schema.txt and the two
 # hint files - are machine-maintained, and they live in .cache, not here.
-_DOMAIN_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "domain"
-)
+# DOMAIN_DIR in .env, "domain" by default - see Settings.domain_dir.
+_DOMAIN_DIR = settings.domain_dir
 
 
 def _load_domain_file(filename: str) -> str:

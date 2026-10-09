@@ -150,6 +150,50 @@ def cache_paths() -> tuple[str, ...]:
     )
 
 
+# ── Database scope ─────────────────────────────────────────────────────────────
+# ONE DATABASE OR SEVERAL, AND THE SINGLE CASE IS UNCHANGED BYTE FOR BYTE.
+#
+# With DB_EXTRA_NAMES blank there is one scope with an EMPTY catalog prefix, so every catalogue
+# query below is the exact text it always was, every table name is the two-part "schema.table"
+# it always was, and no fingerprint moves - an existing catalog stays valid.
+#
+# With DB_EXTRA_NAMES set, each catalogue query is run once per database through a three-part
+# catalogue name ([db].sys.tables, [db].INFORMATION_SCHEMA.COLUMNS) on the ONE connection to
+# DB_NAME, and every table name becomes "database.schema.table". One connection, because the
+# probes themselves run on it and resolve the same three-part names - so introspection sees the
+# databases through exactly the door the probes will use, with the same login's permissions.
+
+def _scopes() -> list[tuple[str, str]]:
+    """(database, catalogue prefix) for each database in scope. Prefix "" = current database."""
+    if not settings.multi_database:
+        return [(settings.db_name, "")]
+    return [(db, f"[{db}].") for db in settings.databases]
+
+
+def qualify(database: str, schema: str, table: str) -> str:
+    """The one spelling of a table name used everywhere: cache, prompts, catalog, reports."""
+    if settings.multi_database:
+        return f"{database}.{schema}.{table}"
+    return f"{schema}.{table}"
+
+
+def split_name(name: str) -> tuple[str, str, str]:
+    """(database, schema, table) of a qualified name. database is "" in single-database mode."""
+    if settings.multi_database:
+        database, _, rest = name.partition(".")
+        schema, _, table = rest.partition(".")
+        return database, schema, table
+    schema, _, table = name.partition(".")
+    return "", schema, table
+
+
+def from_clause(name: str) -> str:
+    """A qualified name as a bracketed FROM target - [schema].[table], or with [database]."""
+    database, schema, table = split_name(name)
+    prefix = f"[{database}]." if database else ""
+    return f"{prefix}[{schema}].[{table}]"
+
+
 # ── Visibility filters ─────────────────────────────────────────────────────────
 
 def _is_secret(col: str) -> bool:
@@ -157,24 +201,61 @@ def _is_secret(col: str) -> bool:
     return any(m in lc for m in SECRET_COLUMN_MARKERS)
 
 
-def _is_excluded(schema: str, table: str) -> bool:
+def _name_forms(database: str, schema: str, table: str) -> set[str]:
+    """Every spelling a scope setting may use for one table: db.schema.table, schema.table, table."""
+    forms = {f"{schema}.{table}".lower(), table.lower()}
+    if database:
+        forms.add(f"{database}.{schema}.{table}".lower())
+    return forms
+
+
+def _is_excluded(schema: str, table: str, database: str = "") -> bool:
     """True when EXCLUDED_TABLES hides this table.
 
     Matches "schema.table" (exact - the safe form) or a bare "table" name, which hides that name
-    in every allowed schema. An excluded table also disappears from the primary keys, foreign
-    keys and both hint files, because each is built from the surviving table list.
+    in every allowed schema - and "database.schema.table" when several databases are in scope.
+    An excluded table also disappears from the primary keys, foreign keys and both hint files,
+    because each is built from the surviving table list.
     """
     if not settings.excluded_tables:
         return False
-    excluded = settings.excluded_tables
-    return f"{schema}.{table}".lower() in excluded or table.lower() in excluded
+    return bool(_name_forms(database, schema, table) & set(settings.excluded_tables))
 
 
-def _is_excluded_column(schema: str, table: str, column: str) -> bool:
+def _is_included(schema: str, table: str, database: str = "") -> bool:
+    """True when INCLUDED_TABLES admits this table. Always true while INCLUDED_TABLES is blank."""
+    if not settings.included_tables:
+        return True
+    return bool(_name_forms(database, schema, table) & set(settings.included_tables))
+
+
+def _is_hidden(schema: str, table: str, database: str = "") -> bool:
+    """The whole table-visibility decision: outside the allow-list, or excluded. Exclusion wins."""
+    return not _is_included(schema, table, database) or _is_excluded(schema, table, database)
+
+
+def unmatched_included(visible: set[str] | list[str]) -> list[str]:
+    """INCLUDED_TABLES entries that matched NO visible table - a typo, a dropped table, or a
+    table in a schema ALLOWED_SCHEMAS does not list.
+
+    Reported, never ignored: an entry that matches nothing is a table the operator believes is
+    being checked and is not, which is the one failure a data-quality tool must not hide.
+    """
+    if not settings.included_tables:
+        return []
+    seen: set[str] = set()
+    for name in visible:
+        database, schema, table = split_name(name)
+        seen |= _name_forms(database, schema, table)
+    return [entry for entry in settings.included_tables if entry not in seen]
+
+
+def _is_excluded_column(schema: str, table: str, column: str, database: str = "") -> bool:
     """True when EXCLUDED_COLUMNS hides this column.
 
     Matches "schema.table.column" (exact), "table.column" (that table in any schema), or a bare
-    "column" name (that name in every table). Runs on top of SECRET_COLUMN_MARKERS.
+    "column" name (that name in every table) - and "database.schema.table.column" when several
+    databases are in scope. Runs on top of SECRET_COLUMN_MARKERS.
     """
     if not settings.excluded_columns:
         return False
@@ -183,6 +264,7 @@ def _is_excluded_column(schema: str, table: str, column: str) -> bool:
         f"{schema}.{table}.{column}".lower() in excluded
         or f"{table}.{column}".lower() in excluded
         or column.lower() in excluded
+        or bool(database) and f"{database}.{schema}.{table}.{column}".lower() in excluded
     )
 
 
@@ -191,44 +273,50 @@ def _is_excluded_column(schema: str, table: str, column: str) -> bool:
 def _fetch_columns(cur) -> dict[str, list[tuple]]:
     """schema.table -> [(column, data_type, max_length, is_nullable), ...] in ordinal order."""
     placeholders = ",".join("?" for _ in settings.allowed_schemas)
-    cur.execute(
-        f"""
-        SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
-               CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE, ORDINAL_POSITION
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE LOWER(TABLE_SCHEMA) IN ({placeholders})
-        ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
-        """,
-        *settings.allowed_schemas,
-    )
     tables: dict[str, list[tuple]] = {}
-    for sch, tbl, col, dtype, maxlen, nullable, _ in cur.fetchall():
-        if _is_excluded(sch, tbl) or _is_secret(col) or _is_excluded_column(sch, tbl, col):
-            continue
-        tables.setdefault(f"{sch}.{tbl}", []).append((col, dtype, maxlen, nullable))
+    for db, cat in _scopes():
+        cur.execute(
+            f"""
+            SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE,
+                   CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE, ORDINAL_POSITION
+            FROM {cat}INFORMATION_SCHEMA.COLUMNS
+            WHERE LOWER(TABLE_SCHEMA) IN ({placeholders})
+            ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
+            """,
+            *settings.allowed_schemas,
+        )
+        for sch, tbl, col, dtype, maxlen, nullable, _ in cur.fetchall():
+            if (
+                _is_hidden(sch, tbl, db) or _is_secret(col)
+                or _is_excluded_column(sch, tbl, col, db)
+            ):
+                continue
+            tables.setdefault(qualify(db, sch, tbl), []).append((col, dtype, maxlen, nullable))
     return tables
 
 
 def _fetch_primary_keys(cur) -> dict[str, set[str]]:
     """schema.table -> set of primary-key column names."""
-    cur.execute(
-        """
-        SELECT sch.name, t.name, c.name
-        FROM sys.indexes i
-        JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
-        JOIN sys.columns c   ON c.object_id  = ic.object_id AND c.column_id = ic.column_id
-        JOIN sys.tables  t   ON t.object_id  = i.object_id
-        JOIN sys.schemas sch ON sch.schema_id = t.schema_id
-        WHERE i.is_primary_key = 1
-        """
-    )
     pks: dict[str, set[str]] = {}
-    for sch, tbl, col in cur.fetchall():
-        # A hidden PK column is dropped HERE rather than later: pks feeds both the " PK" marker
-        # and the duplicate-key scan, either of which would otherwise name an invisible column.
-        if _is_excluded(sch, tbl) or _is_excluded_column(sch, tbl, col):
-            continue
-        pks.setdefault(f"{sch}.{tbl}", set()).add(col)
+    for db, cat in _scopes():
+        cur.execute(
+            f"""
+            SELECT sch.name, t.name, c.name
+            FROM {cat}sys.indexes i
+            JOIN {cat}sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            JOIN {cat}sys.columns c   ON c.object_id  = ic.object_id AND c.column_id = ic.column_id
+            JOIN {cat}sys.tables  t   ON t.object_id  = i.object_id
+            JOIN {cat}sys.schemas sch ON sch.schema_id = t.schema_id
+            WHERE i.is_primary_key = 1
+            """
+        )
+        for sch, tbl, col in cur.fetchall():
+            # A hidden PK column is dropped HERE rather than later: pks feeds both the " PK"
+            # marker and the duplicate-key scan, either of which would otherwise name an
+            # invisible column.
+            if _is_hidden(sch, tbl, db) or _is_excluded_column(sch, tbl, col, db):
+                continue
+            pks.setdefault(qualify(db, sch, tbl), set()).add(col)
     return pks
 
 
@@ -237,30 +325,34 @@ def _fetch_foreign_keys(cur, visible: set[str]) -> dict[str, list[str]]:
 
     These lines are load-bearing twice over in this app: they render into schema.txt for the
     agents, and app/rules/expand.py turns each one into its own orphan-row probe.
+
+    SQL Server cannot declare a foreign key ACROSS databases, so reading each database's own
+    catalogue finds every declared relationship there is.
     """
-    cur.execute(
-        """
-        SELECT sch.name, t.name, c.name, rsch.name, rt.name, rc.name
-        FROM sys.foreign_key_columns fkc
-        JOIN sys.tables  t    ON t.object_id  = fkc.parent_object_id
-        JOIN sys.schemas sch  ON sch.schema_id = t.schema_id
-        JOIN sys.columns c    ON c.object_id  = fkc.parent_object_id
-                             AND c.column_id  = fkc.parent_column_id
-        JOIN sys.tables  rt   ON rt.object_id = fkc.referenced_object_id
-        JOIN sys.schemas rsch ON rsch.schema_id = rt.schema_id
-        JOIN sys.columns rc   ON rc.object_id  = fkc.referenced_object_id
-                             AND rc.column_id  = fkc.referenced_column_id
-        """
-    )
     fks: dict[str, list[str]] = {}
-    for fs, ft, fc, ts, tt, tc in cur.fetchall():
-        frm, to = f"{fs}.{ft}", f"{ts}.{tt}"
-        if frm not in visible or to not in visible:
-            continue
-        # Either END being hidden makes the relationship unusable - a join nobody can write.
-        if _is_excluded_column(fs, ft, fc) or _is_excluded_column(ts, tt, tc):
-            continue
-        fks.setdefault(frm, []).append(f"{fc} -> {to}.{tc}")
+    for db, cat in _scopes():
+        cur.execute(
+            f"""
+            SELECT sch.name, t.name, c.name, rsch.name, rt.name, rc.name
+            FROM {cat}sys.foreign_key_columns fkc
+            JOIN {cat}sys.tables  t    ON t.object_id  = fkc.parent_object_id
+            JOIN {cat}sys.schemas sch  ON sch.schema_id = t.schema_id
+            JOIN {cat}sys.columns c    ON c.object_id  = fkc.parent_object_id
+                                      AND c.column_id  = fkc.parent_column_id
+            JOIN {cat}sys.tables  rt   ON rt.object_id = fkc.referenced_object_id
+            JOIN {cat}sys.schemas rsch ON rsch.schema_id = rt.schema_id
+            JOIN {cat}sys.columns rc   ON rc.object_id  = fkc.referenced_object_id
+                                      AND rc.column_id  = fkc.referenced_column_id
+            """
+        )
+        for fs, ft, fc, ts, tt, tc in cur.fetchall():
+            frm, to = qualify(db, fs, ft), qualify(db, ts, tt)
+            if frm not in visible or to not in visible:
+                continue
+            # Either END being hidden makes the relationship unusable - a join nobody can write.
+            if _is_excluded_column(fs, ft, fc, db) or _is_excluded_column(ts, tt, tc, db):
+                continue
+            fks.setdefault(frm, []).append(f"{fc} -> {to}.{tc}")
     return fks
 
 
@@ -285,34 +377,57 @@ def _row_counts(cur) -> list[tuple]:
     guard in build_numeric_hints() silently never fires, so a hundred-million-row table would
     be fully scanned; and _live_fingerprint() degrades to structure-only, so neither hint file
     would ever notice that the DATA changed. Both failures are invisible.
+
+    Rows are (schema, table, count) - or (database, schema, table, count) when several
+    databases are in scope - so ".".join(row[:-1]) is always the qualified table name. Use
+    _sizes() for that mapping rather than unpacking a fixed shape.
     """
     placeholders = ",".join("?" for _ in settings.allowed_schemas)
     attempts = (
         ("sys.dm_db_partition_stats", "p.row_count"),
         ("sys.partitions", "p.rows"),
     )
-    last_exc: Exception | None = None
-    for source, column in attempts:
-        try:
-            cur.execute(
-                f"""
-                SELECT s.name, t.name, SUM({column})
-                FROM {source} p
-                JOIN sys.tables  t ON t.object_id = p.object_id
-                JOIN sys.schemas s ON s.schema_id = t.schema_id
-                WHERE p.index_id IN (0, 1) AND LOWER(s.name) IN ({placeholders})
-                GROUP BY s.name, t.name
-                ORDER BY s.name, t.name
-                """,
-                *settings.allowed_schemas,
-            )
-            rows = cur.fetchall()
-            if source != attempts[0][0]:
-                log.info("schema: row counts read from %s (the DMV was not permitted)", source)
-            return rows
-        except Exception as exc:  # noqa: BLE001 - try the next source before giving up
-            last_exc = exc
-    raise last_exc if last_exc else RuntimeError("no row-count source available")
+    out: list[tuple] = []
+    for db, cat in _scopes():
+        last_exc: Exception | None = None
+        for source, column in attempts:
+            try:
+                cur.execute(
+                    f"""
+                    SELECT s.name, t.name, SUM({column})
+                    FROM {cat}{source} p
+                    JOIN {cat}sys.tables  t ON t.object_id = p.object_id
+                    JOIN {cat}sys.schemas s ON s.schema_id = t.schema_id
+                    WHERE p.index_id IN (0, 1) AND LOWER(s.name) IN ({placeholders})
+                    GROUP BY s.name, t.name
+                    ORDER BY s.name, t.name
+                    """,
+                    *settings.allowed_schemas,
+                )
+                rows = cur.fetchall()
+                if source != attempts[0][0]:
+                    log.info(
+                        "schema: row counts read from %s (the DMV was not permitted)", source
+                    )
+                if cat:
+                    out.extend((db, *row) for row in rows)
+                else:
+                    out.extend(rows)
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001 - try the next source before giving up
+                last_exc = exc
+        if last_exc is not None:
+            raise last_exc
+    return out
+
+
+def _sizes(cur) -> dict[str, int]:
+    """Qualified table name -> approximate row count. Empty when no count could be read."""
+    try:
+        return {".".join(str(p) for p in row[:-1]): (row[-1] or 0) for row in _row_counts(cur)}
+    except Exception:  # noqa: BLE001 - callers fall back to counting per table
+        return {}
 
 
 def _key_signature(cur) -> list[tuple]:
@@ -331,82 +446,92 @@ def _key_signature(cur) -> list[tuple]:
     schemas = settings.allowed_schemas
     rows: list[tuple] = []
 
-    cur.execute(
-        f"""
-        SELECT sch.name, t.name, c.name
-        FROM sys.indexes i
-        JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
-        JOIN sys.columns c   ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-        JOIN sys.tables  t   ON t.object_id = i.object_id
-        JOIN sys.schemas sch ON sch.schema_id = t.schema_id
-        WHERE i.is_primary_key = 1 AND LOWER(sch.name) IN ({placeholders})
-        ORDER BY sch.name, t.name, c.name
-        """,
-        *schemas,
-    )
-    rows += [("PK", *r) for r in cur.fetchall()]
+    # Every row is (KIND, schema, table, ...). With several databases in scope the schema slot
+    # carries "database.schema", so f"{row[1]}.{row[2]}" is the qualified table name in BOTH
+    # modes - which is all table_signatures() relies on to group a row onto its table.
+    for db, cat in _scopes():
+        found: list[tuple] = []
 
-    cur.execute(
-        f"""
-        SELECT sch.name, t.name, c.name, rsch.name, rt.name, rc.name
-        FROM sys.foreign_key_columns fkc
-        JOIN sys.tables  t    ON t.object_id = fkc.parent_object_id
-        JOIN sys.schemas sch  ON sch.schema_id = t.schema_id
-        JOIN sys.columns c    ON c.object_id = fkc.parent_object_id
-                             AND c.column_id = fkc.parent_column_id
-        JOIN sys.tables  rt   ON rt.object_id = fkc.referenced_object_id
-        JOIN sys.schemas rsch ON rsch.schema_id = rt.schema_id
-        JOIN sys.columns rc   ON rc.object_id = fkc.referenced_object_id
-                             AND rc.column_id = fkc.referenced_column_id
-        WHERE LOWER(sch.name) IN ({placeholders})
-        ORDER BY sch.name, t.name, c.name
-        """,
-        *schemas,
-    )
-    rows += [("FK", *r) for r in cur.fetchall()]
+        cur.execute(
+            f"""
+            SELECT sch.name, t.name, c.name
+            FROM {cat}sys.indexes i
+            JOIN {cat}sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            JOIN {cat}sys.columns c   ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            JOIN {cat}sys.tables  t   ON t.object_id = i.object_id
+            JOIN {cat}sys.schemas sch ON sch.schema_id = t.schema_id
+            WHERE i.is_primary_key = 1 AND LOWER(sch.name) IN ({placeholders})
+            ORDER BY sch.name, t.name, c.name
+            """,
+            *schemas,
+        )
+        found += [("PK", *r) for r in cur.fetchall()]
 
-    cur.execute(
-        f"""
-        SELECT sch.name, t.name, cc.name, cc.definition
-        FROM sys.check_constraints cc
-        JOIN sys.tables  t   ON t.object_id = cc.parent_object_id
-        JOIN sys.schemas sch ON sch.schema_id = t.schema_id
-        WHERE LOWER(sch.name) IN ({placeholders})
-        ORDER BY sch.name, t.name, cc.name
-        """,
-        *schemas,
-    )
-    rows += [("CHECK", *r) for r in cur.fetchall()]
+        cur.execute(
+            f"""
+            SELECT sch.name, t.name, c.name, rsch.name, rt.name, rc.name
+            FROM {cat}sys.foreign_key_columns fkc
+            JOIN {cat}sys.tables  t    ON t.object_id = fkc.parent_object_id
+            JOIN {cat}sys.schemas sch  ON sch.schema_id = t.schema_id
+            JOIN {cat}sys.columns c    ON c.object_id = fkc.parent_object_id
+                                 AND c.column_id = fkc.parent_column_id
+            JOIN {cat}sys.tables  rt   ON rt.object_id = fkc.referenced_object_id
+            JOIN {cat}sys.schemas rsch ON rsch.schema_id = rt.schema_id
+            JOIN {cat}sys.columns rc   ON rc.object_id = fkc.referenced_object_id
+                                 AND rc.column_id = fkc.referenced_column_id
+            WHERE LOWER(sch.name) IN ({placeholders})
+            ORDER BY sch.name, t.name, c.name
+            """,
+            *schemas,
+        )
+        found += [("FK", *r) for r in cur.fetchall()]
 
-    cur.execute(
-        f"""
-        SELECT sch.name, t.name, c.name, dc.definition
-        FROM sys.default_constraints dc
-        JOIN sys.tables  t   ON t.object_id = dc.parent_object_id
-        JOIN sys.columns c   ON c.object_id = dc.parent_object_id
-                            AND c.column_id = dc.parent_column_id
-        JOIN sys.schemas sch ON sch.schema_id = t.schema_id
-        WHERE LOWER(sch.name) IN ({placeholders})
-        ORDER BY sch.name, t.name, c.name
-        """,
-        *schemas,
-    )
-    rows += [("DEFAULT", *r) for r in cur.fetchall()]
+        cur.execute(
+            f"""
+            SELECT sch.name, t.name, cc.name, cc.definition
+            FROM {cat}sys.check_constraints cc
+            JOIN {cat}sys.tables  t   ON t.object_id = cc.parent_object_id
+            JOIN {cat}sys.schemas sch ON sch.schema_id = t.schema_id
+            WHERE LOWER(sch.name) IN ({placeholders})
+            ORDER BY sch.name, t.name, cc.name
+            """,
+            *schemas,
+        )
+        found += [("CHECK", *r) for r in cur.fetchall()]
 
-    cur.execute(
-        f"""
-        SELECT sch.name, t.name, i.name, c.name
-        FROM sys.indexes i
-        JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
-        JOIN sys.columns c   ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-        JOIN sys.tables  t   ON t.object_id = i.object_id
-        JOIN sys.schemas sch ON sch.schema_id = t.schema_id
-        WHERE i.is_unique = 1 AND i.is_primary_key = 0 AND LOWER(sch.name) IN ({placeholders})
-        ORDER BY sch.name, t.name, i.name, ic.key_ordinal
-        """,
-        *schemas,
-    )
-    rows += [("UNIQUE", *r) for r in cur.fetchall()]
+        cur.execute(
+            f"""
+            SELECT sch.name, t.name, c.name, dc.definition
+            FROM {cat}sys.default_constraints dc
+            JOIN {cat}sys.tables  t   ON t.object_id = dc.parent_object_id
+            JOIN {cat}sys.columns c   ON c.object_id = dc.parent_object_id
+                                AND c.column_id = dc.parent_column_id
+            JOIN {cat}sys.schemas sch ON sch.schema_id = t.schema_id
+            WHERE LOWER(sch.name) IN ({placeholders})
+            ORDER BY sch.name, t.name, c.name
+            """,
+            *schemas,
+        )
+        found += [("DEFAULT", *r) for r in cur.fetchall()]
+
+        cur.execute(
+            f"""
+            SELECT sch.name, t.name, i.name, c.name
+            FROM {cat}sys.indexes i
+            JOIN {cat}sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            JOIN {cat}sys.columns c   ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+            JOIN {cat}sys.tables  t   ON t.object_id = i.object_id
+            JOIN {cat}sys.schemas sch ON sch.schema_id = t.schema_id
+            WHERE i.is_unique = 1 AND i.is_primary_key = 0 AND LOWER(sch.name) IN ({placeholders})
+            ORDER BY sch.name, t.name, i.name, ic.key_ordinal
+            """,
+            *schemas,
+        )
+        found += [("UNIQUE", *r) for r in cur.fetchall()]
+
+        if cat:
+            found = [(kind, f"{db}.{sch}", *rest) for kind, sch, *rest in found]
+        rows += found
 
     return rows
 
@@ -453,13 +578,13 @@ def _detect_duplicate_keys(
         if not candidates:
             continue
         key = candidates[0]
-        sch, _, tbl = table.partition(".")
+        target = from_clause(table)
         try:
             if total is None:
-                cur.execute(f"SELECT COUNT(*), COUNT(DISTINCT [{key}]) FROM [{sch}].[{tbl}]")
+                cur.execute(f"SELECT COUNT(*), COUNT(DISTINCT [{key}]) FROM {target}")
                 total, distinct = cur.fetchone()
             else:
-                cur.execute(f"SELECT COUNT(DISTINCT [{key}]) FROM [{sch}].[{tbl}]")
+                cur.execute(f"SELECT COUNT(DISTINCT [{key}]) FROM {target}")
                 distinct = cur.fetchone()[0]
         except Exception:  # noqa: BLE001 - a table we cannot count must not break introspection
             continue
@@ -535,23 +660,20 @@ def _structure_signature(cur, h: hashlib._Hash) -> None:
     system means probes calibrated against the wrong scale and thresholds.
     """
     placeholders = ",".join("?" for _ in settings.allowed_schemas)
-    cur.execute(
-        f"""
-        SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH,
-               IS_NULLABLE
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE LOWER(TABLE_SCHEMA) IN ({placeholders})
-        ORDER BY TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME
-        """,
-        *settings.allowed_schemas,
-    )
     # The catalogue query is NOT filtered by the exclusion settings, so editing one of them
     # would leave the hash unchanged and the cache would keep serving tables you just hid.
     # Fold the settings in explicitly so a change rebuilds.
     h.update(("!schemas=" + ",".join(sorted(settings.allowed_schemas))).encode("utf-8"))
     h.update(("!excluded=" + ",".join(sorted(settings.excluded_tables))).encode("utf-8"))
     h.update(("!excluded_cols=" + ",".join(sorted(settings.excluded_columns))).encode("utf-8"))
-    h.update(f"!db={settings.db_server}:{settings.db_port}/{settings.db_name}".encode("utf-8"))
+    # Folded in ONLY when set. Hashing an empty allow-list would move the fingerprint of every
+    # existing installation and mark its whole catalog stale for a setting it never used.
+    if settings.included_tables:
+        h.update(("!included=" + ",".join(sorted(settings.included_tables))).encode("utf-8"))
+    # database_label is DB_NAME unless DB_EXTRA_NAMES is set - unchanged for a single database.
+    h.update(
+        f"!db={settings.db_server}:{settings.db_port}/{settings.database_label}".encode("utf-8")
+    )
     # ⚠ _RENDER_VERSION IS DELIBERATELY NOT FOLDED IN HERE. It describes how schema.txt is
     # FORMATTED for a prompt - bracketing, spacing, which statistics are abbreviated. A probe's
     # stored SQL depends on which tables and columns EXIST, never on how they were printed, so
@@ -566,9 +688,22 @@ def _structure_signature(cur, h: hashlib._Hash) -> None:
     # It still belongs in _live_fingerprint(), which guards the RENDERED files themselves: those
     # genuinely are stale when the renderer changes.
     h.update(b"\n")
-    for row in cur.fetchall():
-        h.update("|".join("" if v is None else str(v) for v in row).encode("utf-8"))
-        h.update(b"\n")
+    for db, cat in _scopes():
+        cur.execute(
+            f"""
+            SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH,
+                   IS_NULLABLE
+            FROM {cat}INFORMATION_SCHEMA.COLUMNS
+            WHERE LOWER(TABLE_SCHEMA) IN ({placeholders})
+            ORDER BY TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME
+            """,
+            *settings.allowed_schemas,
+        )
+        for row in cur.fetchall():
+            if cat:
+                row = (db, *row)
+            h.update("|".join("" if v is None else str(v) for v in row).encode("utf-8"))
+            h.update(b"\n")
 
     # Keys/constraints live in separate catalogues, so a key changing alone would otherwise
     # leave the hash - and the cache - untouched.
@@ -668,26 +803,31 @@ def table_signatures(cur=None) -> dict[str, str]:
         "schemas=" + ",".join(sorted(settings.allowed_schemas)),
         "excluded=" + ",".join(sorted(settings.excluded_tables)),
         "excluded_cols=" + ",".join(sorted(settings.excluded_columns)),
-        f"db={settings.db_server}:{settings.db_port}/{settings.db_name}",
-    ))
+        f"db={settings.db_server}:{settings.db_port}/{settings.database_label}",
+    ) + ((
+        # Only when set, for the same reason as in _structure_signature: an empty allow-list
+        # must leave every existing signature - and so every compiled probe - untouched.
+        "included=" + ",".join(sorted(settings.included_tables)),
+    ) if settings.included_tables else ()))
 
     parts: dict[str, list[str]] = {}
     placeholders = ",".join("?" for _ in settings.allowed_schemas)
-    cur.execute(
-        f"""
-        SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH,
-               IS_NULLABLE
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE LOWER(TABLE_SCHEMA) IN ({placeholders})
-        ORDER BY TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME
-        """,
-        *settings.allowed_schemas,
-    )
-    for row in cur.fetchall():
-        key = f"{row[0]}.{row[1]}".lower()
-        parts.setdefault(key, []).append(
-            "|".join("" if v is None else str(v) for v in row[2:])
+    for db, cat in _scopes():
+        cur.execute(
+            f"""
+            SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH,
+                   IS_NULLABLE
+            FROM {cat}INFORMATION_SCHEMA.COLUMNS
+            WHERE LOWER(TABLE_SCHEMA) IN ({placeholders})
+            ORDER BY TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME
+            """,
+            *settings.allowed_schemas,
         )
+        for row in cur.fetchall():
+            key = qualify(db, row[0], row[1]).lower()
+            parts.setdefault(key, []).append(
+                "|".join("" if v is None else str(v) for v in row[2:])
+            )
 
     # Keys and constraints, grouped onto the table they belong to. Every row _key_signature
     # returns is (KIND, schema, table, ...), which is what makes this grouping safe. A foreign
@@ -791,10 +931,7 @@ def build_schema_text(use_cache: bool = True) -> str:
         visible = set(tables.keys())
         pks = _fetch_primary_keys(cur)
         fks = _fetch_foreign_keys(cur, visible)
-        try:
-            sizes = {f"{s}.{t}": (n or 0) for s, t, n in _row_counts(cur)}
-        except Exception:  # noqa: BLE001 - fall back to counting per table
-            sizes = {}
+        sizes = _sizes(cur)  # empty on failure: fall back to counting per table
         dup_keys = _detect_duplicate_keys(cur, tables, pks, sizes)
         text = _render(tables, pks, fks, dup_keys, sizes)
         fingerprint = _live_fingerprint(cur)
@@ -809,8 +946,13 @@ def build_schema_text(use_cache: bool = True) -> str:
     identity.write_cache(_SCHEMA_STEM, "fingerprint", fingerprint)
     log.info(
         "schema: rebuilt from the live database for %s (%d tables)",
-        settings.db_name, len(text.split("\nTABLE ")),
+        settings.database_label, len(text.split("\nTABLE ")),
     )
+    for entry in unmatched_included(tables):
+        log.warning(
+            "schema: INCLUDED_TABLES entry %r matches no visible table - it is NOT being "
+            "checked. Check the spelling, ALLOWED_SCHEMAS and EXCLUDED_TABLES.", entry,
+        )
     return text
 
 
@@ -843,21 +985,27 @@ def build_value_hints(use_cache: bool = True) -> str:
     try:
         cur = conn.cursor()
         placeholders = ",".join("?" for _ in settings.allowed_schemas)
-        cur.execute(
-            f"""
-            SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE LOWER(TABLE_SCHEMA) IN ({placeholders})
-            ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
-            """,
-            *settings.allowed_schemas,
-        )
-        table_cols: dict[tuple[str, str], list[str]] = {}
-        for sch, tbl, col in cur.fetchall():
-            if _is_excluded(sch, tbl) or _is_secret(col) or _is_excluded_column(sch, tbl, col):
-                continue
-            if _is_hint_column(col):
-                table_cols.setdefault((sch, tbl), []).append(col)
+        # Keyed on the QUALIFIED name, so a lookup table is sampled through exactly the name the
+        # probes will use for it - three-part when several databases are in scope.
+        table_cols: dict[str, list[str]] = {}
+        for db, cat in _scopes():
+            cur.execute(
+                f"""
+                SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME
+                FROM {cat}INFORMATION_SCHEMA.COLUMNS
+                WHERE LOWER(TABLE_SCHEMA) IN ({placeholders})
+                ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
+                """,
+                *settings.allowed_schemas,
+            )
+            for sch, tbl, col in cur.fetchall():
+                if (
+                    _is_hidden(sch, tbl, db) or _is_secret(col)
+                    or _is_excluded_column(sch, tbl, col, db)
+                ):
+                    continue
+                if _is_hint_column(col):
+                    table_cols.setdefault(qualify(db, sch, tbl), []).append(col)
 
         lines = [
             "VALUE HINTS (real coded values from the lookup tables - filter, join and decode "
@@ -865,24 +1013,22 @@ def build_value_hints(use_cache: bool = True) -> str:
         ]
         # Sizes come from catalogue statistics in ONE query, so a large transactional table is
         # skipped WITHOUT being queried at all.
-        try:
-            sizes = {f"{s}.{t}": (n or 0) for s, t, n in _row_counts(cur)}
-        except Exception:  # noqa: BLE001
-            sizes = {}
+        sizes = _sizes(cur)
 
-        for (sch, tbl), cols in list(table_cols.items())[:_HINT_MAX_TABLES]:
-            known = sizes.get(f"{sch}.{tbl}")
+        for table, cols in list(table_cols.items())[:_HINT_MAX_TABLES]:
+            target = from_clause(table)
+            known = sizes.get(table)
             if known is not None and known > _HINT_MAX_ROWS:
                 continue  # transactional data, not a code list
             col_sql = ", ".join(f"[{c}]" for c in cols)
             try:
                 if known is None:
-                    cur.execute(f"SELECT COUNT(*) FROM [{sch}].[{tbl}]")
+                    cur.execute(f"SELECT COUNT(*) FROM {target}")
                     if (cur.fetchone()[0] or 0) > _HINT_MAX_ROWS:
                         continue
                 cur.execute(
                     f"SELECT DISTINCT TOP {_HINT_MAX_VALUES} {col_sql} "
-                    f"FROM [{sch}].[{tbl}] ORDER BY {col_sql}"
+                    f"FROM {target} ORDER BY {col_sql}"
                 )
                 rows = cur.fetchall()
             except Exception:  # noqa: BLE001 - a bad/empty table must not break hint building
@@ -890,7 +1036,7 @@ def build_value_hints(use_cache: bool = True) -> str:
             if not rows:
                 continue
             vals = ["|".join("" if v is None else str(v).strip() for v in r) for r in rows]
-            lines.append(f"- {sch}.{tbl} ({', '.join(cols)}): " + "; ".join(vals))
+            lines.append(f"- {table} ({', '.join(cols)}): " + "; ".join(vals))
         text = "\n".join(lines) if len(lines) > 1 else ""
     finally:
         conn.close()
@@ -1079,10 +1225,7 @@ def build_numeric_hints(use_cache: bool = True) -> str:
         tables = _fetch_columns(cur)
         # Needed so a primary key is never classified as a measurement, however it is named.
         pks = _fetch_primary_keys(cur)
-        try:
-            sizes = {f"{s}.{t}": (n or 0) for s, t, n in _row_counts(cur)}
-        except Exception:  # noqa: BLE001
-            sizes = {}
+        sizes = _sizes(cur)
 
         lines = [
             "NUMERIC HINTS (MEASURED from the live data - use these to pick the correct scale "
@@ -1091,7 +1234,6 @@ def build_numeric_hints(use_cache: bool = True) -> str:
         skipped: list[str] = []
 
         for table, cols in tables.items():
-            sch, _, tbl = table.partition(".")
             total = sizes.get(table)
             if total is not None and total > _NUMERIC_MAX_ROWS:
                 skipped.append(f"{table} ({total:,} rows)")
@@ -1128,7 +1270,7 @@ def build_numeric_hints(use_cache: bool = True) -> str:
                 ]
 
             try:
-                cur.execute(f"SELECT {', '.join(parts)} FROM [{sch}].[{tbl}]")
+                cur.execute(f"SELECT {', '.join(parts)} FROM {from_clause(table)}")
                 row = list(cur.fetchone())
             except Exception as exc:  # noqa: BLE001 - one bad table must not stop profiling
                 log.info("numeric hints: skipped %s (%s)", table, exc)
@@ -1243,7 +1385,7 @@ if __name__ == "__main__":
     from app.db.connection import ping
 
     print(
-        f"Introspecting {settings.db_name} on {settings.db_server} "
+        f"Introspecting {settings.database_label} on {settings.db_server} "
         f"(schemas: {', '.join(settings.allowed_schemas) or '(none set!)'})"
     )
     ok, message = ping()

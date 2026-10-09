@@ -47,6 +47,7 @@ from __future__ import annotations
 import os
 import re
 
+from app.config import settings
 from app.observability import get_logger
 from app.rules.spec import (
     AUTO,
@@ -65,9 +66,8 @@ log = get_logger()
 # them: business_rules.md, data_anomalies.md and few_shots.md are the operator's control
 # surface and live exactly where they put them. Only the DESCRIPTIONS of the database
 # (schema.txt and the two hint files) are machine-maintained - see app/db/introspect.py.
-_DOMAIN_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "domain"
-)
+# DOMAIN_DIR in .env, "domain" by default - see Settings.domain_dir.
+_DOMAIN_DIR = settings.domain_dir
 _MAIN_FILE = "data_anomalies.md"
 _SPLIT_DIR = "anomalies"
 

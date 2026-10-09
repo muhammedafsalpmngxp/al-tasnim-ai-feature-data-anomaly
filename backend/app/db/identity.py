@@ -45,14 +45,22 @@ def current_database() -> dict[str, str]:
     """Which database this process is pointed at, as a catalog or a cache records it."""
     from app.config import settings
 
-    return {"name": settings.db_name, "server": settings.db_server}
+    # database_label is DB_NAME itself unless DB_EXTRA_NAMES is set, so a single-database
+    # installation records exactly what it always did and its run history stays one trend.
+    return {"name": settings.database_label, "server": settings.db_server}
 
 
 def identity() -> str:
-    """The full identity string the digest is taken over. Lowercased, so case cannot fork it."""
+    """The full identity string the digest is taken over. Lowercased, so case cannot fork it.
+
+    A multi-database scope is a DIFFERENT subject from any one of its members - its schema
+    block, hints and probes all span both - so it is keyed on every database in it. Adding or
+    removing a database therefore starts a fresh description and catalog, rather than reusing
+    one whose three-part names point at a scope that no longer exists.
+    """
     from app.config import settings
 
-    return f"{settings.db_server}:{settings.db_port}/{settings.db_name}".lower()
+    return f"{settings.db_server}:{settings.db_port}/{settings.database_label}".lower()
 
 
 def digest() -> str:

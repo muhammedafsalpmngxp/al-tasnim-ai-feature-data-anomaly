@@ -208,7 +208,10 @@ def test_render_version_does_not_invalidate_catalog() -> None:
         "the rendering, so a renderer change really does make them stale.",
     )
     # The signals that MUST invalidate a compiled probe, because each can make its SQL wrong.
-    for signal in ("allowed_schemas", "excluded_tables", "excluded_columns", "db_name"):
+    # database_label is DB_NAME itself for one database, and every database in scope when
+    # DB_EXTRA_NAMES adds more - so it is the database identity in both modes.
+    for signal in ("allowed_schemas", "excluded_tables", "excluded_columns", "included_tables",
+                   "database_label"):
         check(
             signal in structure_src,
             f"_structure_signature no longer folds in {signal}; a probe could keep running "
@@ -3271,6 +3274,30 @@ def test_both_rule_layouts_are_understood() -> None:
     )
 
 
+def test_only_configured_databases_may_be_read() -> None:
+    """A dot INSIDE brackets is part of a name, not a database separator."""
+    from app.config import settings
+    from app.graph.nodes.validator import foreign_databases
+
+    db = settings.databases[0]
+    schema = next(iter(settings.allowed_schemas), "dbo")
+    allowed = [
+        f"SELECT l.[latest_exp.rig_on_date], l.[actual_eng._completion_date] FROM {db}.{schema}.t l",
+        f"SELECT x.[a.b.c] FROM [{db}].[{schema}].[t] x",
+        f"SELECT {schema}.t.col FROM {schema}.t",
+    ]
+    for sql in allowed:
+        check(not foreign_databases(sql), f"in-scope SQL refused: {sql} -> {foreign_databases(sql)}")
+    refused = [
+        "SELECT * FROM [msdb].[dbo].[x]",
+        "SELECT * FROM [OtherApp]..[Users]",
+        "SELECT * FROM [SRV].[db].[dbo].[t]",
+        "SELECT * FROM master.sys.tables",
+    ]
+    for sql in refused:
+        check(bool(foreign_databases(sql)), f"out-of-scope SQL allowed: {sql}")
+
+
 def main() -> int:
     tests = [
         ("every module parses and imports", test_every_module_parses),
@@ -3342,6 +3369,7 @@ def main() -> int:
         ("structured calls are counted in the usage report",
          test_structured_calls_are_counted_in_the_usage_report),
         ("both rule layouts are understood", test_both_rule_layouts_are_understood),
+        ("only configured databases may be read", test_only_configured_databases_may_be_read),
     ]
     for name, fn in tests:
         before = len(_failures)

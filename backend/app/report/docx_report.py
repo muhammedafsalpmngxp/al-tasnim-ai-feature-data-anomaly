@@ -329,7 +329,7 @@ def build(state, path: str | None = None) -> str:
     subtitle = doc.add_paragraph()
     subtitle.alignment = WD_ALIGN_PARAGRAPH.LEFT
     run = subtitle.add_run(
-        f"{settings.db_name or 'database'}  ·  run {state.get('run_id', '')}"
+        f"{settings.database_label or 'database'}  ·  run {state.get('run_id', '')}"
     )
     run.italic = True
 

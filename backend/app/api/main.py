@@ -219,7 +219,8 @@ def status() -> dict:
     mine, other_database_runs = history_for_current_database()
     _trusted, _on_trial_count = _probe_counts(catalog, _rules_by_id())
     return {
-        "database": {"name": settings.db_name, "server": settings.db_server},
+        "database": {"name": settings.database_label, "server": settings.db_server},
+        "databases": list(settings.databases),
         "schemas": list(settings.allowed_schemas),
         "models": {"main": settings.active_model, "fast": settings.fast_model},
         "catalog": {

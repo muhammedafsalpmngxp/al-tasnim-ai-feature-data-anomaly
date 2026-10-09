@@ -43,13 +43,13 @@ import os
 import re
 
 from app.db import identity
+from app.config import settings
 from app.observability import get_logger
 
 log = get_logger()
 
-_DOMAIN_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "domain"
-)
+# DOMAIN_DIR in .env, "domain" by default - see Settings.domain_dir.
+_DOMAIN_DIR = settings.domain_dir
 # Inside the directory loader._domain_files() already scans, so an accepted rule is picked up by
 # the next compile with no loader change at all.
 DISCOVERED_DIR = os.path.join(_DOMAIN_DIR, "anomalies")
